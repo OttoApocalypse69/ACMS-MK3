@@ -1,4 +1,4 @@
-//! The editing state that is not part of the sprite itself: which document is open, the
+//! The editing state that is not part of a sprite itself: which documents are open, the
 //! colours and brush in use, the tools and which one is active.
 //!
 //! This is the document-related half of what commands act on; the app adds its own UI state
@@ -7,19 +7,35 @@
 use crate::color::Rgba8;
 use crate::compositor::Overlay;
 use crate::document::Document;
+use crate::edit::Clip;
 use crate::geom::Rect;
 use crate::sprite::SpriteError;
 use crate::stroke::Brush;
-use crate::tool::{BrushTool, CursorHint, Eyedropper, PointerEvent, Tool, ToolContext};
+use crate::tool::{
+    BrushTool, CursorHint, Eyedropper, OptionKind, Outline, PointerEvent, Tool, ToolContext,
+    ToolOptions,
+};
+use crate::tools::{BucketTool, GradientTool, MoveTool, SelectTool, ShapeTool};
+
+/// Identifies an open document for as long as it is open. Never reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DocId(pub u64);
 
 pub struct Editor {
-    document: Option<Document>,
-    /// Goes up every time a different document is put in place, so views can tell that
-    /// everything they cached about the old one is stale.
+    /// The open documents, in the order of their tabs.
+    documents: Vec<(DocId, Document)>,
+    /// Index into `documents` of the one being edited.
+    active: usize,
+    next_doc_id: u64,
+    /// Goes up every time a different document becomes the active one, so views can tell
+    /// that everything they cached about the old one is stale.
     generation: u64,
     pub primary: Rgba8,
     pub secondary: Rgba8,
     pub brush: Brush,
+    pub options: ToolOptions,
+    /// What Copy and Cut took; shared by all open documents.
+    pub clipboard: Option<Clip>,
     /// The tool registry.
     tools: Vec<Box<dyn Tool>>,
     active_tool: usize,
@@ -37,36 +53,114 @@ impl Editor {
     /// An editor with the built-in tools and no document.
     pub fn new() -> Self {
         Self {
-            document: None,
+            documents: Vec::new(),
+            active: 0,
+            next_doc_id: 1,
             generation: 0,
             primary: Rgba8::BLACK,
             secondary: Rgba8::WHITE,
             brush: Brush::default(),
+            options: ToolOptions::default(),
+            clipboard: None,
             tools: vec![
                 Box::new(BrushTool::pencil()),
                 Box::new(BrushTool::eraser()),
                 Box::new(Eyedropper),
+                Box::new(ShapeTool::line()),
+                Box::new(ShapeTool::rectangle()),
+                Box::new(ShapeTool::ellipse()),
+                Box::new(BucketTool::default()),
+                Box::new(GradientTool::default()),
+                Box::new(MoveTool::default()),
+                Box::new(SelectTool::rectangle()),
+                Box::new(SelectTool::lasso()),
+                Box::new(SelectTool::wand()),
             ],
             active_tool: 0,
             interacting: false,
         }
     }
 
+    /// The document being edited.
     pub fn document(&self) -> Option<&Document> {
-        self.document.as_ref()
+        self.documents
+            .get(self.active)
+            .map(|(_, document)| document)
     }
 
-    /// The open document, for running transactions, undo and redo on it.
+    /// The document being edited, for running transactions, undo and redo on it.
     pub fn document_mut(&mut self) -> Option<&mut Document> {
         self.cancel_interaction();
-        self.document.as_mut()
+        self.documents
+            .get_mut(self.active)
+            .map(|(_, document)| document)
     }
 
-    /// Replaces the open document (or closes it, with `None`).
-    pub fn set_document(&mut self, document: Option<Document>) {
+    pub fn active_document(&self) -> Option<DocId> {
+        self.documents.get(self.active).map(|(id, _)| *id)
+    }
+
+    /// Every open document, in tab order.
+    pub fn documents(&self) -> impl ExactSizeIterator<Item = (DocId, &Document)> {
+        self.documents.iter().map(|(id, document)| (*id, document))
+    }
+
+    pub fn document_by_id(&self, id: DocId) -> Option<&Document> {
+        self.documents
+            .iter()
+            .find_map(|(doc_id, document)| (*doc_id == id).then_some(document))
+    }
+
+    /// Opens a document in a new tab and makes it the one being edited.
+    pub fn add_document(&mut self, document: Document) -> DocId {
         self.cancel_interaction();
-        self.document = document;
+        let id = DocId(self.next_doc_id);
+        self.next_doc_id += 1;
+        self.documents.push((id, document));
+        self.active = self.documents.len() - 1;
         self.generation += 1;
+        id
+    }
+
+    /// Switches to another open document. Returns `false` if it is not open.
+    pub fn set_active_document(&mut self, id: DocId) -> bool {
+        let Some(index) = self.documents.iter().position(|(doc_id, _)| *doc_id == id) else {
+            return false;
+        };
+        if index != self.active {
+            self.cancel_interaction();
+            self.active = index;
+            self.generation += 1;
+        }
+        true
+    }
+
+    /// Closes a document. The tab to its left becomes active if it was the active one.
+    pub fn close_document(&mut self, id: DocId) -> Option<Document> {
+        let index = self
+            .documents
+            .iter()
+            .position(|(doc_id, _)| *doc_id == id)?;
+        self.cancel_interaction();
+        let (_, document) = self.documents.remove(index);
+        if self.active > index || self.active >= self.documents.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        self.generation += 1;
+        Some(document)
+    }
+
+    /// Opens `document` in a new tab, or with `None` closes the active one.
+    pub fn set_document(&mut self, document: Option<Document>) {
+        match (document, self.active_document()) {
+            (Some(document), _) => {
+                self.add_document(document);
+            }
+            (None, Some(active)) => {
+                self.close_document(active);
+            }
+            (None, None) => {}
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -76,9 +170,9 @@ impl Editor {
     /// The canvas area that needs redrawing since the last call; empty if none does.
     /// Unlike [`Editor::document_mut`] this leaves a stroke in progress alone.
     pub fn take_damage(&mut self) -> Rect {
-        self.document
-            .as_mut()
-            .map_or(Rect::EMPTY, Document::take_damage)
+        self.documents
+            .get_mut(self.active)
+            .map_or(Rect::EMPTY, |(_, document)| document.take_damage())
     }
 
     /// Ids and names of all tools, in registration order.
@@ -106,7 +200,7 @@ impl Editor {
 
     /// Runs `action` on the active tool. Does nothing without a document.
     fn with_tool(&mut self, action: impl FnOnce(&mut dyn Tool, &mut ToolContext<'_>)) {
-        let Some(document) = self.document.as_mut() else {
+        let Some((_, document)) = self.documents.get_mut(self.active) else {
             return;
         };
         let mut ctx = ToolContext {
@@ -114,13 +208,14 @@ impl Editor {
             primary: &mut self.primary,
             secondary: &mut self.secondary,
             brush: self.brush,
+            options: self.options,
         };
         action(self.tools[self.active_tool].as_mut(), &mut ctx);
     }
 
     /// A button went down on the canvas.
     pub fn pointer_down(&mut self, event: PointerEvent) {
-        if self.document.is_some() {
+        if self.document().is_some() {
             self.interacting = true;
             self.with_tool(|tool, ctx| tool.pointer_down(ctx, event));
         }
@@ -151,10 +246,14 @@ impl Editor {
         self.interacting
     }
 
-    /// Why drawing tools have no effect right now, if that is the case: the selected layer is
-    /// a group, locked or hidden. `None` when drawing works, and when no sprite is open.
+    /// Why the active tool has no effect right now, if that is the case: it paints, and the
+    /// selected layer is a group, locked or hidden. `None` when it works, and when no sprite
+    /// is open.
     pub fn draw_block(&self) -> Option<SpriteError> {
-        let document = self.document.as_ref()?;
+        if !self.tools[self.active_tool].paints() {
+            return None;
+        }
+        let document = self.document()?;
         document
             .sprite()
             .check_drawable(document.active_layer(), document.active_frame())
@@ -169,8 +268,17 @@ impl Editor {
     pub fn cursor_hint(&self) -> CursorHint {
         self.tools[self.active_tool].cursor_hint()
     }
-}
 
+    /// The settings the active tool uses.
+    pub fn tool_options(&self) -> &'static [OptionKind] {
+        self.tools[self.active_tool].options()
+    }
+
+    /// The shape the active tool is dragging out, if any.
+    pub fn outline(&self) -> Option<Outline> {
+        self.tools[self.active_tool].outline()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,7 +325,23 @@ mod tests {
     fn built_in_tools_are_registered_and_pencil_is_active() {
         let editor = Editor::new();
         let ids: Vec<&str> = editor.tools().map(|(id, _)| id).collect();
-        assert_eq!(ids, ["pencil", "eraser", "eyedropper"]);
+        assert_eq!(
+            ids,
+            [
+                "pencil",
+                "eraser",
+                "eyedropper",
+                "line",
+                "rectangle",
+                "ellipse",
+                "bucket",
+                "gradient",
+                "move",
+                "select_rectangle",
+                "lasso",
+                "magic_wand"
+            ]
+        );
         assert_eq!(editor.active_tool(), "pencil");
     }
 

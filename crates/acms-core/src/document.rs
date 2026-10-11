@@ -4,12 +4,15 @@
 //! call becomes a single undo step.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use crate::compositor;
 use crate::geom::{Point, Rect};
 use crate::image::Image;
+use crate::selection::Mask;
 use crate::sprite::{
-    Cel, Layer, LayerId, LayerKind, LayerProps, PlacedCel, Slot, Sprite, SpriteError,
+    CanvasState, Cel, CelSource, Layer, LayerId, LayerKind, LayerProps, MAX_SPRITE_SIZE, PlacedCel,
+    Slot, Sprite, SpriteError,
 };
 
 /// Default cap on the memory the undo history may hold.
@@ -63,6 +66,16 @@ enum Op {
         before: LayerProps,
         after: LayerProps,
     },
+    /// The selection changed.
+    Selection {
+        before: Option<Arc<Mask>>,
+        after: Option<Arc<Mask>>,
+    },
+    /// The canvas changed size, and every cel with it.
+    Canvas {
+        before: Box<CanvasState>,
+        after: Box<CanvasState>,
+    },
 }
 
 impl Op {
@@ -79,6 +92,8 @@ impl Op {
             Self::Remove(placement) => placement.remove(sprite),
             Self::Move { id, to, .. } => sprite.move_layer(*id, *to),
             Self::Props { id, after, .. } => sprite.set_layer_props(*id, after),
+            Self::Selection { after, .. } => sprite.set_selection(after.clone()),
+            Self::Canvas { after, .. } => sprite.set_canvas_state((**after).clone()),
         }
     }
 
@@ -95,6 +110,8 @@ impl Op {
             Self::Remove(placement) => placement.insert(sprite),
             Self::Move { id, from, .. } => sprite.move_layer(*id, *from),
             Self::Props { id, before, .. } => sprite.set_layer_props(*id, before),
+            Self::Selection { before, .. } => sprite.set_selection(before.clone()),
+            Self::Canvas { before, .. } => sprite.set_canvas_state((**before).clone()),
         }
     }
 
@@ -105,6 +122,9 @@ impl Op {
             Self::Pixels { rect, .. } => *rect,
             Self::Insert(placement) | Self::Remove(placement) => placement.bounds(),
             Self::Move { id, .. } | Self::Props { id, .. } => sprite.layer_bounds(*id),
+            // The outline is drawn by the view, not composed into the picture.
+            Self::Selection { .. } => Rect::EMPTY,
+            Self::Canvas { .. } => Rect::from_size(MAX_SPRITE_SIZE, MAX_SPRITE_SIZE),
         }
     }
 
@@ -117,6 +137,18 @@ impl Op {
                 .map(|(_, _, cel)| cel.image().byte_size())
                 .sum(),
             Self::Move { .. } | Self::Props { .. } => 0,
+            Self::Selection { before, after } => [before, after]
+                .into_iter()
+                .flatten()
+                .map(|mask| mask.width() as usize * mask.height() as usize)
+                .sum(),
+            // Cels the resize did not have to rebuild are shared, but counting them all is
+            // the safe side to err on.
+            Self::Canvas { before, after } => [before, after]
+                .into_iter()
+                .flat_map(|state| state.cels.values())
+                .map(|cel| cel.image().byte_size())
+                .sum(),
         }
     }
 }
@@ -210,6 +242,86 @@ impl Transaction<'_> {
             after: after.crop(changed),
         });
         Ok(())
+    }
+
+    /// Replaces the selection. `None`, or a mask with nothing in it, selects nothing, which
+    /// leaves every pixel editable.
+    pub fn set_selection(&mut self, selection: Option<Mask>) -> Result<(), SpriteError> {
+        let bounds = self.sprite.bounds();
+        if let Some(mask) = &selection
+            && (mask.width(), mask.height()) != (bounds.w, bounds.h)
+        {
+            return Err(SpriteError::SizeMismatch {
+                want_w: bounds.w,
+                want_h: bounds.h,
+                got_w: mask.width(),
+                got_h: mask.height(),
+            });
+        }
+        let before = self.sprite.selection().cloned();
+        let after = selection.filter(|mask| !mask.is_empty()).map(Arc::new);
+        if before.as_deref() != after.as_deref() {
+            self.push(Op::Selection { before, after });
+        }
+        Ok(())
+    }
+
+    /// Gives the sprite a new canvas built from `cels`, dropping the selection.
+    fn rebuild_canvas(
+        &mut self,
+        width: u32,
+        height: u32,
+        cels: Vec<CelSource>,
+    ) -> Result<(), SpriteError> {
+        let valid = 1..=MAX_SPRITE_SIZE;
+        if !valid.contains(&width) || !valid.contains(&height) {
+            return Err(SpriteError::InvalidSize(width, height));
+        }
+        let before = Box::new(self.sprite.canvas_state());
+        let mut resized = self.sprite.clone();
+        resized.rebuild_canvas(width, height, cels);
+        let after = Box::new(resized.canvas_state());
+        if before != after {
+            self.push(Op::Canvas { before, after });
+        }
+        Ok(())
+    }
+
+    /// Changes the canvas size without scaling: what is drawn moves by `(dx, dy)` and
+    /// anything that ends up outside the new canvas is cut off.
+    pub fn resize_canvas(
+        &mut self,
+        width: u32,
+        height: u32,
+        dx: i32,
+        dy: i32,
+    ) -> Result<(), SpriteError> {
+        let mut cels = self.sprite.cel_sources();
+        for cel in &mut cels {
+            cel.origin = Point::new(cel.origin.x + dx, cel.origin.y + dy);
+        }
+        self.rebuild_canvas(width, height, cels)
+    }
+
+    /// Scales the whole sprite to a new size with nearest-neighbour sampling.
+    pub fn scale_sprite(&mut self, width: u32, height: u32) -> Result<(), SpriteError> {
+        let bounds = self.sprite.bounds();
+        let cels = self
+            .sprite
+            .cel_sources()
+            .into_iter()
+            .map(|cel| {
+                // Scale the cel as it sits on the canvas, so its position scales with it.
+                let mut canvas = Image::new(bounds.w, bounds.h);
+                canvas.blit(&cel.image, cel.origin);
+                CelSource {
+                    origin: Point::new(0, 0),
+                    image: canvas.scaled_to(width.max(1), height.max(1)),
+                    ..cel
+                }
+            })
+            .collect();
+        self.rebuild_canvas(width, height, cels)
     }
 
     /// Adds an empty image layer, or an empty group, at `slot`. Returns its id.
@@ -1497,5 +1609,136 @@ mod tests {
         );
         assert!(!doc.set_group_collapsed(L1, true));
         assert_eq!((doc.history().len(), doc.revision()), (steps, revision));
+    }
+}
+
+#[cfg(test)]
+mod canvas_tests {
+    use super::*;
+    use crate::color::Rgba8;
+
+    const RED: Rgba8 = Rgba8::rgb(255, 0, 0);
+    const L1: LayerId = LayerId(1);
+
+    /// 8×8 with a red 2×2 block at (5, 5) and that block selected.
+    fn document() -> Document {
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        let block = Image::from_pixels(2, 2, vec![RED; 4]).unwrap();
+        doc.transact("Paint", |tx| {
+            tx.set_pixels(L1, 0, Rect::new(5, 5, 2, 2), &block)?;
+            tx.set_selection(Some(Mask::from_rect(8, 8, Rect::new(5, 5, 2, 2))))
+        })
+        .unwrap();
+        doc
+    }
+
+    fn step(
+        doc: &mut Document,
+        edit: impl FnOnce(&mut Transaction<'_>) -> Result<(), SpriteError>,
+    ) {
+        let before = doc.sprite().clone();
+        let steps = doc.history().len();
+        doc.transact("Edit", edit).unwrap();
+        let after = doc.sprite().clone();
+        assert_eq!(doc.history().len(), steps + 1);
+        doc.undo();
+        assert_eq!(*doc.sprite(), before);
+        doc.redo();
+        assert_eq!(*doc.sprite(), after);
+    }
+
+    #[test]
+    fn selection_changes_are_undo_steps_and_must_fit_the_canvas() {
+        let mut doc = document();
+        step(&mut doc, |tx| tx.set_selection(None));
+        assert!(doc.sprite().selection().is_none());
+        assert!(doc.sprite().is_selected(0, 0));
+
+        // An empty mask is the same as no selection, and so not a change here.
+        let steps = doc.history().len();
+        doc.transact("Empty", |tx| tx.set_selection(Some(Mask::empty(8, 8))))
+            .unwrap();
+        assert_eq!(doc.history().len(), steps);
+
+        let wrong = doc.transact("Wrong", |tx| tx.set_selection(Some(Mask::full(4, 4))));
+        assert!(matches!(wrong, Err(SpriteError::SizeMismatch { .. })));
+
+        step(&mut doc, |tx| {
+            tx.set_selection(Some(Mask::from_rect(8, 8, Rect::new(0, 0, 2, 2))))
+        });
+        assert!(doc.sprite().is_selected(1, 1) && !doc.sprite().is_selected(5, 5));
+    }
+
+    #[test]
+    fn resizing_the_canvas_shifts_and_clips_and_drops_the_selection() {
+        let mut doc = document();
+        // Grow to the left and top by 4: everything moves 4 right and down.
+        step(&mut doc, |tx| tx.resize_canvas(12, 12, 4, 4));
+        assert_eq!(doc.sprite().bounds(), Rect::from_size(12, 12));
+        assert_eq!(
+            doc.sprite().cel(L1, 0).unwrap().rect(),
+            Rect::new(9, 9, 2, 2)
+        );
+        assert!(doc.sprite().selection().is_none());
+        assert_eq!(doc.take_damage(), Rect::from_size(12, 12));
+
+        // Shrink so that only one column of the block is left.
+        step(&mut doc, |tx| tx.resize_canvas(10, 12, 0, 0));
+        assert_eq!(
+            doc.sprite().cel(L1, 0).unwrap().rect(),
+            Rect::new(9, 9, 1, 2)
+        );
+
+        // Undoing all the way brings back the cut-off pixels and the selection.
+        while doc.undo() {}
+        doc.jump_to(1);
+        assert_eq!(
+            doc.sprite().cel(L1, 0).unwrap().rect(),
+            Rect::new(5, 5, 2, 2)
+        );
+        assert!(doc.sprite().selection().is_some());
+
+        let bad = doc.transact("Bad", |tx| tx.resize_canvas(0, 5, 0, 0));
+        assert_eq!(bad, Err(SpriteError::InvalidSize(0, 5)));
+        // The same size and no shift is not a change.
+        doc.transact("Deselect", |tx| tx.set_selection(None))
+            .unwrap();
+        let steps = doc.history().len();
+        doc.transact("Same", |tx| tx.resize_canvas(8, 8, 0, 0))
+            .unwrap();
+        assert_eq!(doc.history().len(), steps);
+    }
+
+    #[test]
+    fn cropping_to_the_selection_is_a_resize_to_its_bounds() {
+        let mut doc = document();
+        let bounds = doc.sprite().selection().unwrap().bounds();
+        step(&mut doc, |tx| {
+            tx.resize_canvas(bounds.w, bounds.h, -bounds.x, -bounds.y)
+        });
+        assert_eq!(doc.sprite().bounds(), Rect::from_size(2, 2));
+        assert_eq!(
+            doc.sprite().cel(L1, 0).unwrap().rect(),
+            Rect::from_size(2, 2)
+        );
+    }
+
+    #[test]
+    fn scaling_the_sprite_scales_positions_too() {
+        let mut doc = document();
+        step(&mut doc, |tx| tx.scale_sprite(16, 16));
+        assert_eq!(doc.sprite().bounds(), Rect::from_size(16, 16));
+        assert_eq!(
+            doc.sprite().cel(L1, 0).unwrap().rect(),
+            Rect::new(10, 10, 4, 4)
+        );
+
+        step(&mut doc, |tx| tx.scale_sprite(8, 4));
+        assert_eq!(
+            doc.sprite().cel(L1, 0).unwrap().rect(),
+            Rect::new(5, 3, 2, 1)
+        );
+        let bad = doc.transact("Bad", |tx| tx.scale_sprite(5000, 5));
+        assert_eq!(bad, Err(SpriteError::InvalidSize(5000, 5)));
     }
 }

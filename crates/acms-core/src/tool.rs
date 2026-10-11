@@ -37,6 +37,50 @@ pub struct ToolContext<'a> {
     pub primary: &'a mut Rgba8,
     pub secondary: &'a mut Rgba8,
     pub brush: Brush,
+    pub options: ToolOptions,
+}
+
+/// Settings shared by the tools that are not about the brush.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolOptions {
+    /// Rectangle and ellipse are filled rather than outlined.
+    pub shape_filled: bool,
+    /// Bucket and magic wand only take pixels connected to the one clicked.
+    pub fill_contiguous: bool,
+    /// How different a pixel may be (per channel) and still count as the same colour.
+    pub tolerance: u8,
+    /// The gradient is made of the two colours in a dither pattern, not blended.
+    pub gradient_dither: bool,
+}
+
+impl Default for ToolOptions {
+    fn default() -> Self {
+        Self {
+            shape_filled: false,
+            fill_contiguous: true,
+            tolerance: 0,
+            gradient_dither: true,
+        }
+    }
+}
+
+/// A group of settings a tool uses, for the Tool Options panel to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionKind {
+    Brush,
+    ShapeFill,
+    Similarity,
+    Gradient,
+    SelectionMode,
+}
+
+/// A shape a tool is dragging out, drawn by the view on top of the canvas. Coordinates are
+/// canvas pixels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outline {
+    Rect(Rect),
+    /// Corner-to-corner path through pixel centres, closed.
+    Path(Vec<Point>),
 }
 
 /// What the viewport should draw around the pointer while this tool is active.
@@ -72,6 +116,21 @@ pub trait Tool {
 
     fn cursor_hint(&self) -> CursorHint {
         CursorHint::Pixel
+    }
+
+    /// The settings this tool uses.
+    fn options(&self) -> &'static [OptionKind] {
+        &[]
+    }
+
+    /// The shape being dragged out, if the tool shows one.
+    fn outline(&self) -> Option<Outline> {
+        None
+    }
+
+    /// Whether the tool paints on the layer, and so cannot work on a locked or hidden one.
+    fn paints(&self) -> bool {
+        true
     }
 }
 
@@ -188,6 +247,10 @@ impl Tool for BrushTool {
     fn cursor_hint(&self) -> CursorHint {
         CursorHint::Brush
     }
+
+    fn options(&self) -> &'static [OptionKind] {
+        &[OptionKind::Brush]
+    }
 }
 
 /// Picks the colour under the pointer: into the primary colour with the primary button, the
@@ -243,4 +306,8 @@ impl Tool for Eyedropper {
     }
 
     fn cancel(&mut self, _ctx: &mut ToolContext<'_>) {}
+
+    fn paints(&self) -> bool {
+        false
+    }
 }

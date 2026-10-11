@@ -4,14 +4,37 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phases 0, 1 and 2 are done** (skeleton, drawing on a canvas, layers). Next is Phase 3 (not started).
+**Phases 0, 1 and 2 are done** (skeleton, drawing on a canvas, layers). **Phase 3 — Selections and shape tools: in progress.**
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, directories 6, serde 1,
 serde_json 1, thiserror 2, anyhow 1.
 
-## Phase 2 task list
+## Phase 3 task list
 
+Core:
+
+- [ ] Selection as a mask on the sprite: rectangle, lasso (polygon), magic wand; replace / add / subtract / intersect; invert, select all, deselect; undoable
+- [ ] Selection is a mask stage of the stroke pipeline, so every tool respects it
+- [ ] Shape tools: line, rectangle, ellipse (outline and filled)
+- [ ] Bucket fill (contiguous / global, tolerance), gradient (dithered or smooth)
+- [ ] Move tool; cut / copy / paste / delete; flip, rotate 90°, nearest-neighbour scale of the selection
+- [ ] Canvas resize, crop to selection, sprite scale
+- [ ] Several open documents in the editor
+
+IO:
+
+- [ ] Golden images for line, rectangle, ellipse, bucket, gradient, and for drawing inside a selection
+
+App:
+
+- [ ] Commands, shortcuts and menus for all of the above; system clipboard as an image
+- [ ] Canvas: selection outline (marching ants), tool previews, modifier keys for selection modes
+- [ ] Tool Options per tool; dialogs for canvas size, sprite size, scale selection
+- [ ] Tabs for several open sprites (moved here from section 5, agreed 2026-10-11)
+- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
+
+## Phase 2 task list (done)
 Core:
 
 - [x] Layer tree: image layers (opacity, blend mode, visible, locked, alpha lock) and groups (children, visible, collapsed)

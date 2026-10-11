@@ -135,6 +135,52 @@ impl Image {
         bounds
     }
 
+    /// A new image of the given size whose pixel `(x, y)` is this image's pixel `source(x, y)`.
+    fn remapped(&self, width: u32, height: u32, source: impl Fn(i32, i32) -> (i32, i32)) -> Self {
+        let mut out = Self::new(width, height);
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                let (sx, sy) = source(x, y);
+                out.set(x, y, self.get(sx, sy));
+            }
+        }
+        out
+    }
+
+    /// Mirrored left to right.
+    pub fn flipped_horizontal(&self) -> Self {
+        let last = self.width as i32 - 1;
+        self.remapped(self.width, self.height, |x, y| (last - x, y))
+    }
+
+    /// Mirrored top to bottom.
+    pub fn flipped_vertical(&self) -> Self {
+        let last = self.height as i32 - 1;
+        self.remapped(self.width, self.height, |x, y| (x, last - y))
+    }
+
+    /// Turned a quarter clockwise; width and height swap.
+    pub fn rotated_clockwise(&self) -> Self {
+        let last = self.height as i32 - 1;
+        self.remapped(self.height, self.width, |x, y| (y, last - x))
+    }
+
+    /// Turned a quarter anticlockwise; width and height swap.
+    pub fn rotated_anticlockwise(&self) -> Self {
+        let last = self.width as i32 - 1;
+        self.remapped(self.height, self.width, |x, y| (last - y, x))
+    }
+
+    /// Resized to any size with nearest-neighbour sampling, which keeps pixels hard-edged.
+    pub fn scaled_to(&self, width: u32, height: u32) -> Self {
+        let (from_w, from_h) = (u64::from(self.width), u64::from(self.height));
+        self.remapped(width, height, |x, y| {
+            let sx = (x as u64 * from_w / u64::from(width.max(1))) as i32;
+            let sy = (y as u64 * from_h / u64::from(height.max(1))) as i32;
+            (sx, sy)
+        })
+    }
+
     /// Nearest-neighbour upscale by a whole factor.
     pub fn scaled_up(&self, factor: u32) -> Self {
         let factor = factor.max(1);
@@ -227,6 +273,64 @@ mod tests {
         image.set(6, 5, BLUE);
         assert_eq!(image.content_bounds(), Rect::new(2, 3, 5, 3));
         assert_eq!(Image::new(0, 0).content_bounds(), Rect::EMPTY);
+    }
+
+    /// ```text
+    /// R B
+    /// . .
+    /// G .
+    /// ```
+    fn corner_marks() -> Image {
+        let mut image = Image::new(2, 3);
+        image.set(0, 0, RED);
+        image.set(1, 0, BLUE);
+        image.set(0, 2, Rgba8::rgb(0, 255, 0));
+        image
+    }
+
+    #[test]
+    fn flips_and_quarter_turns() {
+        let image = corner_marks();
+        let green = Rgba8::rgb(0, 255, 0);
+
+        let h = image.flipped_horizontal();
+        assert_eq!((h.get(0, 0), h.get(1, 0), h.get(1, 2)), (BLUE, RED, green));
+        let v = image.flipped_vertical();
+        assert_eq!((v.get(0, 2), v.get(1, 2), v.get(0, 0)), (RED, BLUE, green));
+
+        // Clockwise: the top row becomes the right column.
+        let cw = image.rotated_clockwise();
+        assert_eq!((cw.width(), cw.height()), (3, 2));
+        assert_eq!(
+            (cw.get(2, 0), cw.get(2, 1), cw.get(0, 0)),
+            (RED, BLUE, green)
+        );
+        let ccw = image.rotated_anticlockwise();
+        assert_eq!(
+            (ccw.get(0, 1), ccw.get(0, 0), ccw.get(2, 1)),
+            (RED, BLUE, green)
+        );
+
+        assert_eq!(image.flipped_horizontal().flipped_horizontal(), image);
+        assert_eq!(image.rotated_clockwise().rotated_anticlockwise(), image);
+        let turned_twice = image.rotated_clockwise().rotated_clockwise();
+        assert_eq!(turned_twice, image.flipped_horizontal().flipped_vertical());
+    }
+
+    #[test]
+    fn scaling_to_a_size_samples_the_nearest_pixel() {
+        let image = corner_marks();
+        assert_eq!(image.scaled_to(4, 6), image.scaled_up(2));
+        assert_eq!(image.scaled_to(2, 3), image);
+        // Shrinking keeps a pixel from each block.
+        let small = image.scaled_up(4).scaled_to(2, 3);
+        assert_eq!(small, image);
+        // Uneven factors.
+        let wide = image.scaled_to(5, 3);
+        assert_eq!(
+            (wide.get(0, 0), wide.get(2, 0), wide.get(3, 0)),
+            (RED, RED, BLUE)
+        );
     }
 
     #[test]

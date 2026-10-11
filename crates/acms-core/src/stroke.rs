@@ -11,9 +11,12 @@
 //! ```
 
 use crate::color::Rgba8;
-use crate::document::Document;
+use std::sync::Arc;
+
+use crate::document::{Document, Transaction};
 use crate::geom::{Point, Rect};
 use crate::image::Image;
+use crate::selection::Mask;
 use crate::sprite::{LayerId, Sprite, SpriteError};
 
 pub const MAX_BRUSH_SIZE: u32 = 64;
@@ -211,14 +214,20 @@ impl StrokeBuffer {
     }
 }
 
-/// A stroke in progress on one cel.
+/// A stroke in progress on one cel: everything a tool draws between pointer down and up.
+///
+/// Pencil-like tools call [`Stroke::extend_to`]. Tools that redraw their whole shape while the
+/// pointer moves call [`Stroke::reset`] and then [`Stroke::stamp`] or [`Stroke::plot`] again.
 pub struct Stroke {
     layer: LayerId,
     frame: usize,
+    canvas: Rect,
     footprint: Vec<Point>,
     brush: Brush,
     ink: Ink,
     alpha_lock: bool,
+    /// The selection when the stroke began; pixels outside it are left alone.
+    selection: Option<Arc<Mask>>,
     last: Option<Point>,
     buffer: StrokeBuffer,
 }
@@ -239,10 +248,12 @@ impl Stroke {
         Ok(Self {
             layer,
             frame,
+            canvas: sprite.bounds(),
             footprint: brush.footprint(),
             brush,
             ink,
             alpha_lock,
+            selection: sprite.selection().cloned(),
             last: None,
             buffer,
         })
@@ -256,9 +267,73 @@ impl Stroke {
         self.frame
     }
 
+    pub fn brush(&self) -> Brush {
+        self.brush
+    }
+
     /// What the stroke has drawn so far.
     pub fn buffer(&self) -> &StrokeBuffer {
         &self.buffer
+    }
+
+    /// Wipes what has been drawn so far, to draw the shape again from scratch. Returns the
+    /// canvas area that was covered.
+    pub fn reset(&mut self) -> Rect {
+        let covered = self.buffer.bounds();
+        self.buffer.reset(self.canvas);
+        self.last = None;
+        covered
+    }
+
+    /// Runs one pixel through ink and masks into the preview. Each pixel is inked once per
+    /// stroke, from what the sprite held before it.
+    pub fn plot(&mut self, sprite: &Sprite, x: i32, y: i32, ink: Ink) {
+        if !self.buffer.is_free(x, y) {
+            return;
+        }
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|mask| !mask.contains(x, y))
+        {
+            return;
+        }
+        let original = sprite.pixel(self.layer, self.frame, x, y);
+        let inked = ink.apply(original);
+        let masked = if self.alpha_lock {
+            lock_alpha(original, inked)
+        } else {
+            inked
+        };
+        self.buffer.put(x, y, masked);
+    }
+
+    /// Sets one pixel regardless of selection and alpha lock, for tools that move pixels
+    /// rather than paint them. The first write to a pixel wins.
+    pub fn plot_unmasked(&mut self, x: i32, y: i32, color: Rgba8) {
+        if self.buffer.is_free(x, y) {
+            self.buffer.put(x, y, color.normalized());
+        }
+    }
+
+    /// Paints one pixel with the stroke's ink, without the brush.
+    pub fn fill(&mut self, sprite: &Sprite, x: i32, y: i32) {
+        self.plot(sprite, x, y, self.ink);
+    }
+
+    /// Stamps the brush at `center` with the stroke's ink.
+    pub fn stamp(&mut self, sprite: &Sprite, center: Point) {
+        for index in 0..self.footprint.len() {
+            let offset = self.footprint[index];
+            self.plot(sprite, center.x + offset.x, center.y + offset.y, self.ink);
+        }
+    }
+
+    /// Stamps the brush on every pixel of the straight line between two points.
+    pub fn stamp_line(&mut self, sprite: &Sprite, from: Point, to: Point) {
+        for center in line(from, to) {
+            self.stamp(sprite, center);
+        }
     }
 
     /// Continues the stroke to `point`, filling every pixel on the way from the previous
@@ -266,26 +341,7 @@ impl Stroke {
     pub fn extend_to(&mut self, sprite: &Sprite, point: Point) -> Rect {
         let from = self.last.unwrap_or(point);
         self.last = Some(point);
-
-        let cel = sprite.cel(self.layer, self.frame);
-        // The first pixel of a continued segment was stamped by the previous call.
-        let skip = usize::from(from != point);
-        for center in line(from, point).skip(skip) {
-            for offset in &self.footprint {
-                let (x, y) = (center.x + offset.x, center.y + offset.y);
-                // Each pixel is inked once per stroke, from what the sprite held before it.
-                if self.buffer.is_free(x, y) {
-                    let original = cel.map_or(Rgba8::TRANSPARENT, |cel| cel.pixel(x, y));
-                    let inked = self.ink.apply(original);
-                    let masked = if self.alpha_lock {
-                        lock_alpha(original, inked)
-                    } else {
-                        inked
-                    };
-                    self.buffer.put(x, y, masked);
-                }
-            }
-        }
+        self.stamp_line(sprite, from, point);
 
         self.brush
             .bounds_at(from)
@@ -293,9 +349,9 @@ impl Stroke {
             .intersect(sprite.bounds())
     }
 
-    /// Writes the stroke into the document as one undo step called `name`, and hands the
-    /// preview buffer back for the next stroke.
-    pub fn commit(self, document: &mut Document, name: &str) -> Result<StrokeBuffer, SpriteError> {
+    /// Writes the stroke into a transaction that is already open, and hands the preview
+    /// buffer back for the next stroke.
+    pub fn apply(self, tx: &mut Transaction<'_>) -> Result<StrokeBuffer, SpriteError> {
         let Self {
             layer,
             frame,
@@ -304,7 +360,7 @@ impl Stroke {
         } = self;
         let rect = buffer.bounds();
         if !rect.is_empty() {
-            let mut pixels = document.sprite().read_region(layer, frame, rect);
+            let mut pixels = tx.sprite().read_region(layer, frame, rect);
             for y in rect.y..rect.bottom() {
                 for x in rect.x..rect.right() {
                     if let Some(color) = buffer.get(x, y) {
@@ -312,9 +368,15 @@ impl Stroke {
                     }
                 }
             }
-            document.transact(name, |tx| tx.set_pixels(layer, frame, rect, &pixels))?;
+            tx.set_pixels(layer, frame, rect, &pixels)?;
         }
         Ok(buffer)
+    }
+
+    /// Writes the stroke into the document as one undo step called `name`, and hands the
+    /// preview buffer back for the next stroke.
+    pub fn commit(self, document: &mut Document, name: &str) -> Result<StrokeBuffer, SpriteError> {
+        document.transact(name, |tx| self.apply(tx))
     }
 
     /// Abandons the stroke. Returns the preview buffer and the canvas area it had covered.
@@ -323,7 +385,6 @@ impl Stroke {
         (self.buffer, rect)
     }
 }
-
 /// Renders a brush footprint into a small image, for tests and brush previews.
 pub fn footprint_image(brush: Brush, color: Rgba8) -> Image {
     let half = (brush.size() / 2) as i32;

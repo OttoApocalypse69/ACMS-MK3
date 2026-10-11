@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::color::Rgba8;
 use crate::geom::{Point, Rect};
 use crate::image::Image;
+use crate::selection::Mask;
 
 /// Largest width or height of a sprite. The canvas is shown as a single texture, and this is
 /// a size every GPU the app targets can hold.
@@ -437,6 +438,17 @@ pub struct Sprite {
     frames: Vec<Frame>,
     /// A missing entry is an empty cel.
     cels: HashMap<(LayerId, usize), Cel>,
+    /// The pixels tools may change; `None` means all of them. Never an empty mask.
+    selection: Option<Arc<Mask>>,
+}
+
+/// The size of the canvas and everything whose coordinates depend on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CanvasState {
+    pub width: u32,
+    pub height: u32,
+    pub cels: HashMap<(LayerId, usize), Cel>,
+    pub selection: Option<Arc<Mask>>,
 }
 
 impl Sprite {
@@ -483,6 +495,7 @@ impl Sprite {
             layers,
             frames,
             cels: HashMap::new(),
+            selection: None,
         };
         let mut ids: Vec<LayerId> = sprite.walk().iter().map(|entry| entry.layer.id).collect();
         ids.sort();
@@ -578,6 +591,66 @@ impl Sprite {
 
     pub fn frames(&self) -> &[Frame] {
         &self.frames
+    }
+
+    /// The selection, or `None` when nothing is selected and every pixel may be changed.
+    pub fn selection(&self) -> Option<&Arc<Mask>> {
+        self.selection.as_ref()
+    }
+
+    /// Whether tools may change this pixel as far as the selection is concerned.
+    pub fn is_selected(&self, x: i32, y: i32) -> bool {
+        self.selection
+            .as_ref()
+            .is_none_or(|mask| mask.contains(x, y))
+    }
+
+    pub(crate) fn set_selection(&mut self, selection: Option<Arc<Mask>>) {
+        self.selection = selection.filter(|mask| !mask.is_empty());
+    }
+
+    pub(crate) fn canvas_state(&self) -> CanvasState {
+        CanvasState {
+            width: self.width,
+            height: self.height,
+            cels: self.cels.clone(),
+            selection: self.selection.clone(),
+        }
+    }
+
+    pub(crate) fn set_canvas_state(&mut self, state: CanvasState) {
+        self.width = state.width;
+        self.height = state.height;
+        self.cels = state.cels;
+        self.selection = state.selection;
+    }
+
+    /// Every cel as a full image positioned on the canvas, to rebuild them for another size.
+    pub(crate) fn cel_sources(&self) -> Vec<CelSource> {
+        let mut sources: Vec<CelSource> = self
+            .cels
+            .iter()
+            .map(|(&(layer, frame), cel)| CelSource {
+                layer,
+                frame,
+                origin: cel.origin,
+                image: (*cel.image).clone(),
+            })
+            .collect();
+        sources.sort_by_key(|cel| (cel.layer, cel.frame));
+        sources
+    }
+
+    /// Replaces the canvas size and every cel. The cels are clipped and cropped as usual.
+    pub(crate) fn rebuild_canvas(&mut self, width: u32, height: u32, cels: Vec<CelSource>) {
+        self.width = width;
+        self.height = height;
+        self.cels.clear();
+        self.selection = None;
+        for cel in cels {
+            let rect = cel.image.bounds().translated(cel.origin.x, cel.origin.y);
+            self.write_region(cel.layer, cel.frame, rect, &cel.image);
+        }
     }
 
     /// The cel of a layer in a frame, or `None` if nothing is drawn there.

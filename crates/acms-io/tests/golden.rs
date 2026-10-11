@@ -389,3 +389,94 @@ fn merging_down_and_flattening_do_not_change_the_picture() {
         check_image(&format!("blend_{}", mode.id()), &picture);
     }
 }
+
+fn tool(editor: &mut Editor, id: &str) {
+    assert!(editor.set_active_tool(id), "no tool `{id}`");
+}
+
+#[test]
+fn line_rectangle_and_ellipse() {
+    let mut editor = editor();
+    tool(&mut editor, "line");
+    primary(&mut editor, &[(1, 1), (30, 5)]);
+    editor.brush = Brush::new(BrushShape::Round, 3);
+    drag(&mut editor, PointerButton::Secondary, &[(2, 9), (29, 7)]);
+
+    editor.brush = Brush::new(BrushShape::Round, 1);
+    tool(&mut editor, "rectangle");
+    primary(&mut editor, &[(1, 12), (9, 19)]);
+    editor.options.shape_filled = true;
+    drag(&mut editor, PointerButton::Secondary, &[(12, 12), (19, 19)]);
+    editor.options.shape_filled = false;
+    editor.brush = Brush::new(BrushShape::Square, 2);
+    primary(&mut editor, &[(22, 12), (30, 19)]);
+
+    editor.brush = Brush::new(BrushShape::Round, 1);
+    tool(&mut editor, "ellipse");
+    primary(&mut editor, &[(1, 22), (12, 30)]);
+    editor.options.shape_filled = true;
+    drag(&mut editor, PointerButton::Secondary, &[(15, 22), (21, 30)]);
+    editor.options.shape_filled = false;
+    primary(&mut editor, &[(24, 23), (30, 29)]);
+    check("shapes", &editor);
+}
+
+#[test]
+fn bucket_fill_contiguous_and_global() {
+    let mut editor = editor();
+    // Two frames and a diagonal that cuts the big one in half.
+    tool(&mut editor, "rectangle");
+    primary(&mut editor, &[(2, 2), (20, 20)]);
+    primary(&mut editor, &[(23, 23), (30, 30)]);
+    tool(&mut editor, "line");
+    primary(&mut editor, &[(2, 2), (20, 20)]);
+
+    tool(&mut editor, "bucket");
+    drag(&mut editor, PointerButton::Secondary, &[(15, 5)]);
+    editor.primary = YELLOW;
+    primary(&mut editor, &[(26, 26)]);
+    // Every red pixel, wherever it is, becomes yellow.
+    editor.options.fill_contiguous = false;
+    primary(&mut editor, &[(2, 2)]);
+    check("bucket", &editor);
+}
+
+#[test]
+fn gradients_inside_selections() {
+    let mut editor = editor();
+    // Left half: dithered, left to right.
+    tool(&mut editor, "select_rectangle");
+    primary(&mut editor, &[(0, 0), (15, 31)]);
+    tool(&mut editor, "gradient");
+    primary(&mut editor, &[(0, 0), (15, 0)]);
+
+    // Right half: smooth, top to bottom, the colours the other way round.
+    tool(&mut editor, "select_rectangle");
+    primary(&mut editor, &[(16, 0), (31, 31)]);
+    tool(&mut editor, "gradient");
+    editor.options.gradient_dither = false;
+    drag(&mut editor, PointerButton::Secondary, &[(16, 0), (16, 31)]);
+    check("gradient", &editor);
+}
+
+#[test]
+fn drawing_and_moving_inside_a_lasso_selection() {
+    let mut editor = editor();
+    tool(&mut editor, "lasso");
+    primary(&mut editor, &[(16, 2), (29, 16), (16, 29), (3, 16)]);
+
+    // A fat scribble across everything only lands inside the diamond.
+    tool(&mut editor, "pencil");
+    editor.brush = Brush::new(BrushShape::Round, 9);
+    primary(&mut editor, &[(0, 6), (31, 12), (0, 20), (31, 26)]);
+    editor.primary = YELLOW;
+    editor.brush = Brush::new(BrushShape::Square, 3);
+    primary(&mut editor, &[(0, 16), (31, 16)]);
+
+    // Cut a square out of the middle and drag it to the corner.
+    tool(&mut editor, "select_rectangle");
+    primary(&mut editor, &[(12, 12), (19, 19)]);
+    tool(&mut editor, "move");
+    primary(&mut editor, &[(15, 15), (26, 26)]);
+    check("selection", &editor);
+}

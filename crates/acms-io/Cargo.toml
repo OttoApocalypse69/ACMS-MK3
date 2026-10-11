@@ -1,0 +1,10 @@
+[package]
+name = "acms-io"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+acms-core = { version = "0.1.0", path = "../acms-core" }
+
+[lints]
+workspace = true

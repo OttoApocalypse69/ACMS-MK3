@@ -1,0 +1,15 @@
+[package]
+name = "acms-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+acms-core = { version = "0.1.0", path = "../acms-core" }
+acms-script = { version = "0.1.0", path = "../acms-script" }
+anyhow = "1.0.104"
+eframe = "0.36.2"
+egui = "0.36.2"
+egui_dock = "0.21.1"
+
+[lints]
+workspace = true

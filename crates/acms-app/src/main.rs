@@ -11,9 +11,12 @@ mod dialogs;
 mod fuzzy;
 mod keymap;
 mod layer_commands;
+mod layers_panel;
+mod menu;
 mod palette;
 mod panels;
 mod state;
+mod status;
 mod theme;
 
 fn main() -> anyhow::Result<()> {

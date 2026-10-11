@@ -17,6 +17,7 @@ use egui_dock::{DockState, NodeIndex, TabStyle, TabViewer};
 use crate::canvas::CanvasView;
 use crate::commands;
 use crate::keymap::Keymap;
+use crate::layers_panel::{self, LayersUi};
 use crate::state::AppState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -78,8 +79,8 @@ pub fn default_layout() -> DockState<Panel> {
     // A fraction is the share of the left / top side of the split, whichever node ends up
     // there (checked against egui_dock 0.21; its `split_left` docs say otherwise).
     let [main, colour] = tree.split_right(NodeIndex::root(), 0.77, vec![Colour]);
-    let [_colour, palette] = tree.split_below(colour, 0.47, vec![Palette]);
-    tree.split_below(palette, 0.3, vec![Layers, History]);
+    let [_colour, palette] = tree.split_below(colour, 0.5, vec![Palette]);
+    tree.split_below(palette, 0.37, vec![Layers, History]);
 
     let [main, _bottom] = tree.split_below(main, 0.78, vec![Timeline, Tileset, ScriptConsole, Log]);
     let [_canvas, tools] = tree.split_left(main, 0.17, vec![Tools]);
@@ -114,6 +115,7 @@ struct ColourUi {
 #[derive(Default)]
 pub struct PanelsUi {
     pub canvas: CanvasView,
+    pub layers: LayersUi,
     colour: ColourUi,
 }
 
@@ -152,6 +154,7 @@ impl TabViewer for PanelViewer<'_> {
             Panel::ToolOptions => tool_options(ui, state, registry),
             Panel::Colour => colour(ui, state, registry, keymap, &mut ui_state.colour),
             Panel::Palette => palette(ui, state, registry),
+            Panel::Layers => layers_panel::show(ui, state, registry, keymap, &mut ui_state.layers),
             Panel::History => history(ui, state, registry),
             Panel::Log => log(ui, state),
             other => {
@@ -187,7 +190,7 @@ impl TabViewer for PanelViewer<'_> {
 type Registry = CommandRegistry<AppState>;
 
 /// `"Pencil (B)"`: a label with the shortcut of the command behind it, if it has one.
-fn with_shortcut(ui: &Ui, keymap: &Keymap, label: &str, command: &str) -> String {
+pub(crate) fn with_shortcut(ui: &Ui, keymap: &Keymap, label: &str, command: &str) -> String {
     match keymap.shortcuts_for(command).next() {
         Some(shortcut) => format!("{label} ({})", ui.ctx().format_shortcut(shortcut)),
         None => label.to_owned(),
@@ -330,7 +333,7 @@ fn colour(
         panel.hsva = Hsva::from_srgba_unmultiplied(current.to_array());
         panel.hsva_for = Some(current);
     }
-    ui.spacing_mut().slider_width = ui.available_width().clamp(100.0, 150.0);
+    ui.spacing_mut().slider_width = ui.available_width().clamp(100.0, 130.0);
     if color_picker::color_picker_hsva_2d(ui, &mut panel.hsva, Alpha::OnlyBlend) {
         let picked = Rgba8::from_array(panel.hsva.to_srgba_unmultiplied());
         panel.hsva_for = Some(picked);

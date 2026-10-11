@@ -1,8 +1,9 @@
 //! The canvas viewport (see `PLAN.md`, section 4.6): shows the sprite, turns the mouse wheel
 //! and drags into zoom and pan commands, and hands pointer input to the active tool.
 
+use acms_core::color::Rgba8;
 use acms_core::command::{CommandRegistry, Params};
-use acms_core::compositor;
+use acms_core::compositor::FrameCache;
 use acms_core::editor::Editor;
 use acms_core::geom::{Point, Rect as PixelRect};
 use acms_core::image::Image;
@@ -74,7 +75,9 @@ fn color_image(image: &Image) -> ColorImage {
 /// What the canvas keeps between frames. None of it is part of the document.
 #[derive(Default)]
 pub struct CanvasView {
-    /// The flattened sprite, and the editor generation it was made for.
+    /// The flattened frame; only what changed is recomposed.
+    cache: FrameCache,
+    /// The texture showing `cache`, and the editor generation it was made for.
     sprite_texture: Option<(u64, TextureHandle)>,
     checker_texture: Option<(ThemeKind, TextureHandle)>,
     /// Wheel movement not yet turned into a whole zoom step.
@@ -84,9 +87,16 @@ pub struct CanvasView {
     /// The last pixel reported to the tool.
     last_pixel: Point,
     geometry: Option<Geometry>,
+    /// The sprite pixel under the pointer and the colour seen there.
+    hover: Option<(Point, Rgba8)>,
 }
 
 impl CanvasView {
+    /// The sprite pixel under the pointer and the colour seen there, as of the last frame.
+    pub fn hover(&self) -> Option<(Point, Rgba8)> {
+        self.hover
+    }
+
     pub fn show(
         &mut self,
         ui: &mut Ui,
@@ -104,6 +114,7 @@ impl CanvasView {
         let Some(sprite) = state.editor.document().map(|document| document.sprite()) else {
             self.geometry = None;
             self.drawing = None;
+            self.hover = None;
             empty_state(ui, viewport, state, registry, keymap);
             return;
         };
@@ -172,15 +183,21 @@ impl CanvasView {
             StrokeKind::Outside,
         );
 
+        let hover_pixel = response.hover_pos().map(|pos| geometry.pixel_at(pos));
+        self.hover = hover_pixel.map(|pixel| (pixel, self.cache.image().get(pixel.x, pixel.y)));
+
         // What the tool would touch at the pointer.
+        let brush_tool = state.editor.cursor_hint() == CursorHint::Brush;
         if panning {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-        } else if let Some(pos) = response.hover_pos() {
+        } else if let Some(pixel) = hover_pixel {
             if space_held {
                 ui.ctx().set_cursor_icon(CursorIcon::Grab);
+            } else if brush_tool && state.editor.draw_block().is_some() {
+                // The status bar says why.
+                ui.ctx().set_cursor_icon(CursorIcon::NotAllowed);
             } else {
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-                let pixel = geometry.pixel_at(pos);
                 let covered = match state.editor.cursor_hint() {
                     CursorHint::Brush => state.editor.brush.bounds_at(pixel),
                     CursorHint::Pixel => PixelRect::new(pixel.x, pixel.y, 1, 1),
@@ -364,20 +381,29 @@ impl CanvasView {
         let damage = editor.take_damage();
         let document = editor.document()?;
         let (sprite, frame) = (document.sprite(), document.active_frame());
+        let size = [sprite.width() as usize, sprite.height() as usize];
 
-        match &mut self.sprite_texture {
-            Some((made_for, texture)) if *made_for == generation => {
-                if !damage.is_empty() {
-                    // Only the part that changed is flattened and uploaded again.
-                    let part = compositor::compose_rect(sprite, frame, editor.overlay(), damage);
-                    let at = [damage.x as usize, damage.y as usize];
+        let current = match &mut self.sprite_texture {
+            Some((made_for, texture)) if *made_for == generation && texture.size() == size => {
+                Some(texture)
+            }
+            _ => None,
+        };
+        match current {
+            Some(texture) => {
+                // Only the part that changed is flattened and uploaded again.
+                let redrawn = self.cache.refresh(sprite, frame, editor.overlay(), damage);
+                if !redrawn.is_empty() {
+                    let part = self.cache.image().crop(redrawn);
+                    let at = [redrawn.x as usize, redrawn.y as usize];
                     texture.set_partial(at, color_image(&part), SPRITE_TEXTURE);
                 }
             }
-            _ => {
-                let all =
-                    compositor::compose_rect(sprite, frame, editor.overlay(), sprite.bounds());
-                let texture = ctx.load_texture("canvas", color_image(&all), SPRITE_TEXTURE);
+            None => {
+                self.cache.invalidate();
+                self.cache.refresh(sprite, frame, editor.overlay(), damage);
+                let image = color_image(self.cache.image());
+                let texture = ctx.load_texture("canvas", image, SPRITE_TEXTURE);
                 self.sprite_texture = Some((generation, texture));
             }
         }
@@ -385,7 +411,6 @@ impl CanvasView {
             .as_ref()
             .map(|(_, texture)| texture.id())
     }
-
     /// A 2×2 texture that repeats into the checkerboard behind transparent pixels.
     fn checker(&mut self, ctx: &egui::Context, theme: ThemeKind) -> egui::TextureId {
         if !matches!(&self.checker_texture, Some((made_for, _)) if *made_for == theme) {

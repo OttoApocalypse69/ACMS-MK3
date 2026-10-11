@@ -14,3 +14,8 @@ license = "MIT OR Apache-2.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+# The pixel loops (compositing, strokes) live in acms-core. Optimising just that crate keeps
+# `cargo run` usable on large or many-layered sprites without slowing down rebuilds of the app.
+[profile.dev.package.acms-core]
+opt-level = 2

@@ -207,6 +207,9 @@ pub fn dock_style(egui_style: &egui::Style, kind: ThemeKind) -> egui_dock::Style
     style.tab.hovered.text_color = t.text;
     style.tab.hovered.outline_color = Color32::TRANSPARENT;
 
+    // egui_dock keeps every panel at least this large when a separator is dragged, and applies
+    // the same limit to the default layout. Its default of 175 is more than a small panel needs.
+    style.separator.extra = 64.0;
     style.separator.color_idle = t.border;
     style.separator.color_hovered = t.accent;
     style.separator.color_dragged = t.accent;

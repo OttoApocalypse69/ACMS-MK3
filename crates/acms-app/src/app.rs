@@ -10,9 +10,11 @@ use crate::commands;
 use crate::config;
 use crate::dialogs;
 use crate::keymap::Keymap;
+use crate::menu;
 use crate::palette;
 use crate::panels::{PanelViewer, PanelsUi};
 use crate::state::AppState;
+use crate::status;
 use crate::theme::{self, ThemeKind};
 
 pub struct AcmsApp {
@@ -90,6 +92,13 @@ impl AcmsApp {
                 self.run_command(&id, &params);
             }
         }
+
+        egui::Panel::top("menu_bar").show(ui, |ui| {
+            menu::show(ui, &mut self.state, &self.registry, &self.keymap);
+        });
+        egui::Panel::bottom("status_bar").show(ui, |ui| {
+            status::show(ui, &self.state, self.panels.canvas.hover());
+        });
 
         // The dock is taken out of the state while it is shown, so that the panels inside it
         // can be given the whole state to read and to run commands on.
@@ -600,6 +609,207 @@ mod tests {
         let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
         assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
         assert_eq!(h.app.state.dialog, None);
+    }
+
+    impl Harness {
+        fn click(&mut self, pos: Pos2) {
+            self.pointer_move(pos);
+            self.pointer_button(pos, PointerButton::Primary, true);
+            self.pointer_button(pos, PointerButton::Primary, false);
+            self.frame(vec![]);
+        }
+
+        /// Presses at the first screen position, moves through the others, releases.
+        fn drag_screen(&mut self, positions: &[Pos2]) {
+            let (first, last) = (positions[0], positions[positions.len() - 1]);
+            self.pointer_move(first);
+            self.pointer_button(first, PointerButton::Primary, true);
+            for &pos in &positions[1..] {
+                self.pointer_move(pos);
+            }
+            self.pointer_button(last, PointerButton::Primary, false);
+            self.frame(vec![]);
+        }
+
+        fn command(&mut self, id: &str) {
+            self.app.run_command(id, &Params::new());
+            self.frame(vec![]);
+            self.frame(vec![]);
+        }
+
+        fn active_layer(&self) -> LayerId {
+            self.app.state.editor.document().unwrap().active_layer()
+        }
+
+        fn layer(&self, id: LayerId) -> acms_core::sprite::Layer {
+            let sprite = self.app.state.editor.document().unwrap().sprite();
+            sprite.layer(id).unwrap().clone()
+        }
+
+        /// Layer ids from the top of the stack to the bottom.
+        fn stack(&self) -> Vec<LayerId> {
+            let sprite = self.app.state.editor.document().unwrap().sprite();
+            let entries = sprite.walk_top_down();
+            entries.iter().map(|entry| entry.layer.id).collect()
+        }
+    }
+
+    #[test]
+    fn the_layers_panel_lists_the_stack_and_selects_on_click() {
+        let mut h = Harness::with_sprite();
+        h.command("layer.new");
+        let upper = h.active_layer();
+        assert_eq!(h.app.panels.layers.shown_layers(), [upper, LayerId(1)]);
+
+        let below = h.app.panels.layers.name_pos(LayerId(1));
+        h.click(below);
+        assert_eq!(h.active_layer(), LayerId(1));
+        // Selecting is not an edit.
+        assert_eq!(h.history(), ["New Layer"]);
+
+        // Drawing now lands on the layer that was clicked.
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (6, 2)]);
+        assert_eq!(h.pixel(4, 2), Rgba8::BLACK);
+    }
+
+    #[test]
+    fn clicking_the_eye_hides_a_layer_and_stops_drawing_on_it() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (6, 2)]);
+
+        let eye = h.app.panels.layers.eye_pos(LayerId(1));
+        h.click(eye);
+        assert!(!h.layer(LayerId(1)).visible);
+        assert_eq!(h.history(), ["Pencil", "Layer Visibility"]);
+
+        // Hidden: the canvas shows nothing there, and the pencil does nothing.
+        let on_line = h.app.panels.canvas.screen_pos(4, 2);
+        h.pointer_move(on_line);
+        h.frame(vec![]);
+        assert_eq!(
+            h.app.panels.canvas.hover(),
+            Some((Point::new(4, 2), Rgba8::TRANSPARENT))
+        );
+        h.drag_pixels(PointerButton::Primary, &[(2, 5), (6, 5)]);
+        assert_eq!(h.history().len(), 2);
+
+        h.click(eye);
+        assert!(h.layer(LayerId(1)).visible);
+        h.pointer_move(on_line);
+        h.frame(vec![]);
+        assert_eq!(
+            h.app.panels.canvas.hover(),
+            Some((Point::new(4, 2), Rgba8::BLACK))
+        );
+    }
+
+    #[test]
+    fn dragging_a_row_reorders_the_layers() {
+        let mut h = Harness::with_sprite();
+        h.command("layer.new");
+        let upper = h.active_layer();
+        assert_eq!(h.stack(), [upper, LayerId(1)]);
+
+        // Drag the top row down past the middle of the bottom row.
+        let from = h.app.panels.layers.name_pos(upper);
+        let (_, bottom) = h.app.panels.layers.row_span(LayerId(1));
+        let to = Pos2::new(from.x, bottom - 4.0);
+        h.drag_screen(&[from, from + Vec2::new(0.0, 12.0), to]);
+        assert_eq!(h.stack(), [LayerId(1), upper]);
+        assert_eq!(h.history(), ["New Layer", "Move Layer"]);
+
+        // Dropping a row where it already is changes nothing.
+        let from = h.app.panels.layers.name_pos(upper);
+        h.drag_screen(&[from, from + Vec2::new(0.0, 8.0), from]);
+        assert_eq!(h.history().len(), 2);
+
+        h.press(CTRL, Key::Z);
+        assert_eq!(h.stack(), [upper, LayerId(1)]);
+    }
+
+    #[test]
+    fn dragging_a_row_onto_a_group_moves_the_layer_into_it() {
+        let mut h = Harness::with_sprite();
+        h.command("layer.new_group");
+        let group = h.active_layer();
+        assert_eq!(h.stack(), [group, LayerId(1)]);
+
+        let from = h.app.panels.layers.name_pos(LayerId(1));
+        let onto = h.app.panels.layers.name_pos(group);
+        h.drag_screen(&[from, from + Vec2::new(0.0, -10.0), onto]);
+
+        let sprite = h.app.state.editor.document().unwrap().sprite();
+        assert_eq!(
+            sprite.slot_of(LayerId(1)),
+            Some(acms_core::sprite::Slot::new(Some(group), 0))
+        );
+        // The layer is listed under its group, one level in.
+        assert_eq!(h.app.panels.layers.shown_layers(), [group, LayerId(1)]);
+    }
+
+    #[test]
+    fn f2_renames_the_selected_layer_in_place() {
+        let mut h = Harness::with_sprite();
+        h.press(Modifiers::NONE, Key::F2);
+        assert!(h.app.panels.layers.is_renaming());
+        // Single-key shortcuts are typing now, not commands.
+        h.type_text("Sky");
+        h.press(Modifiers::NONE, Key::E);
+        assert_eq!(h.app.state.editor.active_tool(), "pencil");
+
+        h.press(Modifiers::NONE, Key::Enter);
+        assert!(!h.app.panels.layers.is_renaming());
+        assert_eq!(h.layer(LayerId(1)).name, "Sky");
+        assert_eq!(h.history(), ["Rename Layer"]);
+
+        // Escape leaves the name alone.
+        h.press(Modifiers::NONE, Key::F2);
+        h.type_text("Other");
+        h.press(Modifiers::NONE, Key::Escape);
+        assert!(!h.app.panels.layers.is_renaming());
+        assert_eq!(h.layer(LayerId(1)).name, "Sky");
+        assert_eq!(h.history().len(), 1);
+    }
+
+    #[test]
+    fn a_folded_group_hides_its_rows() {
+        let mut h = Harness::with_sprite();
+        h.command("layer.new_group");
+        let group = h.active_layer();
+        let into_group = Params::new()
+            .with("layer", 1_u32)
+            .with("parent", group.0)
+            .with("index", 0_i64);
+        h.app.run_command("layer.move", &into_group);
+        h.frame(vec![]);
+        assert_eq!(h.app.panels.layers.shown_layers(), [group, LayerId(1)]);
+
+        let fold = Params::new().with("layer", group.0).with("collapsed", true);
+        h.app.run_command("layer.set_collapsed", &fold);
+        h.frame(vec![]);
+        assert_eq!(h.app.panels.layers.shown_layers(), [group]);
+    }
+
+    #[test]
+    fn the_status_bar_knows_what_is_under_the_pointer() {
+        let mut h = Harness::with_sprite();
+        assert_eq!(h.app.panels.canvas.hover(), None);
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (6, 2)]);
+
+        let pos = h.app.panels.canvas.screen_pos(5, 2);
+        h.pointer_move(pos);
+        h.frame(vec![]);
+        assert_eq!(
+            h.app.panels.canvas.hover(),
+            Some((Point::new(5, 2), Rgba8::BLACK))
+        );
+        let pos = h.app.panels.canvas.screen_pos(5, 9);
+        h.pointer_move(pos);
+        h.frame(vec![]);
+        assert_eq!(
+            h.app.panels.canvas.hover(),
+            Some((Point::new(5, 9), Rgba8::TRANSPARENT))
+        );
     }
 
     #[test]

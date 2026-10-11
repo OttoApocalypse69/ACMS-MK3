@@ -10,7 +10,7 @@ use acms_io::png::MAX_EXPORT_SCALE;
 use egui::{DragValue, Grid, Id, Modal, RichText, Ui};
 
 use crate::commands;
-use crate::state::{AppState, Dialog, FileRequest};
+use crate::state::{Anchor, AppState, Dialog, FileRequest, SizePurpose};
 
 /// What the user did with a dialog this frame.
 enum Outcome {
@@ -33,6 +33,12 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &CommandRegistr
             Dialog::ExportPng { scale } => export_png(ui, state, scale),
             Dialog::ConfirmDiscard { then } => confirm_discard(ui, state, then),
             Dialog::Message { title, text } => message(ui, title, text),
+            Dialog::Size {
+                purpose,
+                width,
+                height,
+                anchor,
+            } => size(ui, purpose, width, height, anchor),
         }
     });
 
@@ -141,6 +147,64 @@ fn message(ui: &mut Ui, title: String, text: String) -> Outcome {
     }
 }
 
+/// Width and height for a canvas resize, a sprite resize or scaling the selection.
+fn size(
+    ui: &mut Ui,
+    purpose: SizePurpose,
+    mut width: u32,
+    mut height: u32,
+    mut anchor: Anchor,
+) -> Outcome {
+    let (title, command, confirm) = match purpose {
+        SizePurpose::CanvasSize => ("Canvas Size", "sprite.canvas_size", "Resize"),
+        SizePurpose::SpriteSize => ("Sprite Size", "sprite.size", "Scale"),
+        SizePurpose::ScaleSelection => ("Scale Selection", "selection.scale", "Scale"),
+    };
+    ui.heading(title);
+    Grid::new("size").num_columns(2).show(ui, |ui| {
+        for (label, value) in [("Width", &mut width), ("Height", &mut height)] {
+            ui.label(label);
+            ui.add(
+                DragValue::new(value)
+                    .range(1..=MAX_SPRITE_SIZE)
+                    .suffix(" px"),
+            );
+            ui.end_row();
+        }
+        if purpose == SizePurpose::CanvasSize {
+            ui.label("Keep the picture at");
+            egui::ComboBox::from_id_salt("anchor")
+                .selected_text(anchor.id())
+                .show_ui(ui, |ui| {
+                    for choice in Anchor::ALL {
+                        ui.selectable_value(&mut anchor, choice, choice.id());
+                    }
+                });
+            ui.end_row();
+        }
+    });
+    if purpose != SizePurpose::CanvasSize {
+        ui.label(RichText::new("Pixels are repeated or dropped, never blended.").weak());
+    }
+
+    match buttons(ui, confirm) {
+        (true, _) => {
+            let mut params = Params::new().with("width", width).with("height", height);
+            if purpose == SizePurpose::CanvasSize {
+                params = params.with("anchor", anchor.id());
+            }
+            Outcome::Run(command.to_owned(), params)
+        }
+        (_, true) => Outcome::Dismissed,
+        _ => Outcome::Open(Dialog::Size {
+            purpose,
+            width,
+            height,
+            anchor,
+        }),
+    }
+}
+
 /// Shows the native file dialog a command asked for, then runs the command with the chosen
 /// path. This blocks until the user has picked a file or cancelled.
 pub fn resolve_file_request(
@@ -172,13 +236,10 @@ pub fn resolve_file_request(
     let text = |path: PathBuf| path.to_string_lossy().into_owned();
 
     let (command, params) = match request {
-        FileRequest::Open { discard } => {
+        FileRequest::Open => {
             let picked = dialog.add_filter("ACMS sprite", &["acms"]).pick_file();
             let Some(path) = picked else { return };
-            let params = Params::new()
-                .with("path", text(path))
-                .with("discard", discard);
-            ("file.open", params)
+            ("file.open", Params::new().with("path", text(path)))
         }
         FileRequest::SaveAs => {
             let picked = dialog

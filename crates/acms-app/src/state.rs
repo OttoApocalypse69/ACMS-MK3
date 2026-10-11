@@ -2,11 +2,12 @@
 //!
 //! UI code reads this freely but changes the document only by running commands.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use acms_core::command::Params;
 use acms_core::document::Document;
-use acms_core::editor::Editor;
+use acms_core::editor::{DocId, Editor};
 use acms_core::sprite::LayerId;
 use egui::Vec2;
 use egui_dock::DockState;
@@ -47,6 +48,7 @@ const FIT_MARGIN: f32 = 24.0;
 
 /// How the canvas is shown. Lengths are in physical screen pixels, not egui points, so that
 /// sprite pixels stay crisp on scaled displays.
+#[derive(Clone)]
 pub struct ViewState {
     zoom_index: usize,
     /// Offset of the sprite's centre from the centre of the viewport.
@@ -122,29 +124,111 @@ pub enum Dialog {
         title: String,
         text: String,
     },
+    /// Asks for a width and height, then runs the command for `purpose` with them.
+    Size {
+        purpose: SizePurpose,
+        width: u32,
+        height: u32,
+        /// For a canvas resize: which corner or edge the existing picture stays against.
+        anchor: Anchor,
+    },
+}
+
+/// What a [`Dialog::Size`] is asking the size for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizePurpose {
+    CanvasSize,
+    SpriteSize,
+    ScaleSelection,
+}
+
+/// Where the existing picture sits when the canvas changes size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Anchor {
+    #[default]
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+impl Anchor {
+    pub const ALL: [Self; 9] = [
+        Self::TopLeft,
+        Self::Top,
+        Self::TopRight,
+        Self::Left,
+        Self::Center,
+        Self::Right,
+        Self::BottomLeft,
+        Self::Bottom,
+        Self::BottomRight,
+    ];
+
+    /// Stable name, used as a command argument.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::TopLeft => "top-left",
+            Self::Top => "top",
+            Self::TopRight => "top-right",
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+            Self::BottomLeft => "bottom-left",
+            Self::Bottom => "bottom",
+            Self::BottomRight => "bottom-right",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|anchor| anchor.id() == id)
+    }
+
+    /// How far the picture moves when the canvas grows by `(grow_w, grow_h)` pixels.
+    pub fn offset(self, grow_w: i32, grow_h: i32) -> (i32, i32) {
+        let index = Self::ALL.iter().position(|a| *a == self).unwrap_or(0) as i32;
+        let (column, row) = (index % 3, index / 3);
+        (grow_w * column / 2, grow_h * row / 2)
+    }
 }
 
 /// A command needs a file path from the user. The UI shows a native file dialog and then runs
 /// the command again with the path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileRequest {
-    Open {
-        /// The user has already agreed to lose unsaved changes.
-        discard: bool,
-    },
+    Open,
     SaveAs,
-    ExportPng {
-        scale: u32,
-    },
+    ExportPng { scale: u32 },
+}
+
+/// What the app knows about an open sprite besides the sprite itself.
+#[derive(Clone, Default)]
+struct DocState {
+    path: Option<PathBuf>,
+    saved_revision: u64,
+    view: ViewState,
 }
 
 pub struct AppState {
     pub editor: Editor,
-    /// Where the open sprite was loaded from or last saved to.
+    /// Where the active sprite was loaded from or last saved to.
     pub file_path: Option<PathBuf>,
-    /// The document revision that matches what is on disk (or the blank sprite it began as).
+    /// The revision of the active sprite that matches what is on disk (or the blank sprite it
+    /// began as).
     pub saved_revision: u64,
+    /// How the active sprite is viewed.
     pub view: ViewState,
+    /// The document the three fields above belong to.
+    shown: Option<DocId>,
+    /// The same three things for the open sprites that are not the active one.
+    parked: HashMap<DocId, DocState>,
+    /// Copy and paste also go through the system clipboard. Off in tests.
+    pub system_clipboard: bool,
     pub dock: DockState<Panel>,
     /// Goes up when a command replaces `dock` as a whole.
     pub layout_generation: u64,
@@ -167,6 +251,9 @@ impl Default for AppState {
             file_path: None,
             saved_revision: 0,
             view: ViewState::default(),
+            shown: None,
+            parked: HashMap::new(),
+            system_clipboard: false,
             dock: panels::default_layout(),
             layout_generation: 0,
             theme: ThemeKind::default(),
@@ -181,38 +268,121 @@ impl Default for AppState {
 }
 
 impl AppState {
-    /// Makes `document` the open sprite. `path` is the file it came from, if any.
+    /// Makes `file_path`, `saved_revision` and `view` those of the editor's active document,
+    /// putting the previous document's away. Called whenever the active document may have
+    /// changed.
+    pub fn sync_active_document(&mut self) {
+        let active = self.editor.active_document();
+        if active == self.shown {
+            return;
+        }
+        let previous = DocState {
+            path: self.file_path.take(),
+            saved_revision: self.saved_revision,
+            view: std::mem::take(&mut self.view),
+        };
+        if let Some(id) = self.shown
+            && self.editor.document_by_id(id).is_some()
+        {
+            self.parked.insert(id, previous);
+        }
+        let next = active
+            .and_then(|id| self.parked.remove(&id))
+            .unwrap_or_default();
+        self.file_path = next.path;
+        self.saved_revision = next.saved_revision;
+        self.view = next.view;
+        self.shown = active;
+        self.parked
+            .retain(|id, _| self.editor.document_by_id(*id).is_some());
+    }
+
+    /// Opens `document` in a new tab and switches to it. `path` is the file it came from.
     pub fn open_document(&mut self, document: Document, path: Option<PathBuf>) {
-        self.saved_revision = document.revision();
-        self.editor.set_document(Some(document));
+        let saved_revision = document.revision();
+        self.editor.add_document(document);
+        self.sync_active_document();
+        self.saved_revision = saved_revision;
         self.file_path = path;
         self.view.fit_pending = true;
     }
 
-    /// Whether the open sprite differs from what is on disk.
-    pub fn has_unsaved_changes(&self) -> bool {
-        self.editor
-            .document()
-            .is_some_and(|document| document.revision() != self.saved_revision)
+    /// Switches to another open sprite. Returns `false` if it is not open.
+    pub fn activate_document(&mut self, id: DocId) -> bool {
+        let found = self.editor.set_active_document(id);
+        self.sync_active_document();
+        found
     }
 
-    /// The file name of the open sprite, with a mark when it has unsaved changes.
-    pub fn document_title(&self) -> String {
-        if self.editor.document().is_none() {
-            return "Canvas".to_owned();
+    /// Closes the active sprite without asking.
+    pub fn close_active_document(&mut self) {
+        if let Some(id) = self.editor.active_document() {
+            self.editor.close_document(id);
+            self.sync_active_document();
         }
+    }
+
+    /// The path and saved revision of any open document.
+    fn doc_state(&self, id: DocId) -> (Option<&PathBuf>, u64) {
+        if self.shown == Some(id) {
+            (self.file_path.as_ref(), self.saved_revision)
+        } else {
+            let parked = self.parked.get(&id);
+            (
+                parked.and_then(|doc| doc.path.as_ref()),
+                parked.map_or(0, |doc| doc.saved_revision),
+            )
+        }
+    }
+
+    /// The open document that came from `path`, if there is one.
+    pub fn document_at(&self, path: &std::path::Path) -> Option<DocId> {
+        let mut ids = self.editor.documents().map(|(id, _)| id);
+        ids.find(|id| self.doc_state(*id).0.is_some_and(|p| p == path))
+    }
+
+    /// Whether an open sprite differs from what is on disk.
+    pub fn is_unsaved(&self, id: DocId) -> bool {
+        self.editor
+            .document_by_id(id)
+            .is_some_and(|document| document.revision() != self.doc_state(id).1)
+    }
+
+    /// Whether the active sprite differs from what is on disk.
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.editor
+            .active_document()
+            .is_some_and(|id| self.is_unsaved(id))
+    }
+
+    /// Whether any open sprite has unsaved changes.
+    pub fn any_unsaved_changes(&self) -> bool {
+        let mut ids = self.editor.documents().map(|(id, _)| id);
+        ids.any(|id| self.is_unsaved(id))
+    }
+
+    /// The file name of an open sprite, with a mark when it has unsaved changes.
+    pub fn title_of(&self, id: DocId) -> String {
         let name = self
-            .file_path
-            .as_ref()
+            .doc_state(id)
+            .0
             .and_then(|path| path.file_name())
             .map_or_else(
                 || "Untitled".to_owned(),
                 |name| name.to_string_lossy().into_owned(),
             );
-        if self.has_unsaved_changes() {
+        if self.is_unsaved(id) {
             format!("{name} •")
         } else {
             name
+        }
+    }
+
+    /// The title of the active sprite, or of the empty canvas.
+    pub fn document_title(&self) -> String {
+        match self.editor.active_document() {
+            Some(id) => self.title_of(id),
+            None => "Canvas".to_owned(),
         }
     }
 }

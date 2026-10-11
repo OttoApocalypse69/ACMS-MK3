@@ -5,7 +5,7 @@
 use acms_core::color::Rgba8;
 use acms_core::command::{CommandRegistry, Params};
 use acms_core::stroke::{BrushShape, MAX_BRUSH_SIZE};
-use acms_core::tool::CursorHint;
+use acms_core::tool::OptionKind;
 use egui::color_picker::{self, Alpha};
 use egui::ecolor::Hsva;
 use egui::{
@@ -224,34 +224,79 @@ fn tools(ui: &mut Ui, state: &mut AppState, registry: &Registry, keymap: &Keymap
 }
 
 fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
-    if state.editor.cursor_hint() != CursorHint::Brush {
+    let kinds = state.editor.tool_options();
+    if kinds.is_empty() {
         ui.label(RichText::new("This tool has no options.").weak());
         return;
     }
     let brush = state.editor.brush;
+    let options = state.editor.options;
+    // A checkbox that runs a command with its new value.
+    let toggle = |ui: &mut Ui, state: &mut AppState, on: bool, label: &str, id: &str, arg: &str| {
+        let mut value = on;
+        if ui.checkbox(&mut value, label).changed() {
+            commands::run(registry, state, id, &Params::new().with(arg, value));
+        }
+    };
 
-    ui.label("Brush size");
-    let mut size = brush.size();
-    // The slider takes the width the panel has, leaving room for the number next to it.
-    ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(40.0);
-    if ui.add(Slider::new(&mut size, 1..=MAX_BRUSH_SIZE)).changed() {
-        let params = Params::new().with("size", size);
-        commands::run(registry, state, "brush.set_size", &params);
-    }
-
-    ui.label("Brush shape");
-    ui.horizontal(|ui| {
-        let shapes = [
-            (BrushShape::Round, "Round", "round"),
-            (BrushShape::Square, "Square", "square"),
-        ];
-        for (shape, label, value) in shapes {
-            if ui.selectable_label(brush.shape == shape, label).clicked() {
-                let params = Params::new().with("shape", value);
-                commands::run(registry, state, "brush.set_shape", &params);
+    for kind in kinds {
+        match kind {
+            OptionKind::Brush => {
+                ui.label("Brush size");
+                let mut size = brush.size();
+                // The slider takes the width the panel has, leaving room for the number.
+                ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(40.0);
+                if ui.add(Slider::new(&mut size, 1..=MAX_BRUSH_SIZE)).changed() {
+                    let params = Params::new().with("size", size);
+                    commands::run(registry, state, "brush.set_size", &params);
+                }
+                ui.label("Brush shape");
+                ui.horizontal(|ui| {
+                    let shapes = [
+                        (BrushShape::Round, "Round", "round"),
+                        (BrushShape::Square, "Square", "square"),
+                    ];
+                    for (shape, label, value) in shapes {
+                        if ui.selectable_label(brush.shape == shape, label).clicked() {
+                            let params = Params::new().with("shape", value);
+                            commands::run(registry, state, "brush.set_shape", &params);
+                        }
+                    }
+                });
+            }
+            OptionKind::ShapeFill => {
+                let on = options.shape_filled;
+                toggle(ui, state, on, "Filled", "tool.set_filled", "filled");
+                ui.label(RichText::new("Hold Shift for a square or circle.").weak());
+            }
+            OptionKind::Similarity => {
+                let on = options.fill_contiguous;
+                toggle(
+                    ui,
+                    state,
+                    on,
+                    "Contiguous",
+                    "tool.set_contiguous",
+                    "contiguous",
+                );
+                ui.label("Tolerance");
+                let mut tolerance = u32::from(options.tolerance);
+                ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(40.0);
+                if ui.add(Slider::new(&mut tolerance, 0..=255)).changed() {
+                    let params = Params::new().with("tolerance", tolerance);
+                    commands::run(registry, state, "tool.set_tolerance", &params);
+                }
+            }
+            OptionKind::Gradient => {
+                let on = options.gradient_dither;
+                toggle(ui, state, on, "Dithered", "tool.set_dither", "dither");
+                ui.label(RichText::new("From the primary to the secondary colour.").weak());
+            }
+            OptionKind::SelectionMode => {
+                ui.label(RichText::new("Shift adds, Alt subtracts, both intersect.").weak());
             }
         }
-    });
+    }
 }
 
 /// A clickable colour swatch. `ring` draws the accent outline that marks a selection.

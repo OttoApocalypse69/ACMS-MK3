@@ -139,6 +139,7 @@ dependencies = [
  "acms-io",
  "acms-script",
  "anyhow",
+ "arboard",
  "directories",
  "eframe",
  "egui",

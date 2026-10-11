@@ -24,7 +24,10 @@ const DEFAULT_SPRITE_SIZE: u32 = 32;
 /// log, and a command that ran but failed (a file that would not save, say) also opens a
 /// message.
 pub fn run(registry: &CommandRegistry<AppState>, state: &mut AppState, id: &str, params: &Params) {
-    let Err(err) = registry.run(id, state, params) else {
+    let result = registry.run(id, state, params);
+    // The command may have opened, closed or switched sprites.
+    state.sync_active_document();
+    let Err(err) = result else {
         return;
     };
     state.log.push(err.to_string());
@@ -64,10 +67,10 @@ fn no_document() -> CommandError {
     CommandError::failed("No sprite is open.")
 }
 
-/// If the open sprite has unsaved changes, asks the user before `id` throws them away and
+/// If any open sprite has unsaved changes, asks the user before `id` throws them away and
 /// returns `true`: the command should stop, and runs again with `discard` set if they agree.
 fn must_confirm_discard(state: &mut AppState, id: &str, params: &Params) -> bool {
-    if !state.has_unsaved_changes() || params.bool("discard") == Some(true) {
+    if !state.any_unsaved_changes() || params.bool("discard") == Some(true) {
         return false;
     }
     state.dialog = Some(Dialog::ConfirmDiscard {
@@ -87,9 +90,6 @@ fn file_new(state: &mut AppState, params: &Params) -> CommandResult {
         });
         return Ok(());
     };
-    if must_confirm_discard(state, "file.new", params) {
-        return Ok(());
-    }
     // Sizes that do not even fit in a `u32` are reported like any other bad size.
     let side = |n: i64| u32::try_from(n).unwrap_or(0);
     let sprite = Sprite::new(side(width), side(height))
@@ -99,13 +99,15 @@ fn file_new(state: &mut AppState, params: &Params) -> CommandResult {
 }
 
 fn file_open(state: &mut AppState, params: &Params) -> CommandResult {
-    if must_confirm_discard(state, "file.open", params) {
-        return Ok(());
-    }
     let Some(path) = params.text("path").map(PathBuf::from) else {
-        state.file_request = Some(FileRequest::Open { discard: true });
+        state.file_request = Some(FileRequest::Open);
         return Ok(());
     };
+    // A file that is already open is shown, not opened a second time.
+    if let Some(open) = state.document_at(&path) {
+        state.activate_document(open);
+        return Ok(());
+    }
     let sprite = load_acms(&path)
         .map_err(|err| CommandError::failed(format!("Could not open {}: {err}", path.display())))?;
     state.log.push(format!("Opened {}", path.display()));
@@ -205,14 +207,10 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
     registry.register(
         Command::new("file.new", "New Sprite…", file_new)
             .optional_param("width", Int)
-            .optional_param("height", Int)
-            .optional_param("discard", Bool),
+            .optional_param("height", Int),
     )?;
-    registry.register(
-        Command::new("file.open", "Open…", file_open)
-            .optional_param("path", Text)
-            .optional_param("discard", Bool),
-    )?;
+    registry
+        .register(Command::new("file.open", "Open…", file_open).optional_param("path", Text))?;
     registry.register(Command::new("file.save", "Save", file_save).enabled_when(has_document))?;
     registry.register(
         Command::new("file.save_as", "Save As…", file_save_as)
@@ -260,6 +258,7 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
     )?;
 
     crate::layer_commands::register(registry)?;
+    crate::edit_commands::register(registry)?;
 
     // Tools: one command per registered tool, so each can have its own shortcut.
     let tools: Vec<_> = Editor::new().tools().collect();
@@ -771,10 +770,7 @@ mod tests {
     fn open_and_export_without_a_path_ask_for_one() {
         let mut fixture = Fixture::with_sprite();
         fixture.run("file.open");
-        assert_eq!(
-            fixture.state.file_request.take(),
-            Some(FileRequest::Open { discard: true })
-        );
+        assert_eq!(fixture.state.file_request.take(), Some(FileRequest::Open));
 
         fixture.run("file.export_png");
         assert_eq!(
@@ -805,10 +801,7 @@ mod tests {
 
         let missing = TempFile::path_only("commands-missing.acms");
         let path = missing.path().to_string_lossy().into_owned();
-        fixture.run_with(
-            "file.open",
-            Params::new().with("path", path).with("discard", true),
-        );
+        fixture.run_with("file.open", Params::new().with("path", path));
         let Some(Dialog::Message { title, text }) = fixture.state.dialog.take() else {
             panic!("expected a message");
         };
@@ -820,10 +813,7 @@ mod tests {
         // A file that is not a sprite.
         let garbage = TempFile::new("commands-garbage.acms", "this is not a zip archive");
         let path = garbage.path().to_string_lossy().into_owned();
-        fixture.run_with(
-            "file.open",
-            Params::new().with("path", path).with("discard", true),
-        );
+        fixture.run_with("file.open", Params::new().with("path", path));
         assert!(matches!(
             fixture.state.dialog.take(),
             Some(Dialog::Message { .. })
@@ -864,26 +854,20 @@ mod tests {
     fn unsaved_changes_are_never_thrown_away_without_asking() {
         let mut fixture = Fixture::with_sprite();
         fixture.draw_line(4);
-        let drawn = fixture.state.editor.document().unwrap().sprite().clone();
-        let new_8x8 = || Params::new().with("width", 8_u32).with("height", 8_u32);
+        let drawn = fixture.document().sprite().clone();
 
-        // New, Open and Quit all stop and ask.
-        fixture.run_with("file.new", new_8x8());
-        assert!(matches!(
-            fixture.state.dialog,
-            Some(Dialog::ConfirmDiscard { .. })
-        ));
-        assert_eq!(*fixture.state.editor.document().unwrap().sprite(), drawn);
+        // New and Open put the sprite in a new tab; the old one is untouched.
+        fixture.run_with(
+            "file.new",
+            Params::new().with("width", 8_u32).with("height", 8_u32),
+        );
+        assert_eq!(fixture.state.dialog, None);
+        assert_eq!(fixture.state.editor.documents().len(), 2);
+        fixture.run("doc.next");
+        assert_eq!(*fixture.document().sprite(), drawn);
 
-        fixture.state.dialog = None;
-        fixture.run("file.open");
-        assert!(matches!(
-            fixture.state.dialog,
-            Some(Dialog::ConfirmDiscard { .. })
-        ));
-        assert_eq!(fixture.state.file_request, None);
-
-        fixture.state.dialog = None;
+        // Quit asks as long as any tab has changes, whichever one is in front.
+        fixture.run("doc.next");
         fixture.run("app.quit");
         assert!(matches!(
             fixture.state.dialog,
@@ -893,25 +877,28 @@ mod tests {
 
         // Cancelling (closing the dialog) leaves everything as it was.
         fixture.state.dialog = None;
-        assert_eq!(*fixture.state.editor.document().unwrap().sprite(), drawn);
-
-        // Agreeing runs the original command.
-        fixture.run_with("file.new", new_8x8());
-        fixture.confirm_pending();
-        assert_eq!(fixture.state.editor.document().unwrap().sprite().width(), 8);
-        assert_eq!(fixture.state.dialog, None);
-
-        fixture.draw_line(2);
-        fixture.run("file.open");
-        fixture.confirm_pending();
-        assert_eq!(
-            fixture.state.file_request.take(),
-            Some(FileRequest::Open { discard: true })
-        );
+        assert_eq!(fixture.state.editor.documents().len(), 2);
 
         fixture.run("app.quit");
         fixture.confirm_pending();
         assert!(fixture.state.quit_requested);
+    }
+
+    #[test]
+    fn opening_a_file_that_is_already_open_switches_to_it() {
+        let file = TempFile::path_only("commands-reopen.acms");
+        let path = file.path().to_string_lossy().into_owned();
+        let mut fixture = Fixture::with_sprite();
+        fixture.run_with("file.save_as", Params::new().with("path", path.clone()));
+        let saved = fixture.state.editor.active_document();
+
+        fixture.run_with(
+            "file.new",
+            Params::new().with("width", 8_u32).with("height", 8_u32),
+        );
+        fixture.run_with("file.open", Params::new().with("path", path));
+        assert_eq!(fixture.state.editor.documents().len(), 2);
+        assert_eq!(fixture.state.editor.active_document(), saved);
     }
 
     #[test]

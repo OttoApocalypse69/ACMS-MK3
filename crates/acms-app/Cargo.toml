@@ -8,6 +8,7 @@ acms-core = { version = "0.1.0", path = "../acms-core" }
 acms-io = { version = "0.1.0", path = "../acms-io" }
 acms-script = { version = "0.1.0", path = "../acms-script" }
 anyhow = "1.0.104"
+arboard = "3.6.1"
 directories = "6.0.0"
 eframe = "0.36.2"
 egui = "0.36.2"

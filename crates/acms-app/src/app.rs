@@ -27,6 +27,52 @@ pub struct AcmsApp {
     shown_theme: ThemeKind,
     /// The window has been told to close, so a close request is no longer questioned.
     closing: bool,
+    /// See [`adapt_clipboard_keys`].
+    paste_seen: bool,
+}
+
+/// Makes Ctrl+X / C / V reach the keymap like any other chord.
+///
+/// The windowing layer does not pass those key presses on. It sends "cut" and "copy" events
+/// instead, and for Ctrl+V a "paste" event carrying the clipboard's text — or nothing at all
+/// when the clipboard holds no text, as after copying pixels. The release of V does arrive,
+/// so that is used when no paste event came first. `paste_seen` remembers that one did.
+fn adapt_clipboard_keys(ctx: &egui::Context, paste_seen: &mut bool) {
+    use egui::{Event, Key, Modifiers};
+    ctx.input_mut(|input| {
+        let mut chords = Vec::new();
+        for event in &input.events {
+            match event {
+                Event::Cut => chords.push(Key::X),
+                Event::Copy => chords.push(Key::C),
+                Event::Paste(_) => {
+                    *paste_seen = true;
+                    chords.push(Key::V);
+                }
+                Event::Key {
+                    key: Key::V,
+                    pressed: false,
+                    modifiers,
+                    ..
+                } => {
+                    if modifiers.command && !*paste_seen {
+                        chords.push(Key::V);
+                    }
+                    *paste_seen = false;
+                }
+                _ => {}
+            }
+        }
+        input
+            .events
+            .extend(chords.into_iter().map(|key| Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::COMMAND,
+            }));
+    });
 }
 
 impl AcmsApp {
@@ -50,10 +96,8 @@ impl AcmsApp {
                 .map(|id| format!("Keymap: there is no command `{id}`")),
         );
 
-        let state = AppState {
-            log,
-            ..AppState::default()
-        };
+        let mut state = AppState::default();
+        state.log = log;
         theme::install(ctx, state.theme);
 
         Ok(Self {
@@ -63,7 +107,13 @@ impl AcmsApp {
             state,
             panels: PanelsUi::default(),
             closing: false,
+            paste_seen: false,
         })
+    }
+
+    /// Lets Copy and Paste reach other programs. Left off in tests.
+    pub fn use_system_clipboard(&mut self) {
+        self.state.system_clipboard = true;
     }
 
     fn run_command(&mut self, id: &str, params: &Params) {
@@ -77,13 +127,16 @@ impl AcmsApp {
 
         // Closing the window is quitting, which asks before unsaved changes are lost.
         let close_requested = ctx.input(|input| input.viewport().close_requested());
-        if close_requested && !self.closing && self.state.has_unsaved_changes() {
+        if close_requested && !self.closing && self.state.any_unsaved_changes() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.run_command("app.quit", &Params::new());
         }
 
         // A dialog is modal: shortcuts wait until it is closed.
         if self.state.dialog.is_none() {
+            if !ctx.text_edit_focused() {
+                adapt_clipboard_keys(&ctx, &mut self.paste_seen);
+            }
             let triggered = self
                 .keymap
                 .triggered(&ctx)
@@ -363,10 +416,7 @@ mod tests {
         // The first two commands in registration order are "New Sprite…" and "Open…".
         h.press(Modifiers::NONE, Key::ArrowDown);
         h.press(Modifiers::NONE, Key::Enter);
-        assert_eq!(
-            h.app.state.file_request,
-            Some(FileRequest::Open { discard: true })
-        );
+        assert_eq!(h.app.state.file_request, Some(FileRequest::Open));
         assert_eq!(h.app.state.dialog, None);
     }
 
@@ -810,6 +860,92 @@ mod tests {
             h.app.panels.canvas.hover(),
             Some((Point::new(5, 9), Rgba8::TRANSPARENT))
         );
+    }
+
+    #[test]
+    fn clipboard_shortcuts_arrive_the_way_the_window_sends_them() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (6, 2)]);
+
+        // Ctrl+C and Ctrl+X come as events of their own, not as key presses.
+        h.frame(vec![Event::Copy]);
+        assert!(h.app.state.editor.clipboard.is_some());
+        h.frame(vec![Event::Cut]);
+        assert_eq!(h.pixel(4, 2), Rgba8::TRANSPARENT);
+
+        // Ctrl+V with pixels on the clipboard: only the release of V is seen.
+        let release = |modifiers| Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        };
+        h.frame(vec![release(CTRL)]);
+        assert_eq!(h.pixel(4, 2), Rgba8::BLACK);
+        assert_eq!(h.history(), ["Pencil", "Cut", "Paste"]);
+
+        // With text on the clipboard a paste event comes first; it must not paste twice.
+        h.frame(vec![Event::Cut]);
+        h.frame(vec![Event::Paste("hello".to_owned())]);
+        assert_eq!(h.history().len(), 5);
+        h.frame(vec![Event::Cut]);
+        h.frame(vec![release(CTRL)]);
+        assert_eq!(h.history().len(), 6);
+        assert_eq!(h.pixel(4, 2), Rgba8::TRANSPARENT);
+        // V released after Ctrl is not a paste.
+        h.frame(vec![release(Modifiers::NONE)]);
+        assert_eq!(h.history().len(), 6);
+    }
+
+    #[test]
+    fn dragging_with_a_selection_tool_selects_and_shift_adds() {
+        let mut h = Harness::with_sprite();
+        h.press(Modifiers::NONE, Key::M);
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (5, 4)]);
+        let bounds = |h: &Harness| {
+            let sprite = h.app.state.editor.document().unwrap().sprite();
+            sprite.selection().map(|mask| mask.bounds())
+        };
+        assert_eq!(bounds(&h), Some(acms_core::geom::Rect::new(2, 2, 4, 3)));
+
+        // The pencil now only draws inside it.
+        h.press(Modifiers::NONE, Key::B);
+        h.drag_pixels(PointerButton::Primary, &[(0, 3), (12, 3)]);
+        assert_eq!(
+            (h.pixel(1, 3), h.pixel(3, 3), h.pixel(8, 3)),
+            (Rgba8::TRANSPARENT, Rgba8::BLACK, Rgba8::TRANSPARENT)
+        );
+
+        h.press(CTRL, Key::D);
+        assert_eq!(bounds(&h), None);
+        h.press(CTRL, Key::A);
+        assert_eq!(bounds(&h), Some(acms_core::geom::Rect::from_size(16, 16)));
+    }
+
+    #[test]
+    fn sprite_tabs_switch_and_close() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (6, 2)]);
+        let size = Params::new().with("width", 8_u32).with("height", 8_u32);
+        h.app.run_command("file.new", &size);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        assert_eq!(h.app.state.editor.documents().len(), 2);
+        assert_eq!(h.app.state.editor.document().unwrap().sprite().width(), 8);
+
+        h.press(CTRL, Key::Tab);
+        assert_eq!(h.pixel(4, 2), Rgba8::BLACK);
+        // Drawing still works after switching: the canvas shows the right sprite.
+        h.drag_pixels(PointerButton::Primary, &[(2, 9), (6, 9)]);
+        assert_eq!(h.pixel(4, 9), Rgba8::BLACK);
+
+        // Closing the changed sprite asks first.
+        h.press(CTRL, Key::W);
+        assert!(matches!(
+            h.app.state.dialog,
+            Some(Dialog::ConfirmDiscard { .. })
+        ));
     }
 
     #[test]

@@ -5,9 +5,11 @@
 
 mod app;
 mod canvas;
+mod clipboard;
 mod commands;
 mod config;
 mod dialogs;
+mod edit_commands;
 mod fuzzy;
 mod keymap;
 mod layer_commands;
@@ -33,7 +35,8 @@ fn main() -> anyhow::Result<()> {
         "acms-mk3",
         options,
         Box::new(|cc| {
-            let app = app::AcmsApp::new(&cc.egui_ctx, keymap_file.as_deref())?;
+            let mut app = app::AcmsApp::new(&cc.egui_ctx, keymap_file.as_deref())?;
+            app.use_system_clipboard();
             Ok(Box::new(app))
         }),
     )

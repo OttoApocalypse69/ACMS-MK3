@@ -39,7 +39,7 @@ fn target(state: &AppState, params: &Params) -> Result<LayerId, CommandError> {
 }
 
 /// Runs `edit` on the open sprite as one undo step called `name`.
-fn transact<T>(
+pub(crate) fn transact<T>(
     state: &mut AppState,
     name: &str,
     edit: impl FnOnce(&mut Transaction<'_>) -> Result<T, SpriteError>,

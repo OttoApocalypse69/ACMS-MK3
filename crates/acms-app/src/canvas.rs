@@ -7,7 +7,7 @@ use acms_core::compositor::FrameCache;
 use acms_core::editor::Editor;
 use acms_core::geom::{Point, Rect as PixelRect};
 use acms_core::image::Image;
-use acms_core::tool::{self, CursorHint, PointerEvent};
+use acms_core::tool::{self, CursorHint, Outline, PointerEvent};
 use egui::{
     Color32, ColorImage, CursorIcon, Event, Key, MouseWheelUnit, PointerButton, Pos2, Rect,
     RichText, Sense, Stroke, StrokeKind, TextureFilter, TextureHandle, TextureOptions, Ui,
@@ -60,6 +60,11 @@ impl Geometry {
         Point::new(local.x.floor() as i32, local.y.floor() as i32)
     }
 
+    /// The screen position of a pixel corner (the top-left corner of that pixel).
+    fn corner(&self, corner: Point) -> Pos2 {
+        self.origin + Vec2::new(corner.x as f32, corner.y as f32) * self.scale
+    }
+
     /// The screen rectangle covered by a rectangle of sprite pixels.
     fn screen_rect(&self, rect: PixelRect) -> Rect {
         let min = self.origin + Vec2::new(rect.x as f32, rect.y as f32) * self.scale;
@@ -89,6 +94,8 @@ pub struct CanvasView {
     geometry: Option<Geometry>,
     /// The sprite pixel under the pointer and the colour seen there.
     hover: Option<(Point, Rgba8)>,
+    /// The border of the selection, and the mask it was worked out for.
+    outline: Option<(usize, Vec<(Point, Point)>)>,
 }
 
 impl CanvasView {
@@ -106,6 +113,7 @@ impl CanvasView {
     ) {
         let tokens = state.theme.tokens();
         let pixels_per_point = ui.ctx().pixels_per_point();
+        sprite_tabs(ui, state, registry);
         let viewport = ui.available_rect_before_wrap();
         state.view.viewport = viewport.size() * pixels_per_point;
         ui.painter_at(viewport)
@@ -182,6 +190,60 @@ impl CanvasView {
             Stroke::new(1.0, tokens.border),
             StrokeKind::Outside,
         );
+
+        // The selection, and whatever shape the tool is dragging out, as marching ants.
+        let segments = self.selection_outline(&state.editor);
+        let mut paths: Vec<[Pos2; 2]> = segments
+            .iter()
+            .map(|&(a, b)| [geometry.corner(a), geometry.corner(b)])
+            .collect();
+        match state.editor.outline() {
+            Some(Outline::Rect(rect)) => {
+                let r = geometry.screen_rect(rect);
+                let corners = [
+                    r.left_top(),
+                    r.right_top(),
+                    r.right_bottom(),
+                    r.left_bottom(),
+                ];
+                paths.extend((0..4).map(|i| [corners[i], corners[(i + 1) % 4]]));
+            }
+            Some(Outline::Path(points)) => {
+                let center = |p: &Point| {
+                    geometry
+                        .screen_rect(PixelRect::new(p.x, p.y, 1, 1))
+                        .center()
+                };
+                paths.extend(
+                    points
+                        .windows(2)
+                        .map(|pair| [center(&pair[0]), center(&pair[1])]),
+                );
+            }
+            None => {}
+        }
+        if !paths.is_empty() {
+            // The dashes crawl, which is what makes a selection easy to tell from the drawing.
+            let time = ui.input(|input| input.time);
+            let offset = (time * 8.0 % 8.0) as f32;
+            let dark = Stroke::new(1.0, Color32::BLACK);
+            let light = Stroke::new(1.0, Color32::WHITE);
+            let mut shapes = Vec::new();
+            for path in &paths {
+                shapes.push(egui::Shape::line_segment(*path, dark));
+                egui::Shape::dashed_line_many_with_offset(
+                    path,
+                    light,
+                    &[4.0],
+                    &[4.0],
+                    offset,
+                    &mut shapes,
+                );
+            }
+            painter.extend(shapes);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(120));
+        }
 
         let hover_pixel = response.hover_pos().map(|pos| geometry.pixel_at(pos));
         self.hover = hover_pixel.map(|pixel| (pixel, self.cache.image().get(pixel.x, pixel.y)));
@@ -375,6 +437,27 @@ impl CanvasView {
         }
     }
 
+    /// The border segments of the selection, recomputed only when the selection changes.
+    fn selection_outline(&mut self, editor: &Editor) -> Vec<(Point, Point)> {
+        let selection = editor
+            .document()
+            .and_then(|document| document.sprite().selection());
+        let Some(mask) = selection else {
+            self.outline = None;
+            return Vec::new();
+        };
+        // A selection is replaced, never changed in place, so its address identifies it.
+        let key = std::sync::Arc::as_ptr(mask) as usize;
+        match &self.outline {
+            Some((made_for, segments)) if *made_for == key => segments.clone(),
+            _ => {
+                let segments = mask.outline();
+                self.outline = Some((key, segments.clone()));
+                segments
+            }
+        }
+    }
+
     /// The texture of the flattened sprite, brought up to date with what changed.
     fn sprite(&mut self, ctx: &egui::Context, editor: &mut Editor) -> Option<egui::TextureId> {
         let generation = editor.generation();
@@ -471,6 +554,47 @@ fn empty_state(
             ui.label(RichText::new(hint).weak());
         });
     });
+}
+
+/// One tab per open sprite, above the canvas. Shown once there is more than one, or when the
+/// only one could be closed from here.
+fn sprite_tabs(ui: &mut Ui, state: &mut AppState, registry: &CommandRegistry<AppState>) {
+    let tabs: Vec<(u64, String, bool)> = state
+        .editor
+        .documents()
+        .map(|(id, _)| {
+            let active = state.editor.active_document() == Some(id);
+            (id.0, state.title_of(id), active)
+        })
+        .collect();
+    if tabs.is_empty() {
+        return;
+    }
+    let mut activate = None;
+    let mut close = None;
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(6, 3))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (id, title, active) in &tabs {
+                    if ui.selectable_label(*active, title).clicked() {
+                        activate = Some(*id);
+                    }
+                    if ui.small_button("×").on_hover_text("Close").clicked() {
+                        close = Some(*id);
+                    }
+                    ui.add_space(8.0);
+                }
+            });
+        });
+    if let Some(id) = activate.or(close) {
+        let params = Params::new().with("doc", id as i64);
+        commands::run(registry, state, "doc.activate", &params);
+    }
+    if close.is_some() {
+        commands::run(registry, state, "file.close", &Params::new());
+    }
 }
 
 #[cfg(test)]

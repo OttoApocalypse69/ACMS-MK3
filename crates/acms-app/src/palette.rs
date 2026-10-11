@@ -37,9 +37,13 @@ impl PaletteState {
 }
 
 /// Commands matching `query`, best match first. Ties keep registration order.
+///
+/// Commands that cannot run without being given arguments are left out: the palette has no
+/// way to supply them.
 fn matching<'a, C>(registry: &'a CommandRegistry<C>, query: &str) -> Vec<&'a Command<C>> {
     let mut scored: Vec<(i32, &Command<C>)> = registry
         .iter()
+        .filter(|command| command.runs_without_params())
         .filter_map(|command| {
             let by_name = fuzzy::score(query, command.name());
             let by_id = fuzzy::score(query, command.id());
@@ -196,11 +200,23 @@ mod tests {
         for (id, name) in [
             ("view.toggle_theme", "Toggle Light / Dark Theme"),
             ("view.reset_layout", "Reset Panel Layout"),
-            ("debug.clear_log", "Debug: Clear Log"),
+            ("view.clear_log", "Clear Log"),
         ] {
-            registry.register(Command::new(id, name, |_| {})).unwrap();
+            registry
+                .register(Command::new(id, name, |_, _| Ok(())))
+                .unwrap();
         }
         registry
+    }
+
+    #[test]
+    fn commands_that_need_arguments_are_not_listed() {
+        let mut registry = registry();
+        let needs_size = Command::new("brush.set_size", "Set Brush Size", |_, _| Ok(()))
+            .param("size", acms_core::command::ParamKind::Int);
+        registry.register(needs_size).unwrap();
+        assert!(ids(&registry, "brush").is_empty());
+        assert_eq!(ids(&registry, "").len(), 3);
     }
 
     fn ids(registry: &CommandRegistry<()>, query: &str) -> Vec<String> {
@@ -215,7 +231,7 @@ mod tests {
         let registry = registry();
         assert_eq!(
             ids(&registry, ""),
-            ["view.toggle_theme", "view.reset_layout", "debug.clear_log"]
+            ["view.toggle_theme", "view.reset_layout", "view.clear_log"]
         );
     }
 
@@ -223,7 +239,7 @@ mod tests {
     fn query_filters_and_ranks() {
         let registry = registry();
         assert_eq!(ids(&registry, "reset"), ["view.reset_layout"]);
-        assert_eq!(ids(&registry, "clear log")[0], "debug.clear_log");
+        assert_eq!(ids(&registry, "clear log")[0], "view.clear_log");
         assert!(ids(&registry, "zzz").is_empty());
     }
 

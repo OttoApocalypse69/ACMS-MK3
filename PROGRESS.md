@@ -4,10 +4,40 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phase 0 — Skeleton: done.** Next is Phase 1 (not started).
+**Phase 0 — Skeleton: done. Phase 1 — Draw on a canvas: in progress.**
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, thiserror 2, anyhow 1, directories 6, serde 1, serde_json 1.
+
+## Phase 1 task list
+
+Core (`acms-core`, no egui, no file IO):
+
+- [ ] `Rgba8`, `Point` / `Rect`, `Image` (RGBA8, straight alpha)
+- [ ] Document model: `Sprite` (size, palette, layers, frames, cels by `(LayerId, frame)`), stable `LayerId`, cels cropped to their content with an origin
+- [ ] Transactions: every pixel change goes through one, stores only the changed region (before / after)
+- [ ] History: list with a cursor, undo / redo / jump, memory limit, revision number for "unsaved changes"
+- [ ] Stroke pipeline: interpolate (Bresenham) → brush stamp (square / round, size N) → ink (simple, erase) → canvas mask → preview buffer → commit as one transaction
+- [ ] Compositor: flatten a frame (or a rectangle of it), with the stroke preview on top
+- [ ] `Tool` trait + tools: pencil, eraser, eyedropper
+- [ ] `Editor`: document, primary / secondary colour, brush, tool registry and active tool
+- [ ] Typed command parameters (deferred from Phase 0)
+
+IO (`acms-io`):
+
+- [ ] `.acms` save / load (zip: `manifest.json` with `format_version`, `cels/<id>.png`, `thumb.png`)
+- [ ] PNG export with integer scale
+- [ ] Round-trip tests; golden image tests for pencil and eraser in `tests/golden/`
+
+App (`acms-app`):
+
+- [ ] Commands: new, open, save, save as, export PNG, undo, redo, history jump, tool selection, colours, brush, zoom, grid
+- [ ] Keymap: default shortcuts for the above; optional `args` per binding
+- [ ] Viewport: sprite texture (nearest), checkerboard, pixel grid, zoom at cursor in integer steps, pan with middle mouse or space + drag
+- [ ] Pointer input → active tool, no gaps on fast strokes
+- [ ] Panels: Tools, Tool Options (brush), Colour (primary / secondary, picker, hex), Palette (basic grid), History
+- [ ] Dialogs: new sprite, export PNG, native file dialogs (`rfd`), unsaved-changes confirmation
+- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
 
 ## Phase 0 task list
 

@@ -4,12 +4,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod canvas;
 mod commands;
 mod config;
+mod dialogs;
 mod fuzzy;
 mod keymap;
 mod palette;
 mod panels;
+mod state;
 mod theme;
 
 fn main() -> anyhow::Result<()> {
@@ -20,7 +23,6 @@ fn main() -> anyhow::Result<()> {
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
-
     let keymap_file = config::keymap_path();
 
     eframe::run_native(

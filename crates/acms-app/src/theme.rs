@@ -27,13 +27,6 @@ impl ThemeKind {
         }
     }
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Dark => "Dark",
-            Self::Light => "Light",
-        }
-    }
-
     pub fn tokens(self) -> Tokens {
         match self {
             Self::Dark => Tokens::DARK,
@@ -69,6 +62,8 @@ pub struct Tokens {
     pub on_accent: Color32,
     /// Errors and destructive actions.
     pub danger: Color32,
+    /// The two colours of the checkerboard shown behind transparent pixels.
+    pub checker: [Color32; 2],
 }
 
 impl Tokens {
@@ -82,6 +77,10 @@ impl Tokens {
         accent: Color32::from_rgb(0x5B, 0x8D, 0xEF),
         on_accent: Color32::WHITE,
         danger: Color32::from_rgb(0xE5, 0x53, 0x4B),
+        checker: [
+            Color32::from_rgb(0x4B, 0x4E, 0x57),
+            Color32::from_rgb(0x3C, 0x3F, 0x47),
+        ],
     };
 
     pub const LIGHT: Self = Self {
@@ -94,6 +93,10 @@ impl Tokens {
         accent: Color32::from_rgb(0x2F, 0x6F, 0xEB),
         on_accent: Color32::WHITE,
         danger: Color32::from_rgb(0xD1, 0x24, 0x2F),
+        checker: [
+            Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            Color32::from_rgb(0xD6, 0xD9, 0xE0),
+        ],
     };
 }
 
@@ -102,6 +105,8 @@ pub fn install(ctx: &egui::Context, active: ThemeKind) {
     for kind in [ThemeKind::Dark, ThemeKind::Light] {
         ctx.set_style_of(kind.egui_theme(), egui_style(kind));
     }
+    // Ctrl+Plus / Minus / 0 zoom the canvas (through the keymap), not the whole interface.
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
     set_active(ctx, active);
 }
 

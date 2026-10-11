@@ -1,24 +1,30 @@
-//! The eframe application: wires the registry, keymap, palette and dock together.
+//! The eframe application: wires the registry, keymap, palette, dialogs and dock together.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use acms_core::command::CommandRegistry;
-use egui_dock::DockArea;
+use acms_core::command::{CommandRegistry, Params};
+use egui_dock::{DockArea, DockState};
 
-use crate::commands::{self, AppState};
+use crate::commands;
 use crate::config;
+use crate::dialogs;
 use crate::keymap::Keymap;
 use crate::palette;
-use crate::panels::PanelViewer;
+use crate::panels::{PanelViewer, PanelsUi};
+use crate::state::AppState;
 use crate::theme::{self, ThemeKind};
 
 pub struct AcmsApp {
     registry: CommandRegistry<AppState>,
     keymap: Keymap,
     state: AppState,
+    /// Widget state of the panels: textures, text being typed and the like.
+    panels: PanelsUi,
     /// The theme egui is currently showing; compared with `state.theme` every frame.
     shown_theme: ThemeKind,
+    /// The window has been told to close, so a close request is no longer questioned.
+    closing: bool,
 }
 
 impl AcmsApp {
@@ -53,13 +59,13 @@ impl AcmsApp {
             keymap,
             shown_theme: state.theme,
             state,
+            panels: PanelsUi::default(),
+            closing: false,
         })
     }
 
-    fn run_command(&mut self, id: &str) {
-        if let Err(err) = self.registry.run(id, &mut self.state) {
-            self.state.log.push(err.to_string());
-        }
+    fn run_command(&mut self, id: &str, params: &Params) {
+        commands::run(&self.registry, &mut self.state, id, params);
     }
 
     /// One frame of the whole UI. Separate from [`eframe::App::ui`] so tests can drive it
@@ -67,31 +73,49 @@ impl AcmsApp {
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
-        if let Some(id) = self.keymap.triggered(&ctx).map(str::to_owned) {
-            self.run_command(&id);
+        // Closing the window is quitting, which asks before unsaved changes are lost.
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested && !self.closing && self.state.has_unsaved_changes() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.run_command("app.quit", &Params::new());
         }
 
-        let palette_shortcut = self
-            .keymap
-            .shortcuts_for("view.command_palette")
-            .next()
-            .map(|shortcut| ctx.format_shortcut(shortcut))
-            .unwrap_or_default();
+        // A dialog is modal: shortcuts wait until it is closed.
+        if self.state.dialog.is_none() {
+            let triggered = self
+                .keymap
+                .triggered(&ctx)
+                .map(|(id, params)| (id.to_owned(), params.clone()));
+            if let Some((id, params)) = triggered {
+                self.run_command(&id, &params);
+            }
+        }
 
+        // The dock is taken out of the state while it is shown, so that the panels inside it
+        // can be given the whole state to read and to run commands on.
+        let layout = self.state.layout_generation;
+        let mut dock = std::mem::replace(&mut self.state.dock, DockState::new(Vec::new()));
         let surface = self.shown_theme.tokens().surface;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(surface))
             .show(ui, |ui| {
+                let style = theme::dock_style(ui.style(), self.shown_theme);
                 let mut viewer = PanelViewer {
-                    log: &self.state.log,
-                    palette_shortcut: &palette_shortcut,
+                    state: &mut self.state,
+                    registry: &self.registry,
+                    keymap: &self.keymap,
+                    ui_state: &mut self.panels,
                 };
-                DockArea::new(&mut self.state.dock)
-                    .style(theme::dock_style(ui.style(), self.shown_theme))
+                DockArea::new(&mut dock)
+                    .style(style)
                     .show_leaf_collapse_buttons(false)
                     .show_leaf_close_all_buttons(false)
                     .show_inside(ui, &mut viewer);
             });
+        // If a command replaced the layout meanwhile (Reset Panel Layout), the new one stays.
+        if self.state.layout_generation == layout {
+            self.state.dock = dock;
+        }
 
         // The palette needs its own state mutably and the rest of the app state read-only.
         let mut palette_state = std::mem::take(&mut self.state.palette);
@@ -104,30 +128,44 @@ impl AcmsApp {
         );
         self.state.palette = palette_state;
         if let Some(id) = picked {
-            self.run_command(&id);
+            self.run_command(&id, &Params::new());
         }
+
+        dialogs::show(&ctx, &mut self.state, &self.registry);
 
         if self.state.theme != self.shown_theme {
             self.shown_theme = self.state.theme;
             theme::set_active(&ctx, self.shown_theme);
         }
         if std::mem::take(&mut self.state.quit_requested) {
+            self.closing = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }
 
 impl eframe::App for AcmsApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.frame(ui);
+
+        // Native file dialogs block, so they are shown once the frame's UI is done.
+        if self.state.file_request.is_some() {
+            dialogs::resolve_file_request(&mut self.state, &self.registry, frame);
+            ui.ctx().request_repaint();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use egui::{Event, Key, Modifiers, RawInput};
+    use acms_core::color::Rgba8;
+    use acms_core::geom::Point;
+    use acms_core::sprite::LayerId;
+    use acms_core::stroke;
+    use egui::{Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, RawInput, Vec2};
 
     use super::*;
+    use crate::state::{Dialog, FileRequest};
 
     /// Ctrl as a desktop backend reports it on Windows and Linux.
     const CTRL: Modifiers = Modifiers::CTRL.plus(Modifiers::COMMAND);
@@ -150,17 +188,37 @@ mod tests {
             harness
         }
 
+        /// With a blank 16×16 sprite open and laid out on screen.
+        fn with_sprite() -> Self {
+            let mut harness = Self::new();
+            let size = Params::new().with("width", 16_u32).with("height", 16_u32);
+            harness.app.run_command("file.new", &size);
+            // One frame to learn the canvas size and zoom to fit, one to settle.
+            harness.frame(vec![]);
+            harness.frame(vec![]);
+            harness
+        }
+
         fn frame(&mut self, events: Vec<Event>) -> egui::FullOutput {
-            let input = RawInput {
+            self.frame_with(RawInput {
+                events,
+                ..self.input()
+            })
+        }
+
+        fn input(&self) -> RawInput {
+            RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
+                    Pos2::ZERO,
                     egui::vec2(1280.0, 800.0),
                 )),
-                events,
                 ..Default::default()
-            };
+            }
+        }
+
+        fn frame_with(&mut self, input: RawInput) -> egui::FullOutput {
             let mut output = self.ctx.run_ui(input, |ui| self.app.frame(ui));
-            // There is no renderer to upload the font atlas to.
+            // There is no renderer to upload textures to.
             output.textures_delta.clear();
             output
         }
@@ -179,13 +237,53 @@ mod tests {
         fn type_text(&mut self, text: &str) {
             self.frame(vec![Event::Text(text.to_owned())]);
         }
+
+        fn pointer_move(&mut self, pos: Pos2) {
+            self.frame(vec![Event::PointerMoved(pos)]);
+        }
+
+        fn pointer_button(&mut self, pos: Pos2, button: PointerButton, pressed: bool) {
+            self.frame(vec![Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }]);
+        }
+
+        /// Presses at the first sprite pixel, moves through the others, releases at the last.
+        fn drag_pixels(&mut self, button: PointerButton, pixels: &[(i32, i32)]) {
+            let positions: Vec<Pos2> = pixels
+                .iter()
+                .map(|&(x, y)| self.app.panels.canvas.screen_pos(x, y))
+                .collect();
+            let (first, last) = (positions[0], positions[positions.len() - 1]);
+            self.pointer_move(first);
+            self.pointer_button(first, button, true);
+            for &pos in &positions[1..] {
+                self.pointer_move(pos);
+            }
+            self.pointer_button(last, button, false);
+            self.frame(vec![]);
+        }
+
+        fn pixel(&self, x: i32, y: i32) -> Rgba8 {
+            let document = self.app.state.editor.document().unwrap();
+            document.sprite().pixel(LayerId(1), 0, x, y)
+        }
+
+        fn history(&self) -> Vec<String> {
+            let document = self.app.state.editor.document().unwrap();
+            document.history().map(str::to_owned).collect()
+        }
     }
 
     #[test]
     fn a_shortcut_runs_its_command() {
         let mut h = Harness::new();
-        h.press(CTRL, Key::H);
-        assert_eq!(h.app.state.log, ["Hello from the command system"]);
+        h.press(CTRL.plus(Modifiers::SHIFT), Key::T);
+        assert_eq!(h.app.state.theme, ThemeKind::Light);
+        assert_eq!(h.ctx.theme(), egui::Theme::Light);
     }
 
     #[test]
@@ -193,17 +291,21 @@ mod tests {
         let file = config::TempFile::new(
             "app-rebind.json",
             r#"{ "bindings": [
-                { "keys": "Ctrl+J", "command": "debug.say_hello" },
-                { "keys": "Ctrl+H", "command": null }
+                { "keys": "Ctrl+J", "command": "view.toggle_grid" },
+                { "keys": "Ctrl+G", "command": null },
+                { "keys": "Ctrl+3", "command": "brush.set_size", "args": { "size": 3 } }
             ] }"#,
         );
         let mut h = Harness::with_keymap_file(Some(file.path()));
-        h.app.state.log.clear();
+        assert!(h.app.state.view.show_grid);
 
-        h.press(CTRL, Key::H);
-        assert!(h.app.state.log.is_empty());
+        h.press(CTRL, Key::G);
+        assert!(h.app.state.view.show_grid);
         h.press(CTRL, Key::J);
-        assert_eq!(h.app.state.log, ["Hello from the command system"]);
+        assert!(!h.app.state.view.show_grid);
+
+        h.press(CTRL, Key::Num3);
+        assert_eq!(h.app.state.editor.brush.size(), 3);
     }
 
     #[test]
@@ -239,9 +341,9 @@ mod tests {
     fn palette_search_then_enter_runs_the_command_and_closes() {
         let mut h = Harness::new();
         h.press(CTRL.plus(Modifiers::SHIFT), Key::P);
-        h.type_text("hello");
+        h.type_text("pixel grid");
         h.press(Modifiers::NONE, Key::Enter);
-        assert_eq!(h.app.state.log, ["Hello from the command system"]);
+        assert!(!h.app.state.view.show_grid);
         assert!(!h.app.state.palette.is_open());
     }
 
@@ -249,11 +351,14 @@ mod tests {
     fn palette_arrow_keys_move_the_selection() {
         let mut h = Harness::new();
         h.press(CTRL, Key::K);
-        // The second entry in registration order is "Toggle Light / Dark Theme".
+        // The first two commands in registration order are "New Sprite…" and "Open…".
         h.press(Modifiers::NONE, Key::ArrowDown);
         h.press(Modifiers::NONE, Key::Enter);
-        assert_eq!(h.app.state.theme, ThemeKind::Light);
-        assert_eq!(h.ctx.theme(), egui::Theme::Light);
+        assert_eq!(
+            h.app.state.file_request,
+            Some(FileRequest::Open { discard: true })
+        );
+        assert_eq!(h.app.state.dialog, None);
     }
 
     #[test]
@@ -262,6 +367,7 @@ mod tests {
         h.press(CTRL, Key::K);
         h.press(Modifiers::NONE, Key::Escape);
         assert!(!h.app.state.palette.is_open());
+        assert_eq!(h.app.state.dialog, None);
         assert!(h.app.state.log.is_empty());
     }
 
@@ -269,11 +375,22 @@ mod tests {
     fn a_disabled_command_cannot_be_run_from_the_palette() {
         let mut h = Harness::new();
         h.press(CTRL, Key::K);
-        h.type_text("clear log");
+        h.type_text("undo");
         h.press(Modifiers::NONE, Key::Enter);
-        // Nothing to clear, so the command is disabled: the palette stays open.
+        // There is nothing to undo, so the command is disabled: the palette stays open.
         assert!(h.app.state.palette.is_open());
         assert!(h.app.state.log.is_empty());
+    }
+
+    #[test]
+    fn typing_in_the_palette_does_not_trigger_single_key_shortcuts() {
+        let mut h = Harness::new();
+        h.press(Modifiers::NONE, Key::E);
+        assert_eq!(h.app.state.editor.active_tool(), "eraser");
+
+        h.press(CTRL, Key::K);
+        h.press(Modifiers::NONE, Key::B);
+        assert_eq!(h.app.state.editor.active_tool(), "eraser");
     }
 
     #[test]
@@ -288,5 +405,215 @@ mod tests {
         }]);
         let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
         assert!(commands.contains(&egui::ViewportCommand::Close));
+    }
+
+    #[test]
+    fn dragging_on_the_canvas_draws_one_undoable_stroke() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (6, 2), (10, 2)]);
+
+        for x in 2..=10 {
+            assert_eq!(h.pixel(x, 2), Rgba8::BLACK, "x = {x}");
+        }
+        assert_eq!(h.pixel(11, 2), Rgba8::TRANSPARENT);
+        assert_eq!(h.pixel(6, 3), Rgba8::TRANSPARENT);
+        assert_eq!(h.history(), ["Pencil"]);
+        assert!(h.app.state.has_unsaved_changes());
+
+        h.press(CTRL, Key::Z);
+        assert_eq!(h.pixel(6, 2), Rgba8::TRANSPARENT);
+        h.press(CTRL, Key::Y);
+        assert_eq!(h.pixel(6, 2), Rgba8::BLACK);
+        h.press(CTRL, Key::Z);
+        h.press(CTRL.plus(Modifiers::SHIFT), Key::Z);
+        assert_eq!(h.pixel(6, 2), Rgba8::BLACK);
+    }
+
+    #[test]
+    fn a_fast_stroke_across_the_canvas_leaves_no_gaps() {
+        let mut h = Harness::with_sprite();
+        // One press, then a single jump most of the way across: as from a fast mouse.
+        h.drag_pixels(PointerButton::Primary, &[(1, 1), (14, 9), (3, 14)]);
+
+        for (from, to) in [((1, 1), (14, 9)), ((14, 9), (3, 14))] {
+            for p in stroke::line(Point::new(from.0, from.1), Point::new(to.0, to.1)) {
+                assert_eq!(h.pixel(p.x, p.y), Rgba8::BLACK, "gap at {p:?}");
+            }
+        }
+        assert_eq!(h.history(), ["Pencil"]);
+    }
+
+    #[test]
+    fn the_right_button_draws_with_the_secondary_colour() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Secondary, &[(4, 4), (4, 8)]);
+        assert_eq!(h.pixel(4, 6), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn tool_shortcuts_switch_between_pencil_eraser_and_eyedropper() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (10, 2)]);
+
+        h.press(Modifiers::NONE, Key::E);
+        h.drag_pixels(PointerButton::Primary, &[(5, 2), (7, 2)]);
+        assert_eq!(h.pixel(4, 2), Rgba8::BLACK);
+        assert_eq!(h.pixel(6, 2), Rgba8::TRANSPARENT);
+        assert_eq!(h.history(), ["Pencil", "Eraser"]);
+
+        // Pick black into the secondary colour, then swap it into primary.
+        h.app.state.editor.primary = Rgba8::rgb(1, 2, 3);
+        h.press(Modifiers::NONE, Key::I);
+        h.drag_pixels(PointerButton::Secondary, &[(3, 2)]);
+        assert_eq!(h.app.state.editor.secondary, Rgba8::BLACK);
+        h.press(Modifiers::NONE, Key::X);
+        assert_eq!(h.app.state.editor.primary, Rgba8::BLACK);
+        assert_eq!(h.app.state.editor.secondary, Rgba8::rgb(1, 2, 3));
+
+        h.press(Modifiers::NONE, Key::B);
+        assert_eq!(h.app.state.editor.active_tool(), "pencil");
+    }
+
+    #[test]
+    fn escape_abandons_the_stroke_being_drawn() {
+        let mut h = Harness::with_sprite();
+        let canvas = &h.app.panels.canvas;
+        let (from, to) = (canvas.screen_pos(2, 2), canvas.screen_pos(9, 2));
+        h.pointer_move(from);
+        h.pointer_button(from, PointerButton::Primary, true);
+        h.pointer_move(to);
+        assert!(h.app.state.editor.is_interacting());
+
+        h.press(Modifiers::NONE, Key::Escape);
+        assert!(!h.app.state.editor.is_interacting());
+        h.pointer_button(to, PointerButton::Primary, false);
+        assert_eq!(h.pixel(5, 2), Rgba8::TRANSPARENT);
+        assert!(h.history().is_empty());
+    }
+
+    #[test]
+    fn the_wheel_zooms_around_the_pointer() {
+        let mut h = Harness::with_sprite();
+        let before = h.app.state.view.zoom();
+        let under = h.app.panels.canvas.screen_pos(12, 3);
+        h.pointer_move(under);
+
+        let wheel = |delta: f32| Event::MouseWheel {
+            unit: MouseWheelUnit::Line,
+            delta: Vec2::new(0.0, delta),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        };
+        h.frame(vec![wheel(1.0)]);
+        h.frame(vec![]);
+        assert!(h.app.state.view.zoom() > before);
+        // The pixel that was under the pointer still is.
+        let now = h.app.panels.canvas.screen_pos(12, 3);
+        assert!((now - under).length() <= h.app.state.view.zoom() / 2.0 + 1.0);
+
+        h.frame(vec![wheel(-1.0)]);
+        h.frame(vec![wheel(-1.0)]);
+        assert!(h.app.state.view.zoom() < before);
+    }
+
+    #[test]
+    fn dragging_with_the_middle_button_pans() {
+        let mut h = Harness::with_sprite();
+        let start = h.app.panels.canvas.screen_pos(8, 8);
+        let corner_before = h.app.panels.canvas.screen_pos(0, 0);
+
+        h.pointer_move(start);
+        h.pointer_button(start, PointerButton::Middle, true);
+        for step in 1..=4 {
+            h.pointer_move(start + Vec2::new(15.0, 10.0) * step as f32);
+        }
+        h.pointer_button(start + Vec2::new(60.0, 40.0), PointerButton::Middle, false);
+        h.frame(vec![]);
+
+        // The drag only counts once the pointer has clearly moved, so allow for a little
+        // lost at the start.
+        let moved = h.app.panels.canvas.screen_pos(0, 0) - corner_before;
+        assert!((40.0..=60.0).contains(&moved.x), "{moved:?}");
+        assert!((25.0..=40.0).contains(&moved.y), "{moved:?}");
+        // Panning is not drawing.
+        assert!(h.history().is_empty());
+    }
+
+    #[test]
+    fn a_dialog_blocks_shortcuts_and_clicks_on_the_canvas_until_it_is_closed() {
+        let mut h = Harness::with_sprite();
+        h.press(CTRL, Key::N);
+        assert!(matches!(h.app.state.dialog, Some(Dialog::NewSprite { .. })));
+
+        h.press(Modifiers::NONE, Key::E);
+        assert_eq!(h.app.state.editor.active_tool(), "pencil");
+        h.drag_pixels(PointerButton::Primary, &[(1, 1), (1, 6)]);
+        assert!(h.history().is_empty());
+
+        // Escape closes the dialog like Cancel does, and everything works again.
+        assert!(h.app.state.dialog.is_some());
+        h.press(Modifiers::NONE, Key::Escape);
+        assert_eq!(h.app.state.dialog, None);
+        h.press(Modifiers::NONE, Key::E);
+        assert_eq!(h.app.state.editor.active_tool(), "eraser");
+    }
+
+    #[test]
+    fn closing_the_window_with_unsaved_changes_asks_first() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (6, 2)]);
+
+        let close = |h: &mut Harness| {
+            let mut input = h.input();
+            let root = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+            root.events.push(egui::ViewportEvent::Close);
+            let output = h.frame_with(input);
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .clone()
+        };
+
+        let commands = close(&mut h);
+        assert!(commands.contains(&egui::ViewportCommand::CancelClose));
+        assert!(!commands.contains(&egui::ViewportCommand::Close));
+        let Some(Dialog::ConfirmDiscard { then }) = h.app.state.dialog.take() else {
+            panic!("expected to be asked about unsaved changes");
+        };
+
+        // Agreeing closes the window, and the close is not questioned a second time.
+        h.app.run_command(&then.id, &then.params);
+        let commands = h.frame(vec![]).viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .clone();
+        assert!(commands.contains(&egui::ViewportCommand::Close));
+        let commands = close(&mut h);
+        assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
+    }
+
+    #[test]
+    fn closing_the_window_without_changes_just_closes() {
+        let mut h = Harness::with_sprite();
+        let mut input = h.input();
+        let root = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+        root.events.push(egui::ViewportEvent::Close);
+        let output = h.frame_with(input);
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
+        assert_eq!(h.app.state.dialog, None);
+    }
+
+    #[test]
+    fn reset_layout_from_the_palette_survives_the_frame_it_runs_in() {
+        let mut h = Harness::new();
+        let all = h.app.state.dock.iter_all_tabs().count();
+        h.app
+            .state
+            .dock
+            .retain_tabs(|tab| *tab != crate::panels::Panel::Log);
+        h.frame(vec![]);
+        assert_eq!(h.app.state.dock.iter_all_tabs().count(), all - 1);
+
+        h.press(CTRL.plus(Modifiers::SHIFT), Key::R);
+        assert_eq!(h.app.state.dock.iter_all_tabs().count(), all);
     }
 }

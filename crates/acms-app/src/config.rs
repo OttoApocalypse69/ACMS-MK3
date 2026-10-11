@@ -52,9 +52,16 @@ pub struct TempFile(PathBuf);
 impl TempFile {
     /// `name` must be unique among the tests, which run in parallel.
     pub fn new(name: &str, contents: &str) -> Self {
+        let file = Self::path_only(name);
+        std::fs::write(file.path(), contents).unwrap();
+        file
+    }
+
+    /// Reserves a path without creating the file, for tests that write it themselves.
+    pub fn path_only(name: &str) -> Self {
         let file_name = format!("acms-test-{}-{name}", std::process::id());
         let path = std::env::temp_dir().join(file_name);
-        std::fs::write(&path, contents).unwrap();
+        let _ = std::fs::remove_file(&path);
         Self(path)
     }
 
@@ -93,7 +100,7 @@ mod tests {
     fn a_missing_file_means_defaults() {
         let path = std::env::temp_dir().join("acms-test-this-file-does-not-exist.json");
         let (keymap, messages) = load_keymap(&path);
-        assert!(has(&keymap, "debug.say_hello", "Ctrl+H"));
+        assert!(has(&keymap, "view.toggle_grid", "Ctrl+G"));
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("using the defaults"));
     }
@@ -103,13 +110,13 @@ mod tests {
         let file = TempFile::new(
             "config-applied.json",
             r#"{ "bindings": [
-                { "keys": "Ctrl+J", "command": "debug.say_hello" },
-                { "keys": "Nope", "command": "debug.say_hello" }
+                { "keys": "Ctrl+J", "command": "view.toggle_grid" },
+                { "keys": "Nope", "command": "view.toggle_grid" }
             ] }"#,
         );
         let (keymap, messages) = load_keymap(file.path());
-        assert!(has(&keymap, "debug.say_hello", "Ctrl+J"));
-        assert!(has(&keymap, "debug.say_hello", "Ctrl+H"));
+        assert!(has(&keymap, "view.toggle_grid", "Ctrl+J"));
+        assert!(has(&keymap, "view.toggle_grid", "Ctrl+G"));
         assert_eq!(messages.len(), 2);
         assert!(messages[0].starts_with("Keymap: loaded "));
         assert_eq!(messages[1], "Keymap: \"Nope\" is not a key chord");
@@ -119,7 +126,7 @@ mod tests {
     fn a_broken_file_means_defaults_and_a_message() {
         let file = TempFile::new("config-broken.json", "{ this is not json");
         let (keymap, messages) = load_keymap(file.path());
-        assert!(has(&keymap, "debug.say_hello", "Ctrl+H"));
+        assert!(has(&keymap, "view.toggle_grid", "Ctrl+G"));
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("is not a valid keymap file"));
     }

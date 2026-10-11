@@ -215,6 +215,7 @@ Work through the phases in order. The app must build and run at the end of every
 - Image layers and groups: add, delete, duplicate, rename, reorder (drag), merge down, flatten.
 - Opacity, visibility, lock, alpha lock. Blend modes: normal, multiply, screen, overlay, add.
 - Compositor with dirty rectangles.
+- Menu bar and status bar (described in section 5).
 
 **Done when:** layer operations all undo correctly and compositing matches golden images.
 
@@ -223,6 +224,7 @@ Work through the phases in order. The app must build and run at the end of every
 - Move / cut / copy / paste (also to and from the system clipboard as an image), flip, rotate 90°, nearest-neighbour scale of the selection.
 - Line, rectangle, ellipse, bucket fill, gradient.
 - Canvas resize, crop to selection, sprite scale.
+- Tabs for several open sprites (described in section 5).
 
 **Done when:** every tool respects the selection mask and is one undo step.
 
@@ -240,6 +242,7 @@ Work through the phases in order. The app must build and run at the end of every
 - Timeline panel: layers × frames grid, drag to move/copy cels and frames, multi-select.
 - Tags with playback direction. Play / pause / step, loop a tag.
 - Onion skin: previous/next count, tint, opacity.
+- Preview panel (described in section 5).
 - Export: GIF, spritesheet (rows / columns / packed, padding, trim) + JSON metadata in the Aseprite-style layout so game engines' existing importers can read it; PNG sequence.
 
 **Done when:** a multi-layer, tagged animation round-trips through `.acms` and exports a correct GIF and spritesheet + JSON.

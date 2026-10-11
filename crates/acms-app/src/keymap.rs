@@ -22,6 +22,8 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("E", "tool.eraser"),
     ("I", "tool.eyedropper"),
     ("X", "color.swap"),
+    ("Ctrl+Shift+N", "layer.new"),
+    ("F2", "layer.rename"),
     ("Ctrl+Plus", "view.zoom_in"),
     ("Ctrl+Equals", "view.zoom_in"),
     ("Ctrl+Minus", "view.zoom_out"),

@@ -15,7 +15,10 @@ use std::path::Path;
 use acms_core::color::Rgba8;
 use acms_core::compositor;
 use acms_core::geom::Point;
-use acms_core::sprite::{CelSource, Frame, Layer, LayerId, Palette, PaletteEntry, Sprite};
+use acms_core::sprite::{
+    BlendMode, CelSource, Frame, GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Palette,
+    PaletteEntry, Sprite,
+};
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -25,7 +28,11 @@ use crate::{IoError, write_atomically};
 
 /// The version this build writes. Raise it whenever the manifest changes in a way older
 /// builds cannot read, and teach [`migrate`] to upgrade the previous version.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// - **1**: a flat list of image layers with an id and a name.
+/// - **2**: layers have visibility, opacity, blend mode, lock and alpha lock, and can be
+///   groups with children.
+pub const FORMAT_VERSION: u32 = 2;
 
 const MANIFEST: &str = "manifest.json";
 const THUMBNAIL: &str = "thumb.png";
@@ -55,16 +62,100 @@ struct PaletteEntryData {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum LayerKind {
-    Image,
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum LayerData {
+    Image {
+        id: u32,
+        name: String,
+        visible: bool,
+        /// 0 to 255.
+        opacity: u8,
+        /// One of [`BlendMode::id`].
+        blend: String,
+        locked: bool,
+        alpha_lock: bool,
+    },
+    Group {
+        id: u32,
+        name: String,
+        visible: bool,
+        collapsed: bool,
+        /// Bottom to top.
+        children: Vec<LayerData>,
+    },
 }
 
-#[derive(Serialize, Deserialize)]
-struct LayerData {
-    id: u32,
-    name: String,
-    kind: LayerKind,
+impl LayerData {
+    fn from_layer(layer: &Layer) -> Self {
+        let (id, name, visible) = (layer.id.0, layer.name.clone(), layer.visible);
+        match &layer.kind {
+            LayerKind::Image(image) => Self::Image {
+                id,
+                name,
+                visible,
+                opacity: image.opacity,
+                blend: image.blend.id().to_owned(),
+                locked: image.locked,
+                alpha_lock: image.alpha_lock,
+            },
+            LayerKind::Group(group) => Self::Group {
+                id,
+                name,
+                visible,
+                collapsed: group.collapsed,
+                children: group.children.iter().map(Self::from_layer).collect(),
+            },
+        }
+    }
+
+    fn into_layer(self) -> Result<Layer, IoError> {
+        Ok(match self {
+            Self::Image {
+                id,
+                name,
+                visible,
+                opacity,
+                blend,
+                locked,
+                alpha_lock,
+            } => {
+                let blend = BlendMode::from_id(&blend)
+                    .ok_or_else(|| IoError::Invalid(format!("`{blend}` is not a blend mode")))?;
+                Layer {
+                    id: LayerId(id),
+                    name,
+                    visible,
+                    kind: LayerKind::Image(ImageLayer {
+                        opacity,
+                        blend,
+                        locked,
+                        alpha_lock,
+                    }),
+                }
+            }
+            Self::Group {
+                id,
+                name,
+                visible,
+                collapsed,
+                children,
+            } => {
+                let children = children
+                    .into_iter()
+                    .map(Self::into_layer)
+                    .collect::<Result<_, _>>()?;
+                Layer {
+                    id: LayerId(id),
+                    name,
+                    visible,
+                    kind: LayerKind::Group(GroupLayer {
+                        children,
+                        collapsed,
+                    }),
+                }
+            }
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -87,7 +178,8 @@ struct CelData {
 pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoError> {
     // Layer by layer, frame by frame, so that the same sprite always gives the same file.
     let mut cels: Vec<_> = sprite.cels().collect();
-    let layer_order = |id: LayerId| sprite.layers().iter().position(|layer| layer.id == id);
+    let painted: Vec<LayerId> = sprite.walk().iter().map(|entry| entry.layer.id).collect();
+    let layer_order = |id: LayerId| painted.iter().position(|&layer| layer == id);
     cels.sort_by_key(|&(layer, frame, _)| (layer_order(layer), frame));
 
     let manifest = Manifest {
@@ -103,15 +195,7 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
                 name: entry.name.clone(),
             })
             .collect(),
-        layers: sprite
-            .layers()
-            .iter()
-            .map(|layer| LayerData {
-                id: layer.id.0,
-                name: layer.name.clone(),
-                kind: LayerKind::Image,
-            })
-            .collect(),
+        layers: sprite.layers().iter().map(LayerData::from_layer).collect(),
         frames: sprite
             .frames()
             .iter()
@@ -152,23 +236,43 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
     Ok(())
 }
 
-/// Brings a manifest written by an older version up to [`FORMAT_VERSION`].
-///
-/// Version 1 is the first one, so there is nothing to upgrade from yet. When version 2
-/// arrives, a `1 => { … }` arm goes here that rewrites the JSON into the new shape.
-fn migrate(manifest: serde_json::Value, version: u64) -> Result<serde_json::Value, IoError> {
-    match version {
-        v if v == u64::from(FORMAT_VERSION) => Ok(manifest),
-        v if v > u64::from(FORMAT_VERSION) => Err(IoError::TooNew {
-            found: v,
+/// Brings a manifest written by an older version up to [`FORMAT_VERSION`], one version step
+/// at a time.
+fn migrate(mut manifest: serde_json::Value, version: u64) -> Result<serde_json::Value, IoError> {
+    if version > u64::from(FORMAT_VERSION) {
+        return Err(IoError::TooNew {
+            found: version,
             supported: FORMAT_VERSION,
-        }),
-        v => Err(IoError::Invalid(format!(
-            "format version {v} does not exist"
-        ))),
+        });
     }
+    if version == 0 {
+        return Err(IoError::Invalid(
+            "format version 0 does not exist".to_owned(),
+        ));
+    }
+    if version == 1 {
+        upgrade_1_to_2(&mut manifest);
+    }
+    Ok(manifest)
 }
 
+/// Version 1 only knew plain image layers. In version 2 terms they are all visible, fully
+/// opaque, normally blended and unlocked.
+fn upgrade_1_to_2(manifest: &mut serde_json::Value) {
+    let layers = manifest
+        .get_mut("layers")
+        .and_then(serde_json::Value::as_array_mut);
+    for layer in layers.into_iter().flatten() {
+        if let Some(layer) = layer.as_object_mut() {
+            layer.insert("visible".to_owned(), true.into());
+            layer.insert("opacity".to_owned(), 255.into());
+            layer.insert("blend".to_owned(), BlendMode::Normal.id().into());
+            layer.insert("locked".to_owned(), false.into());
+            layer.insert("alpha_lock".to_owned(), false.into());
+        }
+    }
+    manifest["format_version"] = 2.into();
+}
 fn read_entry<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Vec<u8>, IoError> {
     let mut entry = zip
         .by_name(name)
@@ -205,11 +309,8 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
     let layers = manifest
         .layers
         .into_iter()
-        .map(|layer| Layer {
-            id: LayerId(layer.id),
-            name: layer.name,
-        })
-        .collect();
+        .map(LayerData::into_layer)
+        .collect::<Result<Vec<_>, IoError>>()?;
 
     let frames = manifest
         .frames
@@ -258,7 +359,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::test_util::{TempPath, drawn_sprite};
+    use crate::test_util::{TempPath, drawn_sprite, layered_sprite};
 
     fn archive(sprite: &Sprite) -> Vec<u8> {
         let mut bytes = Cursor::new(Vec::new());
@@ -289,6 +390,92 @@ mod tests {
     }
 
     #[test]
+    fn layers_groups_and_their_properties_round_trip() {
+        let sprite = layered_sprite();
+        let loaded = read_acms(Cursor::new(archive(&sprite))).unwrap();
+        assert_eq!(loaded, sprite);
+        // Spot checks, in case both sides agreed on losing something.
+        let names: Vec<&str> = loaded
+            .walk()
+            .iter()
+            .map(|entry| entry.layer.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["Background", "Shading", "Details", "Line", "Glow", "Notes"]
+        );
+        let glow = loaded.walk()[4].layer.as_image().copied().unwrap();
+        assert_eq!((glow.opacity, glow.blend), (140, BlendMode::Add));
+        assert!(glow.alpha_lock && !glow.locked);
+        assert!(!loaded.walk()[5].layer.visible);
+        assert!(loaded.walk()[2].layer.as_group().unwrap().collapsed);
+        assert_eq!(loaded.cels().count(), 4);
+
+        let manifest = manifest_json(&sprite);
+        assert_eq!(manifest["layers"][2]["kind"], "group");
+        assert_eq!(manifest["layers"][2]["children"][1]["blend"], "add");
+    }
+
+    /// The manifest of a Phase 1 file, with the given cels.
+    fn version_1_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "format_version": 1,
+            "width": 8,
+            "height": 8,
+            "palette": [{ "color": "#FF0000" }, { "color": "#00FF0080", "name": "glass" }],
+            "layers": [
+                { "id": 1, "name": "Layer 1", "kind": "image" },
+                { "id": 5, "name": "Ink", "kind": "image" }
+            ],
+            "frames": [{ "duration_ms": 80 }],
+            "cels": [{ "layer": 5, "frame": 0, "x": 2, "y": 3, "image": 1 }]
+        })
+    }
+
+    #[test]
+    fn a_version_1_file_is_upgraded_on_load() {
+        let mut cel = Vec::new();
+        let mut pixels = acms_core::image::Image::new(2, 1);
+        pixels.set(0, 0, Rgba8::rgb(1, 2, 3));
+        pixels.set(1, 0, Rgba8::rgb(4, 5, 6));
+        encode_png(&pixels, &mut cel).unwrap();
+        let bytes = archive_with(&[
+            (MANIFEST, version_1_manifest().to_string().as_bytes()),
+            ("cels/1.png", &cel),
+        ]);
+
+        let sprite = read_acms(Cursor::new(bytes)).unwrap();
+        assert_eq!(sprite.layers().len(), 2);
+        for layer in sprite.layers() {
+            assert!(layer.visible);
+            assert_eq!(layer.as_image(), Some(&ImageLayer::default()));
+        }
+        assert_eq!(sprite.layers()[1].name, "Ink");
+        assert_eq!(sprite.pixel(LayerId(5), 0, 3, 3), Rgba8::rgb(4, 5, 6));
+        assert_eq!(sprite.frames()[0].duration_ms, 80);
+        assert_eq!(sprite.palette().entries()[1].name.as_deref(), Some("glass"));
+
+        // Saving writes the current version.
+        assert_eq!(manifest_json(&sprite)["format_version"], 2);
+    }
+
+    #[test]
+    fn a_file_saved_by_the_phase_1_build_still_opens() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/phase1-v1.acms");
+        let sprite = load_acms(&path).unwrap();
+        assert_eq!((sprite.width(), sprite.height()), (32, 32));
+        assert_eq!(sprite.layers().len(), 1);
+        assert_eq!(sprite.layers()[0].name, "Layer 1");
+        assert_eq!(sprite.layers()[0].as_image(), Some(&ImageLayer::default()));
+        assert_eq!(sprite.palette().len(), 32);
+        // The file holds one stroke from (3, 3) to (20, 9).
+        let stroke = Rgba8::rgb(200, 30, 40);
+        assert_eq!(sprite.pixel(LayerId(1), 0, 3, 3), stroke);
+        assert_eq!(sprite.pixel(LayerId(1), 0, 20, 9), stroke);
+        assert_eq!(sprite.pixel(LayerId(1), 0, 20, 3), Rgba8::TRANSPARENT);
+    }
+
+    #[test]
     fn an_empty_sprite_round_trips() {
         let sprite = Sprite::new(7, 3).unwrap();
         let loaded = read_acms(Cursor::new(archive(&sprite))).unwrap();
@@ -314,9 +501,11 @@ mod tests {
         assert_eq!(names, ["cels/1.png", "manifest.json", "thumb.png"]);
 
         let manifest = manifest_json(&sprite);
-        assert_eq!(manifest["format_version"], 1);
+        assert_eq!(manifest["format_version"], 2);
         assert_eq!(manifest["width"], 24);
         assert_eq!(manifest["layers"][0]["kind"], "image");
+        assert_eq!(manifest["layers"][0]["opacity"], 255);
+        assert_eq!(manifest["layers"][0]["blend"], "normal");
         assert_eq!(manifest["palette"][0]["color"], "#000000");
 
         let thumb = decode_png(&read_entry(&mut zip, THUMBNAIL).unwrap()).unwrap();
@@ -335,7 +524,7 @@ mod tests {
             err,
             IoError::TooNew {
                 found: 99,
-                supported: 1
+                supported: 2
             }
         ));
         assert!(err.to_string().contains("format version 99"));
@@ -409,6 +598,20 @@ mod tests {
                 ("cels/1.png", &cel_png)
             ]),
             Err(IoError::Sprite(_))
+        ));
+        // A blend mode this version does not know.
+        let mut odd_blend = good.clone();
+        odd_blend["layers"][0]["blend"] = "dissolve".into();
+        assert!(matches!(
+            read(&[(MANIFEST, odd_blend.to_string().as_bytes())]),
+            Err(IoError::Invalid(_))
+        ));
+        // A layer kind this version does not know.
+        let mut odd_kind = good.clone();
+        odd_kind["layers"][0]["kind"] = "tilemap".into();
+        assert!(matches!(
+            read(&[(MANIFEST, odd_kind.to_string().as_bytes())]),
+            Err(IoError::Manifest(_))
         ));
         // A palette entry that is not a colour.
         let mut bad_color = good.clone();

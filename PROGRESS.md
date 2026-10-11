@@ -4,13 +4,36 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phase 0 — Skeleton: done. Phase 1 — Draw on a canvas: done.** Next is Phase 2 (not started).
+**Phase 0 — Skeleton: done. Phase 1 — Draw on a canvas: done. Phase 2 — Layers: in progress.**
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, directories 6, serde 1,
 serde_json 1, thiserror 2, anyhow 1.
 
-## Phase 1 task list
+## Phase 2 task list
+
+Core:
+
+- [ ] Layer tree: image layers (opacity, blend mode, visible, locked, alpha lock) and groups (children, visible, collapsed)
+- [ ] Undoable layer operations in transactions: add, delete, duplicate, rename, move / reorder, merge down, flatten, and every property change
+- [ ] Slider drags (opacity) collapse into one undo step
+- [ ] Blend modes: normal, multiply, screen, overlay, add; layer opacity; hidden layers and groups
+- [ ] Compositor keeps the flattened frame and only recomposites the damaged rectangle
+- [ ] Tools respect lock, alpha lock and hidden layers
+
+IO:
+
+- [ ] `.acms` format version 2 (layer tree and properties) with a migration from version 1; a Phase 1 file kept in `tests/samples/`
+- [ ] Golden images for compositing (each blend mode, opacity, groups, hidden layers)
+
+App:
+
+- [ ] Layer commands and shortcuts
+- [ ] Layers panel: select, visibility / lock toggles, rename, drag to reorder, groups, opacity, blend mode, alpha lock
+- [ ] Menu bar and status bar (moved here from the open questions, agreed 2026-10-11)
+- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
+
+## Phase 1 task list (done)
 
 Core (`acms-core`, no egui, no file IO):
 
@@ -98,13 +121,9 @@ App (`acms-app`):
 
 ## Open questions
 
-`PLAN.md` section 5 lists these but no phase picks them up. Tell me where they should go:
-
-- **Menu bar.** Everything is reachable through shortcuts and the command palette, and the empty
-  canvas has New / Open buttons, but there are no menus yet.
-- **Status bar** (cursor position, colour under cursor, zoom, frame).
-- **Tabs for several open sprites.** Today one sprite is open at a time.
-- **Preview panel.** Still a placeholder; its animation part belongs to Phase 5.
+None. The four section 5 items without a phase were placed on 2026-10-11 and written into
+`PLAN.md`: menu bar and status bar → Phase 2, tabs for several sprites → Phase 3, Preview
+panel → Phase 5.
 
 ## The keymap file
 

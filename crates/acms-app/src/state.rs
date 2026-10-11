@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use acms_core::command::Params;
 use acms_core::document::Document;
 use acms_core::editor::Editor;
+use acms_core::sprite::LayerId;
 use egui::Vec2;
 use egui_dock::DockState;
 
@@ -151,6 +152,8 @@ pub struct AppState {
     pub palette: PaletteState,
     pub dialog: Option<Dialog>,
     pub file_request: Option<FileRequest>,
+    /// `layer.rename` was run without a name: the Layers panel should let the user type one.
+    pub rename_layer_request: Option<LayerId>,
     /// Lines shown in the Log panel.
     pub log: Vec<String>,
     /// Set by `app.quit`; the app closes the window at the end of the frame.
@@ -170,6 +173,7 @@ impl Default for AppState {
             palette: PaletteState::default(),
             dialog: None,
             file_request: None,
+            rename_layer_request: None,
             log: Vec::new(),
             quit_requested: false,
         }

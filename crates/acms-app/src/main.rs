@@ -10,6 +10,7 @@ mod config;
 mod dialogs;
 mod fuzzy;
 mod keymap;
+mod layer_commands;
 mod palette;
 mod panels;
 mod state;

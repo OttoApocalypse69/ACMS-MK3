@@ -16,8 +16,9 @@ use acms_core::color::Rgba8;
 use acms_core::compositor;
 use acms_core::document::Document;
 use acms_core::editor::Editor;
-use acms_core::geom::Point;
-use acms_core::sprite::Sprite;
+use acms_core::geom::{Point, Rect};
+use acms_core::image::Image;
+use acms_core::sprite::{BlendMode, LayerId, Slot, Sprite};
 use acms_core::stroke::{Brush, BrushShape};
 use acms_core::tool::{Modifiers, PointerButton, PointerEvent};
 use acms_io::png::{decode_png, encode_png};
@@ -60,12 +61,15 @@ fn primary(editor: &mut Editor, path: &[(i32, i32)]) {
 
 fn check(name: &str, editor: &Editor) {
     let sprite = editor.document().expect("a document is open").sprite();
-    let actual = compositor::compose(sprite, 0);
+    check_image(name, &compositor::compose(sprite, 0));
+}
+
+fn check_image(name: &str, actual: &Image) {
     let path = golden_dir().join(format!("{name}.png"));
 
     let write = |path: &PathBuf| {
         let mut bytes = Vec::new();
-        encode_png(&actual, &mut bytes).unwrap();
+        encode_png(actual, &mut bytes).unwrap();
         std::fs::create_dir_all(golden_dir()).unwrap();
         std::fs::write(path, bytes).unwrap();
     };
@@ -81,7 +85,7 @@ fn check(name: &str, editor: &Editor) {
             path.display()
         )
     });
-    if decode_png(&bytes).unwrap() != actual {
+    if decode_png(&bytes).unwrap() != *actual {
         let actual_path = golden_dir().join(format!("{name}.actual.png"));
         write(&actual_path);
         panic!(
@@ -178,4 +182,210 @@ fn eyedropper_picks_the_colours_later_strokes_use() {
     primary(&mut editor, &[(4, 16), (27, 16)]);
     drag(&mut editor, PointerButton::Secondary, &[(4, 24), (27, 24)]);
     check("eyedropper", &editor);
+}
+
+/// Fills a rectangle of a layer with one colour.
+fn fill(document: &mut Document, layer: LayerId, rect: Rect, color: Rgba8) {
+    let pixels = Image::from_pixels(rect.w, rect.h, vec![color; rect.area()]).unwrap();
+    document
+        .transact("Fill", |tx| tx.set_pixels(layer, 0, rect, &pixels))
+        .unwrap();
+}
+
+fn add_layer(document: &mut Document, parent: Option<LayerId>, group: bool) -> LayerId {
+    let index = document.sprite().siblings(parent).unwrap().len();
+    document
+        .transact("Add", |tx| {
+            tx.add_layer(Slot::new(parent, index), "Layer", group)
+        })
+        .unwrap()
+}
+
+fn style(document: &mut Document, layer: LayerId, opacity: u8, blend: BlendMode) {
+    document
+        .transact("Style", |tx| {
+            tx.update_layer(layer, |props| {
+                if let Some(image) = &mut props.image {
+                    image.opacity = opacity;
+                    image.blend = blend;
+                }
+            })
+        })
+        .unwrap();
+}
+
+fn hide(document: &mut Document, layer: LayerId) {
+    document
+        .transact("Hide", |tx| {
+            tx.update_layer(layer, |props| props.visible = false)
+        })
+        .unwrap();
+}
+
+/// Four vertical stripes — dark, saturated, light, mid grey — with the bottom rows left empty,
+/// under a layer with an opaque band and a half-transparent band that both stick out to the
+/// right of nothing and over the empty rows.
+fn blend_scene(mode: BlendMode) -> Document {
+    let mut document = Document::new(Sprite::new(32, 32).unwrap());
+    let stripes = [
+        Rgba8::rgb(30, 40, 90),
+        Rgba8::rgb(200, 60, 60),
+        Rgba8::rgb(240, 220, 120),
+        Rgba8::rgb(128, 128, 128),
+    ];
+    for (index, color) in stripes.into_iter().enumerate() {
+        fill(
+            &mut document,
+            LayerId(1),
+            Rect::new(index as i32 * 8, 0, 8, 24),
+            color,
+        );
+    }
+
+    let top = add_layer(&mut document, None, false);
+    fill(
+        &mut document,
+        top,
+        Rect::new(2, 4, 28, 8),
+        Rgba8::rgb(40, 180, 170),
+    );
+    fill(
+        &mut document,
+        top,
+        Rect::new(2, 14, 28, 8),
+        Rgba8::new(240, 140, 40, 128),
+    );
+    fill(
+        &mut document,
+        top,
+        Rect::new(12, 20, 8, 10),
+        Rgba8::rgb(250, 250, 250),
+    );
+    style(&mut document, top, 255, mode);
+    document
+}
+
+#[test]
+fn compositing_each_blend_mode() {
+    for mode in BlendMode::ALL {
+        let document = blend_scene(mode);
+        let name = format!("blend_{}", mode.id());
+        check_image(&name, &compositor::compose(document.sprite(), 0));
+    }
+}
+
+#[test]
+fn compositing_opacity_groups_and_hidden_layers() {
+    let mut document = Document::new(Sprite::new(32, 32).unwrap());
+    // A dark backdrop with a light frame.
+    fill(
+        &mut document,
+        LayerId(1),
+        Rect::new(0, 0, 32, 32),
+        Rgba8::rgb(230, 230, 235),
+    );
+    fill(
+        &mut document,
+        LayerId(1),
+        Rect::new(2, 2, 28, 28),
+        Rgba8::rgb(40, 44, 60),
+    );
+
+    // Three squares fading out: opacity 255, 128 and 48.
+    for (index, opacity) in [255, 128, 48].into_iter().enumerate() {
+        let layer = add_layer(&mut document, None, false);
+        fill(
+            &mut document,
+            layer,
+            Rect::new(4 + index as i32 * 8, 4, 7, 7),
+            Rgba8::rgb(240, 90, 60),
+        );
+        style(&mut document, layer, opacity, BlendMode::Normal);
+    }
+
+    // A group: its two layers overlap, the upper one multiplied at 200.
+    let group = add_layer(&mut document, None, true);
+    let lower = add_layer(&mut document, Some(group), false);
+    fill(
+        &mut document,
+        lower,
+        Rect::new(4, 14, 14, 7),
+        Rgba8::rgb(90, 200, 120),
+    );
+    let upper = add_layer(&mut document, Some(group), false);
+    fill(
+        &mut document,
+        upper,
+        Rect::new(10, 16, 14, 7),
+        Rgba8::rgb(120, 140, 250),
+    );
+    style(&mut document, upper, 200, BlendMode::Multiply);
+    // A hidden layer inside the visible group must not show.
+    let hidden_inside = add_layer(&mut document, Some(group), false);
+    fill(
+        &mut document,
+        hidden_inside,
+        Rect::new(0, 0, 32, 32),
+        Rgba8::rgb(255, 0, 255),
+    );
+    hide(&mut document, hidden_inside);
+
+    // A hidden group: its visible child must not show either.
+    let hidden_group = add_layer(&mut document, None, true);
+    let child = add_layer(&mut document, Some(hidden_group), false);
+    fill(
+        &mut document,
+        child,
+        Rect::new(0, 24, 32, 8),
+        Rgba8::rgb(255, 255, 0),
+    );
+    hide(&mut document, hidden_group);
+
+    // On top of everything: a translucent bar set to Add, and a layer at opacity 0.
+    let glow = add_layer(&mut document, None, false);
+    fill(
+        &mut document,
+        glow,
+        Rect::new(2, 25, 28, 4),
+        Rgba8::new(90, 90, 160, 200),
+    );
+    style(&mut document, glow, 255, BlendMode::Add);
+    let invisible = add_layer(&mut document, None, false);
+    fill(
+        &mut document,
+        invisible,
+        Rect::new(0, 0, 32, 32),
+        Rgba8::rgb(0, 255, 0),
+    );
+    style(&mut document, invisible, 0, BlendMode::Normal);
+
+    check_image(
+        "layers_opacity_groups",
+        &compositor::compose(document.sprite(), 0),
+    );
+}
+
+#[test]
+fn merging_down_and_flattening_do_not_change_the_picture() {
+    for mode in BlendMode::ALL {
+        let mut document = blend_scene(mode);
+        let picture = compositor::compose(document.sprite(), 0);
+        let top = document.sprite().layers()[1].id;
+
+        document.transact("Merge", |tx| tx.merge_down(top)).unwrap();
+        assert_eq!(
+            compositor::compose(document.sprite(), 0),
+            picture,
+            "merge, {mode:?}"
+        );
+        document.undo();
+        document.transact("Flatten", |tx| tx.flatten()).unwrap();
+        assert_eq!(
+            compositor::compose(document.sprite(), 0),
+            picture,
+            "flatten, {mode:?}"
+        );
+        // Both leave exactly the image the golden test above pins down.
+        check_image(&format!("blend_{}", mode.id()), &picture);
+    }
 }

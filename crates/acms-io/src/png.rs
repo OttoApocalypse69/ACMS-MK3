@@ -5,7 +5,7 @@ use std::path::Path;
 
 use acms_core::compositor;
 use acms_core::image::Image;
-use acms_core::sprite::Sprite;
+use acms_core::sprite::{Sprite, SpriteError};
 use png::{BitDepth, ColorType, Transformations};
 
 use crate::{IoError, write_atomically};
@@ -71,7 +71,9 @@ pub fn export_png(
             "the export scale must be between 1 and {MAX_EXPORT_SCALE}, not {scale}"
         )));
     }
-    sprite.check_cel(sprite.layers()[0].id, frame)?;
+    if frame >= sprite.frames().len() {
+        return Err(SpriteError::UnknownFrame(frame).into());
+    }
     let flat = compositor::compose(sprite, frame);
     encode_png(&flat.scaled_up(scale), writer)
 }

@@ -41,6 +41,21 @@ pub fn run(registry: &CommandRegistry<AppState>, state: &mut AppState, id: &str,
     }
 }
 
+/// Turns an error message written as a fragment ("the layer is locked") into a sentence for
+/// a dialog ("The layer is locked.").
+pub fn sentence(message: impl std::fmt::Display) -> String {
+    let message = message.to_string();
+    let mut chars = message.chars();
+    let mut sentence: String = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => return message,
+    };
+    if !sentence.ends_with(['.', '!', '?']) {
+        sentence.push('.');
+    }
+    sentence
+}
+
 fn has_document(state: &AppState) -> bool {
     state.editor.document().is_some()
 }
@@ -77,7 +92,8 @@ fn file_new(state: &mut AppState, params: &Params) -> CommandResult {
     }
     // Sizes that do not even fit in a `u32` are reported like any other bad size.
     let side = |n: i64| u32::try_from(n).unwrap_or(0);
-    let sprite = Sprite::new(side(width), side(height)).map_err(CommandError::failed)?;
+    let sprite = Sprite::new(side(width), side(height))
+        .map_err(|err| CommandError::failed(sentence(err)))?;
     state.open_document(Document::new(sprite), None);
     Ok(())
 }
@@ -243,6 +259,8 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
         .enabled_when(has_document),
     )?;
 
+    crate::layer_commands::register(registry)?;
+
     // Tools: one command per registered tool, so each can have its own shortcut.
     let tools: Vec<_> = Editor::new().tools().collect();
     for (tool, name) in tools {
@@ -396,27 +414,24 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
     Ok(())
 }
 
+/// A registry and state to run commands against in tests.
 #[cfg(test)]
-mod tests {
+pub mod testing {
     use super::*;
-    use crate::config::TempFile;
-    use crate::keymap;
-    use crate::panels::Panel;
-    use crate::theme::ThemeKind;
     use acms_core::color::Rgba8;
     use acms_core::geom::Point;
     use acms_core::sprite::LayerId;
     use acms_core::tool::{Modifiers, PointerButton, PointerEvent};
 
-    const RED: Rgba8 = Rgba8::rgb(255, 0, 0);
+    pub const RED: Rgba8 = Rgba8::rgb(255, 0, 0);
 
-    struct Fixture {
-        registry: CommandRegistry<AppState>,
-        state: AppState,
+    pub struct Fixture {
+        pub registry: CommandRegistry<AppState>,
+        pub state: AppState,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub fn new() -> Self {
             let mut registry = CommandRegistry::new();
             register_builtin(&mut registry).unwrap();
             Self {
@@ -426,7 +441,7 @@ mod tests {
         }
 
         /// With a blank 16×16 sprite open.
-        fn with_sprite() -> Self {
+        pub fn with_sprite() -> Self {
             let mut fixture = Self::new();
             fixture.run_with(
                 "file.new",
@@ -435,20 +450,30 @@ mod tests {
             fixture
         }
 
-        fn run(&mut self, id: &str) {
+        pub fn run(&mut self, id: &str) {
             self.run_with(id, Params::new());
         }
 
-        fn run_with(&mut self, id: &str, params: Params) {
+        pub fn run_with(&mut self, id: &str, params: Params) {
             run(&self.registry, &mut self.state, id, &params);
         }
 
-        fn try_run(&mut self, id: &str, params: Params) -> CommandResult {
+        pub fn try_run(&mut self, id: &str, params: Params) -> Result<(), CommandError> {
             self.registry.run(id, &mut self.state, &params)
         }
 
-        /// Draws a horizontal red line on row `y`, as one stroke.
-        fn draw_line(&mut self, y: i32) {
+        pub fn is_enabled(&self, id: &str) -> bool {
+            self.registry
+                .get(id)
+                .is_some_and(|command| command.is_enabled(&self.state))
+        }
+
+        pub fn document(&self) -> &Document {
+            self.state.editor.document().unwrap()
+        }
+
+        /// Draws a horizontal red line on row `y` of the selected layer, as one stroke.
+        pub fn draw_line(&mut self, y: i32) {
             let event = |x| PointerEvent {
                 position: Point::new(x, y),
                 button: PointerButton::Primary,
@@ -460,18 +485,35 @@ mod tests {
             self.state.editor.pointer_up(event(10));
         }
 
-        fn pixel(&self, x: i32, y: i32) -> Rgba8 {
-            let document = self.state.editor.document().unwrap();
-            document.sprite().pixel(LayerId(1), 0, x, y)
+        /// A pixel of the bottom layer the sprite was created with.
+        pub fn pixel(&self, x: i32, y: i32) -> Rgba8 {
+            self.pixel_on(LayerId(1), x, y)
         }
 
-        fn confirm_pending(&mut self) {
+        pub fn pixel_on(&self, layer: LayerId, x: i32, y: i32) -> Rgba8 {
+            self.document().sprite().pixel(layer, 0, x, y)
+        }
+
+        pub fn confirm_pending(&mut self) {
             let Some(Dialog::ConfirmDiscard { then }) = self.state.dialog.take() else {
                 panic!("expected a confirmation, found {:?}", self.state.dialog);
             };
             self.run_with(&then.id, then.params);
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{Fixture, RED};
+    use super::*;
+    use crate::config::TempFile;
+    use crate::keymap;
+    use crate::panels::Panel;
+    use crate::theme::ThemeKind;
+    use acms_core::color::Rgba8;
+    use acms_core::geom::Point;
+    use acms_core::tool::{Modifiers, PointerButton, PointerEvent};
 
     #[test]
     fn every_default_shortcut_points_at_a_registered_command() {

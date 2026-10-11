@@ -8,6 +8,7 @@ use crate::color::Rgba8;
 use crate::compositor::Overlay;
 use crate::document::Document;
 use crate::geom::Rect;
+use crate::sprite::SpriteError;
 use crate::stroke::Brush;
 use crate::tool::{BrushTool, CursorHint, Eyedropper, PointerEvent, Tool, ToolContext};
 
@@ -148,6 +149,16 @@ impl Editor {
 
     pub fn is_interacting(&self) -> bool {
         self.interacting
+    }
+
+    /// Why drawing tools have no effect right now, if that is the case: the selected layer is
+    /// a group, locked or hidden. `None` when drawing works, and when no sprite is open.
+    pub fn draw_block(&self) -> Option<SpriteError> {
+        let document = self.document.as_ref()?;
+        document
+            .sprite()
+            .check_drawable(document.active_layer(), document.active_frame())
+            .err()
     }
 
     /// The stroke being drawn right now, to be shown on top of the sprite.
@@ -309,6 +320,94 @@ mod tests {
         editor.cancel_interaction();
         assert_eq!(editor.take_damage(), Rect::new(2, 2, 4, 1));
         assert!(editor.take_damage().is_empty());
+    }
+
+    #[test]
+    fn tools_draw_on_the_selected_layer_and_respect_its_state() {
+        use crate::sprite::Slot;
+
+        let mut editor = editor();
+        let document = editor.document_mut().unwrap();
+        let upper = document
+            .transact("Add", |tx| tx.add_layer(Slot::new(None, 1), "Upper", false))
+            .unwrap();
+        let group = document
+            .transact("Add", |tx| tx.add_layer(Slot::new(None, 2), "Group", true))
+            .unwrap();
+        document.set_active_layer(upper);
+        assert_eq!(editor.draw_block(), None);
+
+        drag(&mut editor, PointerButton::Primary, &[(1, 1), (5, 1)]);
+        let sprite = editor.document().unwrap().sprite();
+        assert_eq!(sprite.pixel(upper, 0, 3, 1), RED);
+        assert_eq!(sprite.pixel(L1, 0, 3, 1), Rgba8::TRANSPARENT);
+
+        // A group has no pixels: nothing is drawn and nothing is recorded.
+        let steps = editor.document().unwrap().history().len();
+        editor.document_mut().unwrap().set_active_layer(group);
+        assert_eq!(
+            editor.draw_block(),
+            Some(SpriteError::NotAnImageLayer(group.0))
+        );
+        drag(&mut editor, PointerButton::Primary, &[(1, 4), (5, 4)]);
+        assert_eq!(editor.document().unwrap().history().len(), steps);
+        assert!(editor.overlay().is_none());
+
+        // Locked, then hidden.
+        let document = editor.document_mut().unwrap();
+        document.set_active_layer(upper);
+        let set = |document: &mut Document, locked: bool, visible: bool| {
+            document
+                .transact("Props", |tx| {
+                    tx.update_layer(upper, |props| {
+                        props.visible = visible;
+                        if let Some(image) = &mut props.image {
+                            image.locked = locked;
+                        }
+                    })
+                })
+                .unwrap();
+        };
+        set(document, true, true);
+        assert_eq!(editor.draw_block(), Some(SpriteError::LayerLocked(upper.0)));
+        drag(&mut editor, PointerButton::Primary, &[(1, 6), (5, 6)]);
+        assert_eq!(pixel_on(&editor, upper, 3, 6), Rgba8::TRANSPARENT);
+
+        set(editor.document_mut().unwrap(), false, false);
+        assert_eq!(editor.draw_block(), Some(SpriteError::LayerHidden(upper.0)));
+        drag(&mut editor, PointerButton::Primary, &[(1, 6), (5, 6)]);
+        assert_eq!(pixel_on(&editor, upper, 3, 6), Rgba8::TRANSPARENT);
+
+        set(editor.document_mut().unwrap(), false, true);
+        drag(&mut editor, PointerButton::Primary, &[(1, 6), (5, 6)]);
+        assert_eq!(pixel_on(&editor, upper, 3, 6), RED);
+    }
+
+    #[test]
+    fn the_eyedropper_sees_all_layers_together() {
+        use crate::sprite::Slot;
+
+        let mut editor = editor();
+        drag(&mut editor, PointerButton::Primary, &[(1, 1), (5, 1)]);
+        let document = editor.document_mut().unwrap();
+        let upper = document
+            .transact("Add", |tx| tx.add_layer(Slot::new(None, 1), "Upper", false))
+            .unwrap();
+        document.set_active_layer(upper);
+        editor.primary = GREEN;
+        drag(&mut editor, PointerButton::Primary, &[(3, 1)]);
+
+        // The upper layer is selected, but the eyedropper picks what is seen at each pixel.
+        editor.set_active_tool("eyedropper");
+        editor.primary = Rgba8::BLACK;
+        drag(&mut editor, PointerButton::Primary, &[(1, 1)]);
+        assert_eq!(editor.primary, RED);
+        drag(&mut editor, PointerButton::Primary, &[(3, 1)]);
+        assert_eq!(editor.primary, GREEN);
+    }
+
+    fn pixel_on(editor: &Editor, layer: LayerId, x: i32, y: i32) -> Rgba8 {
+        editor.document().unwrap().sprite().pixel(layer, 0, x, y)
     }
 
     #[test]

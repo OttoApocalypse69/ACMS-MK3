@@ -5,7 +5,7 @@
 //!   → interpolate     [`line`]: no gaps between two samples
 //!   → brush stamp     [`Brush::footprint`]: the pixels one sample covers
 //!   → ink             [`Ink::apply`]: what happens to each covered pixel
-//!   → mask            only the canvas, for now
+//!   → mask            [`lock_alpha`] and the canvas edge: where the ink may land
 //!   → preview buffer  [`StrokeBuffer`]: shown live, nothing in the sprite changes
 //!   → commit          [`Stroke::commit`]: one transaction, one undo step
 //! ```
@@ -137,6 +137,15 @@ impl Ink {
     }
 }
 
+/// The mask for a layer with alpha lock: drawing recolours the pixels that are already there
+/// and never changes how transparent anything is.
+pub fn lock_alpha(original: Rgba8, inked: Rgba8) -> Rgba8 {
+    if original.a == 0 || inked.a == 0 {
+        return original;
+    }
+    Rgba8::new(inked.r, inked.g, inked.b, original.a)
+}
+
 /// The preview buffer: the pixels a stroke has changed so far, without touching the sprite.
 ///
 /// It covers the whole canvas so that it can be reused from one stroke to the next.
@@ -209,12 +218,14 @@ pub struct Stroke {
     footprint: Vec<Point>,
     brush: Brush,
     ink: Ink,
+    alpha_lock: bool,
     last: Option<Point>,
     buffer: StrokeBuffer,
 }
 
 impl Stroke {
-    /// Starts a stroke. `buffer` is an old preview buffer to reuse, or a new one.
+    /// Starts a stroke on an image layer that is neither locked nor hidden. `buffer` is an old
+    /// preview buffer to reuse, or a new one.
     pub fn begin(
         sprite: &Sprite,
         layer: LayerId,
@@ -223,7 +234,7 @@ impl Stroke {
         ink: Ink,
         mut buffer: StrokeBuffer,
     ) -> Result<Self, SpriteError> {
-        sprite.check_cel(layer, frame)?;
+        let alpha_lock = sprite.check_drawable(layer, frame)?.alpha_lock;
         buffer.reset(sprite.bounds());
         Ok(Self {
             layer,
@@ -231,6 +242,7 @@ impl Stroke {
             footprint: brush.footprint(),
             brush,
             ink,
+            alpha_lock,
             last: None,
             buffer,
         })
@@ -264,7 +276,13 @@ impl Stroke {
                 // Each pixel is inked once per stroke, from what the sprite held before it.
                 if self.buffer.is_free(x, y) {
                     let original = cel.map_or(Rgba8::TRANSPARENT, |cel| cel.pixel(x, y));
-                    self.buffer.put(x, y, self.ink.apply(original));
+                    let inked = self.ink.apply(original);
+                    let masked = if self.alpha_lock {
+                        lock_alpha(original, inked)
+                    } else {
+                        inked
+                    };
+                    self.buffer.put(x, y, masked);
                 }
             }
         }
@@ -579,5 +597,104 @@ mod tests {
             StrokeBuffer::new(),
         );
         assert!(matches!(result, Err(SpriteError::UnknownLayer(7))));
+    }
+
+    #[test]
+    fn alpha_lock_mask() {
+        let blue = Rgba8::rgb(0, 0, 255);
+        let faint_blue = Rgba8::new(0, 0, 255, 40);
+        // Existing pixels take the new colour and keep their alpha.
+        assert_eq!(lock_alpha(blue, RED), RED);
+        assert_eq!(lock_alpha(faint_blue, RED), Rgba8::new(255, 0, 0, 40));
+        assert_eq!(lock_alpha(blue, Rgba8::new(255, 0, 0, 10)), RED);
+        // Nothing appears where there was nothing, and nothing can be erased.
+        assert_eq!(lock_alpha(Rgba8::TRANSPARENT, RED), Rgba8::TRANSPARENT);
+        assert_eq!(lock_alpha(faint_blue, Rgba8::TRANSPARENT), faint_blue);
+    }
+
+    /// A 8×8 document whose only layer has `edit` applied to its properties.
+    fn document_with(edit: impl FnOnce(&mut crate::sprite::LayerProps)) -> Document {
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        doc.transact("Props", |tx| tx.update_layer(L1, edit))
+            .unwrap();
+        doc
+    }
+
+    #[test]
+    fn with_alpha_lock_a_stroke_only_recolours_what_is_there() {
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        let mut s = stroke(
+            &doc,
+            Brush::default(),
+            Ink::Simple(Rgba8::new(0, 0, 255, 100)),
+        );
+        s.extend_to(doc.sprite(), Point::new(2, 3));
+        s.extend_to(doc.sprite(), Point::new(4, 3));
+        s.commit(&mut doc, "Pencil").unwrap();
+        doc.transact("Lock alpha", |tx| {
+            tx.update_layer(L1, |props| {
+                if let Some(image) = &mut props.image {
+                    image.alpha_lock = true;
+                }
+            })
+        })
+        .unwrap();
+
+        // A red line straight through the three blue pixels and well beyond them.
+        let mut s = stroke(&doc, Brush::default(), Ink::Simple(RED));
+        s.extend_to(doc.sprite(), Point::new(0, 3));
+        s.extend_to(doc.sprite(), Point::new(7, 3));
+        s.commit(&mut doc, "Pencil").unwrap();
+        assert_eq!(doc.sprite().pixel(L1, 0, 3, 3), Rgba8::new(255, 0, 0, 100));
+        assert_eq!(doc.sprite().pixel(L1, 0, 1, 3), Rgba8::TRANSPARENT);
+        assert_eq!(
+            doc.sprite().cel(L1, 0).unwrap().rect(),
+            Rect::new(2, 3, 3, 1)
+        );
+
+        // The eraser does nothing at all, and leaves no undo step.
+        let steps = doc.history().len();
+        let mut s = stroke(&doc, Brush::new(BrushShape::Square, 8), Ink::Erase);
+        s.extend_to(doc.sprite(), Point::new(4, 4));
+        s.commit(&mut doc, "Eraser").unwrap();
+        assert_eq!(doc.sprite().pixel(L1, 0, 3, 3), Rgba8::new(255, 0, 0, 100));
+        assert_eq!(doc.history().len(), steps);
+    }
+
+    #[test]
+    fn a_stroke_cannot_start_on_a_locked_hidden_or_group_layer() {
+        let begin = |doc: &Document, layer| {
+            Stroke::begin(
+                doc.sprite(),
+                layer,
+                0,
+                Brush::default(),
+                Ink::Simple(RED),
+                StrokeBuffer::new(),
+            )
+            .err()
+        };
+
+        let locked = document_with(|props| {
+            if let Some(image) = &mut props.image {
+                image.locked = true;
+            }
+        });
+        assert_eq!(begin(&locked, L1), Some(SpriteError::LayerLocked(1)));
+
+        let hidden = document_with(|props| props.visible = false);
+        assert_eq!(begin(&hidden, L1), Some(SpriteError::LayerHidden(1)));
+
+        let mut grouped = Document::new(Sprite::new(8, 8).unwrap());
+        let group = grouped
+            .transact("Add", |tx| {
+                tx.add_layer(crate::sprite::Slot::new(None, 1), "Group", true)
+            })
+            .unwrap();
+        assert_eq!(
+            begin(&grouped, group),
+            Some(SpriteError::NotAnImageLayer(group.0))
+        );
+        assert_eq!(begin(&grouped, L1), None);
     }
 }

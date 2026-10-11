@@ -92,6 +92,91 @@ pub(crate) mod test_util {
         }
     }
 
+    /// A sprite that uses every layer feature: a group, each property, and a few cels.
+    ///
+    /// ```text
+    /// Notes        hidden
+    /// Details      group, collapsed
+    ///     Glow     add, opacity 140, alpha lock
+    ///     Line     locked, no pixels
+    /// Shading      multiply, opacity 200
+    /// Background
+    /// ```
+    pub fn layered_sprite() -> Sprite {
+        use acms_core::image::Image;
+        use acms_core::sprite::{
+            BlendMode, CelSource, Frame, GroupLayer, ImageLayer, Layer, LayerKind, Palette,
+        };
+
+        let image = |id, name: &str, visible, style: ImageLayer| Layer {
+            id: LayerId(id),
+            name: name.to_owned(),
+            visible,
+            kind: LayerKind::Image(style),
+        };
+        let plain = ImageLayer::default();
+        let details = Layer {
+            id: LayerId(10),
+            name: "Details".to_owned(),
+            visible: true,
+            kind: LayerKind::Group(GroupLayer {
+                collapsed: true,
+                children: vec![
+                    image(
+                        4,
+                        "Line",
+                        true,
+                        ImageLayer {
+                            locked: true,
+                            ..plain
+                        },
+                    ),
+                    image(
+                        7,
+                        "Glow",
+                        true,
+                        ImageLayer {
+                            opacity: 140,
+                            blend: BlendMode::Add,
+                            alpha_lock: true,
+                            ..plain
+                        },
+                    ),
+                ],
+            }),
+        };
+        let layers = vec![
+            image(1, "Background", true, plain),
+            image(
+                2,
+                "Shading",
+                true,
+                ImageLayer {
+                    opacity: 200,
+                    blend: BlendMode::Multiply,
+                    ..plain
+                },
+            ),
+            details,
+            image(12, "Notes", false, plain),
+        ];
+
+        let block = |layer, x, y, w, h, color: Rgba8| CelSource {
+            layer: LayerId(layer),
+            frame: 0,
+            origin: Point::new(x, y),
+            image: Image::from_pixels(w, h, vec![color; (w * h) as usize]).unwrap(),
+        };
+        let cels = vec![
+            block(1, 0, 0, 16, 12, Rgba8::rgb(90, 140, 200)),
+            block(2, 4, 2, 8, 8, Rgba8::rgb(180, 120, 120)),
+            block(7, 6, 5, 6, 4, Rgba8::new(250, 220, 90, 200)),
+            block(12, 1, 1, 3, 3, Rgba8::rgb(255, 0, 255)),
+        ];
+        let frames = vec![Frame { duration_ms: 100 }];
+        Sprite::from_parts(16, 12, Palette::default_palette(), layers, frames, cels).unwrap()
+    }
+
     /// A sprite with a few strokes on it, including translucent pixels.
     pub fn drawn_sprite() -> Sprite {
         let mut document = Document::new(Sprite::new(24, 16).unwrap());

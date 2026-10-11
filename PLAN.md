@@ -45,6 +45,7 @@ Vector tools, photo editing, 3D, online collaboration, mobile, AI generation. Do
 | Project file | `zip` + `serde` / `serde_json` | |
 | File dialogs | `rfd` | |
 | Config location | `directories` | Finds the per-user config folder (keymap file, later preferences) |
+| System clipboard | `arboard` | Copy and paste images to and from other programs |
 | Errors | `thiserror` in libraries, `anyhow` in the app | |
 | Logging | `log` + a simple in-app log panel | |
 

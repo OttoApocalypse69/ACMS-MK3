@@ -4,7 +4,7 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phases 0, 1 and 2 are done** (skeleton, drawing on a canvas, layers). **Phase 3 — Selections and shape tools: in progress.**
+**Phases 0 to 3 are done** (skeleton, drawing, layers, selections and shape tools). Next is Phase 4 (not started).
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, directories 6, serde 1,
@@ -14,25 +14,61 @@ serde_json 1, thiserror 2, anyhow 1.
 
 Core:
 
-- [ ] Selection as a mask on the sprite: rectangle, lasso (polygon), magic wand; replace / add / subtract / intersect; invert, select all, deselect; undoable
-- [ ] Selection is a mask stage of the stroke pipeline, so every tool respects it
-- [ ] Shape tools: line, rectangle, ellipse (outline and filled)
-- [ ] Bucket fill (contiguous / global, tolerance), gradient (dithered or smooth)
-- [ ] Move tool; cut / copy / paste / delete; flip, rotate 90°, nearest-neighbour scale of the selection
-- [ ] Canvas resize, crop to selection, sprite scale
-- [ ] Several open documents in the editor
+- [x] Selection as a mask on the sprite: rectangle, lasso (polygon), magic wand; replace / add / subtract / intersect; invert, select all, deselect; undoable
+- [x] Selection is a mask stage of the stroke pipeline, so every tool respects it
+- [x] Shape tools: line, rectangle, ellipse (outline and filled)
+- [x] Bucket fill (contiguous / global, tolerance), gradient (dithered or smooth)
+- [x] Move tool; cut / copy / paste / delete; flip, rotate 90°, nearest-neighbour scale of the selection
+- [x] Canvas resize, crop to selection, sprite scale
+- [x] Several open documents in the editor
 
 IO:
 
-- [ ] Golden images for line, rectangle, ellipse, bucket, gradient, and for drawing inside a selection
+- [x] Golden images for line, rectangle, ellipse, bucket, gradient, and for drawing inside a selection
 
 App:
 
-- [ ] Commands, shortcuts and menus for all of the above; system clipboard as an image
-- [ ] Canvas: selection outline (marching ants), tool previews, modifier keys for selection modes
-- [ ] Tool Options per tool; dialogs for canvas size, sprite size, scale selection
-- [ ] Tabs for several open sprites (moved here from section 5, agreed 2026-10-11)
-- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
+- [x] Commands, shortcuts and menus for all of the above; system clipboard as an image
+- [x] Canvas: selection outline (marching ants), tool previews, modifier keys for selection modes
+- [x] Tool Options per tool; dialogs for canvas size, sprite size, scale selection
+- [x] Tabs for several open sprites (moved here from section 5, agreed 2026-10-11)
+- [x] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass (283 tests); commits along the way
+
+### How Phase 3 was checked
+
+- **Every painting tool respects the selection and is one undo step**: one test runs pencil,
+  eraser, line, rectangle, ellipse, bucket and gradient across a selection, checks that no pixel
+  outside it changed, that exactly one history entry appeared, and that undo and redo restore
+  the sprite exactly. The move tool has its own tests (with and without a selection, overlapping
+  its own old position, cancelled).
+- **Edits**: copy, cut, paste, delete, flip, rotate and scale each undo exactly; canvas resize,
+  crop and sprite scale too, including getting cut-off pixels and the selection back.
+- **Golden images** (`shapes`, `bucket`, `gradient`, `selection`), looked at enlarged.
+- **Commands**: clipboard, select all / none / invert, transforms, canvas size with anchors,
+  crop, sprite size, tool settings, several sprites each keeping file, view and unsaved state,
+  reopening an already open file.
+- **Headless UI tests**: dragging with the rectangle-select tool selects and the pencil then
+  stays inside; Ctrl+D / Ctrl+A; clipboard shortcuts in the form the window really sends them;
+  switching and closing sprite tabs.
+- **In the real window**: a capture with two tabs, a dithered gradient, an ellipse, a lasso
+  selection with its outline, the full tool list and the bucket's options.
+- **Not checked by me**: the system clipboard with another program, the three size dialogs and
+  the new menus being clicked, selection modifier keys with a real keyboard.
+
+### Known limits of Phase 3
+
+- **Ctrl+V depends on how the keys are released.** The windowing layer swallows the Ctrl+V key
+  press when the clipboard holds no text (as after copying pixels), so paste is triggered by the
+  *release* of V while Ctrl is still down. Releasing Ctrl first does nothing. Edit → Paste and
+  the command palette always work. A proper fix needs a change in egui-winit or a clipboard crate
+  that can put text and image on the clipboard together.
+- The selection is not saved in the `.acms` file.
+- Moving pixels off the canvas loses them (undo brings them back).
+- Paste lands where the pixels were copied from, or centred if that does not fit; it is not
+  attached to the mouse.
+- The gradient fills the selection, or the whole canvas without one.
+- Magic wand and bucket look at the selected layer only, not at all layers together.
+- Sprite tabs are a strip above the canvas, not dockable tabs; sprites cannot be shown side by side.
 
 ## Phase 2 task list (done)
 Core:
@@ -191,6 +227,12 @@ App (`acms-app`):
   any other source; merging onto it is refused.
 - **Alpha lock** recolours existing pixels and keeps their alpha; the eraser does nothing.
 - **`.acms` format version 2.** Version 1 files are upgraded when loaded; saving writes version 2.
+- **The selection lives on the sprite and is undoable**, but is not written to the file.
+- **Selecting with a plain click deselects.** Shift adds, Alt subtracts, Shift+Alt intersects.
+- **Opening or creating a sprite never replaces another**: it gets a tab. Only Close and Quit ask
+  about unsaved changes.
+- **System clipboard crate**: `arboard` (already a dependency of egui-winit), added to the tech
+  table. Copy puts the image on both the app's own clipboard and the system one.
 - **Dev builds optimise `acms-core`** (`[profile.dev.package.acms-core]`), so `cargo run` stays
   responsive on large sprites.
 
@@ -233,6 +275,12 @@ editor in Phase 8. The Log panel says at startup which file was used and what wa
 | Ctrl+E | Export PNG |
 | Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y | Undo / Redo |
 | B / E / I | Pencil / Eraser / Eyedropper |
+| L / U / Shift+U | Line / Rectangle / Ellipse |
+| G / Shift+G | Bucket fill / Gradient |
+| V / M / Q / W | Move / Rectangle select / Lasso / Magic wand |
+| Ctrl+X / C / V, Delete | Cut / Copy / Paste, delete the selected pixels |
+| Ctrl+A / Ctrl+D / Ctrl+Shift+I | Select all / Deselect / Invert selection |
+| Ctrl+W, Ctrl+Tab / Ctrl+Shift+Tab | Close sprite, next / previous sprite |
 | Ctrl+Shift+N | New layer |
 | F2 | Rename the selected layer |
 | X | Swap primary and secondary colour |

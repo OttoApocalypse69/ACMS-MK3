@@ -84,8 +84,7 @@ pub fn default_layout() -> DockState<Panel> {
 
     let [main, _bottom] = tree.split_below(main, 0.78, vec![Timeline, Tileset, ScriptConsole, Log]);
     let [_canvas, tools] = tree.split_left(main, 0.17, vec![Tools]);
-    let [_tools, options] = tree.split_below(tools, 0.3, vec![ToolOptions]);
-    tree.split_below(options, 0.4, vec![Preview]);
+    tree.split_below(tools, 0.72, vec![ToolOptions, Preview]);
 
     dock
 }
@@ -209,6 +208,7 @@ fn tools(ui: &mut Ui, state: &mut AppState, registry: &Registry, keymap: &Keymap
     let active = state.editor.active_tool();
     let tools: Vec<_> = state.editor.tools().collect();
     ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
         for (id, name) in tools {
             let command = format!("tool.{id}");
             let tip = with_shortcut(ui, keymap, name, &command);

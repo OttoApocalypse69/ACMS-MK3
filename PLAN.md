@@ -44,6 +44,7 @@ Vector tools, photo editing, 3D, online collaboration, mobile, AI generation. Do
 | Images | `image`, `png`, `gif` | |
 | Project file | `zip` + `serde` / `serde_json` | |
 | File dialogs | `rfd` | |
+| Config location | `directories` | Finds the per-user config folder (keymap file, later preferences) |
 | Errors | `thiserror` in libraries, `anyhow` in the app | |
 | Logging | `log` + a simple in-app log panel | |
 
@@ -112,6 +113,8 @@ Every action is a **command**: a struct with an id (`"layer.new"`, `"edit.flip_h
 - Menus, buttons, shortcuts, the command palette and Lua scripts all call commands. No UI code changes the document directly.
 - One registry holds all commands. The keymap maps key chords → command id (+ parameters) and is stored in a user config file.
 - Commands added by scripts appear in the palette and can be bound to keys like built-in ones.
+- The registry lives in `acms-core` and is generic over the context a command acts on, so the core never sees app types. The app owns the concrete context. Everything document-related in that context is a type defined in `acms-core` (from Phase 1); app-only state (dock layout, theme, palette) stays in `acms-app`. Commands registered by scripts are written against the core type and wrapped by the app when it adds them to the registry.
+- The keymap file holds only the user's changes; they are applied on top of the built-in defaults, so new default shortcuts reach existing users.
 
 ### 4.3 Undo / redo
 

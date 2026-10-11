@@ -1,9 +1,12 @@
 //! Key chords → command ids (see `PLAN.md`, section 4.2).
+//!
+//! The keymap starts from the built-in defaults; the user's keymap file is applied on top.
 
 use egui::{Key, KeyboardShortcut, Modifiers};
+use serde::Deserialize;
 
-/// Chords are written as text (`"Ctrl+Shift+P"`) so the same format can later be used in the
-/// user's keymap file. `Ctrl` means Cmd on macOS.
+/// Chords are written as text (`"Ctrl+Shift+P"`), the same way as in the user's keymap file.
+/// `Ctrl` means Cmd on macOS.
 const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("Ctrl+Shift+P", "view.command_palette"),
     ("Ctrl+K", "view.command_palette"),
@@ -21,6 +24,32 @@ pub fn default_commands() -> impl Iterator<Item = &'static str> {
 struct Binding {
     shortcut: KeyboardShortcut,
     command: String,
+}
+
+/// The user's keymap file. It only holds what differs from the defaults:
+///
+/// ```json
+/// {
+///   "bindings": [
+///     { "keys": "Ctrl+J", "command": "debug.say_hello" },
+///     { "keys": "Ctrl+H", "command": null }
+///   ]
+/// }
+/// ```
+///
+/// An entry binds its chord to the command, replacing what the chord did before. A `null`
+/// (or missing) command leaves the chord unbound.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeymapFile {
+    bindings: Vec<FileBinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileBinding {
+    keys: String,
+    command: Option<String>,
 }
 
 #[derive(Default)]
@@ -51,6 +80,37 @@ impl Keymap {
         });
         self.bindings
             .sort_by_key(|b| std::cmp::Reverse(modifier_count(b.shortcut.modifiers)));
+    }
+
+    /// Removes whatever `shortcut` is bound to.
+    pub fn unbind(&mut self, shortcut: KeyboardShortcut) {
+        self.bindings.retain(|b| b.shortcut != shortcut);
+    }
+
+    /// Applies the contents of a keymap file (see [`KeymapFile`]) on top of the current bindings.
+    ///
+    /// Fails without changing anything if the text is not a keymap file. Entries whose chord
+    /// cannot be parsed are skipped; the returned list has one message for each of them.
+    pub fn apply_user_json(&mut self, json: &str) -> Result<Vec<String>, serde_json::Error> {
+        let file: KeymapFile = serde_json::from_str(json)?;
+
+        let mut skipped = Vec::new();
+        for entry in file.bindings {
+            let Some(shortcut) = parse_chord(&entry.keys) else {
+                skipped.push(format!("\"{}\" is not a key chord", entry.keys));
+                continue;
+            };
+            match entry.command {
+                Some(command) => self.bind(shortcut, command),
+                None => self.unbind(shortcut),
+            }
+        }
+        Ok(skipped)
+    }
+
+    /// The command of every binding; a command bound to two chords appears twice.
+    pub fn commands(&self) -> impl Iterator<Item = &str> {
+        self.bindings.iter().map(|b| b.command.as_str())
     }
 
     /// The shortcuts bound to a command, in no particular order.
@@ -161,6 +221,73 @@ mod tests {
                 .shortcuts_for("view.toggle_theme")
                 .any(|s| *s == chord)
         );
+    }
+
+    fn chords_for(keymap: &Keymap, command: &str) -> Vec<KeyboardShortcut> {
+        keymap.shortcuts_for(command).copied().collect()
+    }
+
+    #[test]
+    fn user_file_rebinds_and_unbinds_on_top_of_the_defaults() {
+        let mut keymap = Keymap::with_defaults();
+        let skipped = keymap
+            .apply_user_json(
+                r#"{ "bindings": [
+                    { "keys": "Ctrl+J", "command": "debug.say_hello" },
+                    { "keys": "Ctrl+H", "command": null },
+                    { "keys": "Ctrl+Q", "command": "view.toggle_theme" }
+                ] }"#,
+            )
+            .unwrap();
+
+        assert!(skipped.is_empty());
+        assert_eq!(
+            chords_for(&keymap, "debug.say_hello"),
+            [parse_chord("Ctrl+J").unwrap()]
+        );
+        assert!(chords_for(&keymap, "app.quit").is_empty());
+        assert!(chords_for(&keymap, "view.toggle_theme").contains(&parse_chord("Ctrl+Q").unwrap()));
+        // Defaults the file does not mention are untouched.
+        assert_eq!(chords_for(&keymap, "view.command_palette").len(), 2);
+    }
+
+    #[test]
+    fn user_file_entries_with_a_bad_chord_are_skipped_and_reported() {
+        let mut keymap = Keymap::with_defaults();
+        let skipped = keymap
+            .apply_user_json(
+                r#"{ "bindings": [
+                    { "keys": "Hyper+J", "command": "debug.say_hello" },
+                    { "keys": "Ctrl+J", "command": "debug.say_hello" }
+                ] }"#,
+            )
+            .unwrap();
+
+        assert_eq!(skipped, ["\"Hyper+J\" is not a key chord"]);
+        assert!(chords_for(&keymap, "debug.say_hello").contains(&parse_chord("Ctrl+J").unwrap()));
+    }
+
+    #[test]
+    fn a_broken_user_file_changes_nothing() {
+        for broken in [
+            "not json",
+            r#"{ "bindings": "Ctrl+J" }"#,
+            r#"{ "binding": [] }"#,
+            r#"{ "bindings": [ { "key": "Ctrl+J", "command": "app.quit" } ] }"#,
+            // Valid first entry, broken second: the first must not be applied either.
+            r#"{ "bindings": [ { "keys": "Ctrl+J", "command": "app.quit" }, 5 ] }"#,
+        ] {
+            let mut keymap = Keymap::with_defaults();
+            assert!(
+                keymap.apply_user_json(broken).is_err(),
+                "accepted: {broken}"
+            );
+            assert_eq!(keymap.bindings.len(), DEFAULT_BINDINGS.len());
+            assert_eq!(
+                chords_for(&keymap, "app.quit"),
+                [parse_chord("Ctrl+Q").unwrap()]
+            );
+        }
     }
 
     #[test]

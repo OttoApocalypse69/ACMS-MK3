@@ -1,9 +1,13 @@
 //! The eframe application: wires the registry, keymap, palette and dock together.
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
 use acms_core::command::CommandRegistry;
 use egui_dock::DockArea;
 
 use crate::commands::{self, AppState};
+use crate::config;
 use crate::keymap::Keymap;
 use crate::palette;
 use crate::panels::PanelViewer;
@@ -18,16 +22,35 @@ pub struct AcmsApp {
 }
 
 impl AcmsApp {
-    pub fn new(ctx: &egui::Context) -> anyhow::Result<Self> {
+    /// `keymap_file` is the user's keymap file; `None` means built-in shortcuts only.
+    pub fn new(ctx: &egui::Context, keymap_file: Option<&Path>) -> anyhow::Result<Self> {
         let mut registry = CommandRegistry::new();
         commands::register_builtin(&mut registry)?;
 
-        let state = AppState::default();
+        let (keymap, mut log) = match keymap_file {
+            Some(path) => config::load_keymap(path),
+            None => (Keymap::with_defaults(), Vec::new()),
+        };
+        // The binding is kept: the chord is the user's choice, and pressing it says the same.
+        let unknown: BTreeSet<&str> = keymap
+            .commands()
+            .filter(|id| registry.get(id).is_none())
+            .collect();
+        log.extend(
+            unknown
+                .into_iter()
+                .map(|id| format!("Keymap: there is no command `{id}`")),
+        );
+
+        let state = AppState {
+            log,
+            ..AppState::default()
+        };
         theme::install(ctx, state.theme);
 
         Ok(Self {
             registry,
-            keymap: Keymap::with_defaults(),
+            keymap,
             shown_theme: state.theme,
             state,
         })
@@ -116,8 +139,12 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_keymap_file(None)
+        }
+
+        fn with_keymap_file(keymap_file: Option<&Path>) -> Self {
             let ctx = egui::Context::default();
-            let app = AcmsApp::new(&ctx).unwrap();
+            let app = AcmsApp::new(&ctx, keymap_file).unwrap();
             let mut harness = Self { ctx, app };
             harness.frame(vec![]);
             harness
@@ -159,6 +186,43 @@ mod tests {
         let mut h = Harness::new();
         h.press(CTRL, Key::H);
         assert_eq!(h.app.state.log, ["Hello from the command system"]);
+    }
+
+    #[test]
+    fn the_users_keymap_file_changes_which_keys_run_a_command() {
+        let file = config::TempFile::new(
+            "app-rebind.json",
+            r#"{ "bindings": [
+                { "keys": "Ctrl+J", "command": "debug.say_hello" },
+                { "keys": "Ctrl+H", "command": null }
+            ] }"#,
+        );
+        let mut h = Harness::with_keymap_file(Some(file.path()));
+        h.app.state.log.clear();
+
+        h.press(CTRL, Key::H);
+        assert!(h.app.state.log.is_empty());
+        h.press(CTRL, Key::J);
+        assert_eq!(h.app.state.log, ["Hello from the command system"]);
+    }
+
+    #[test]
+    fn a_binding_to_a_command_that_does_not_exist_is_reported() {
+        let file = config::TempFile::new(
+            "app-unknown.json",
+            r#"{ "bindings": [ { "keys": "Ctrl+J", "command": "debug.no_such_thing" } ] }"#,
+        );
+        let mut h = Harness::with_keymap_file(Some(file.path()));
+        assert_eq!(
+            h.app.state.log.last().map(String::as_str),
+            Some("Keymap: there is no command `debug.no_such_thing`")
+        );
+
+        h.press(CTRL, Key::J);
+        assert_eq!(
+            h.app.state.log.last().map(String::as_str),
+            Some("unknown command `debug.no_such_thing`")
+        );
     }
 
     #[test]

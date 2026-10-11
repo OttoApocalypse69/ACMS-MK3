@@ -5,6 +5,7 @@
 
 mod app;
 mod commands;
+mod config;
 mod fuzzy;
 mod keymap;
 mod palette;
@@ -20,10 +21,15 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    let keymap_file = config::keymap_path();
+
     eframe::run_native(
         "acms-mk3",
         options,
-        Box::new(|cc| Ok(Box::new(app::AcmsApp::new(&cc.egui_ctx)?))),
+        Box::new(|cc| {
+            let app = app::AcmsApp::new(&cc.egui_ctx, keymap_file.as_deref())?;
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|err| anyhow::anyhow!("could not run the app: {err}"))
 }

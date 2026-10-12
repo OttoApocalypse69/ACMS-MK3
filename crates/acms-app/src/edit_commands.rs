@@ -560,7 +560,7 @@ mod tests {
             "tool.set_tolerance",
             Params::new().with("tolerance", 300_i64),
         );
-        let options = f.state.editor.options;
+        let options = f.state.editor.options.clone();
         assert!(options.shape_filled && !options.fill_contiguous && !options.gradient_dither);
         assert_eq!(options.tolerance, 255);
         f.run_with("tool.set_filled", Params::new().with("filled", false));

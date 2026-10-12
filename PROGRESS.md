@@ -4,13 +4,37 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phases 0 to 3 are done** (skeleton, drawing, layers, selections and shape tools). Next is Phase 4 (not started).
+**Phases 0 to 3 are done** (skeleton, drawing, layers, selections and shape tools). **Phase 4 is in progress.**
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, directories 6, serde 1,
 serde_json 1, thiserror 2, anyhow 1.
 
-## Phase 3 task list
+## Phase 4 task list
+
+Core:
+
+- [ ] Stroke pipeline stages: pixel-perfect filter, symmetry (horizontal, vertical, both, radial N-way), tiled (wrap-around) plotting
+- [ ] Custom brushes (an image as the brush; made from the selection)
+- [ ] Dither ink (Bayer 2×2 / 4×4 / 8×8, checker, custom pattern) and shade ink (one step along a palette ramp)
+- [ ] Palette: undoable changes, ramps, sort, generate a ramp between two colours, replace a colour across the sprite, reduce the sprite to the palette
+- [ ] Reference image layer (shown at screen resolution, never composited or exported)
+
+IO:
+
+- [ ] Palette import / export: `.gpl`, `.hex`, `.pal`; palette from an image
+- [ ] `.acms` format version 3 (ramps, symmetry, reference layers) with a migration from version 2
+- [ ] Golden images: pixel-perfect, each symmetry mode, custom brush, dither ink, shade ink, tiled, and all of symmetry + pixel-perfect + dither in one stroke
+
+App:
+
+- [ ] Commands, shortcuts and menus for all of the above
+- [ ] Tool Options: ink, pattern picker, density, pixel-perfect; symmetry and tiled mode
+- [ ] Canvas: symmetry axes, 3 × 3 tiled preview, reference layers
+- [ ] Palette panel: selecting colours, ramps, palette commands
+- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
+
+## Phase 3 task list (done)
 
 Core:
 

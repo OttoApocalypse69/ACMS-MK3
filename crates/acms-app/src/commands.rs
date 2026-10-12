@@ -169,7 +169,7 @@ fn file_export_png(state: &mut AppState, params: &Params) -> CommandResult {
 }
 
 fn brush_set_shape(state: &mut AppState, params: &Params) -> CommandResult {
-    state.editor.brush.shape = match params.text("shape") {
+    let shape = match params.text("shape") {
         Some("round") => BrushShape::Round,
         Some("square") => BrushShape::Square,
         other => {
@@ -178,6 +178,7 @@ fn brush_set_shape(state: &mut AppState, params: &Params) -> CommandResult {
             )));
         }
     };
+    state.editor.brush.set_shape(shape);
     Ok(())
 }
 
@@ -646,9 +647,9 @@ mod tests {
         assert_eq!(fixture.state.editor.brush.size(), 64);
 
         fixture.run_with("brush.set_shape", Params::new().with("shape", "square"));
-        assert_eq!(fixture.state.editor.brush.shape, BrushShape::Square);
+        assert_eq!(fixture.state.editor.brush.shape(), BrushShape::Square);
         fixture.run_with("brush.set_shape", Params::new().with("shape", "round"));
-        assert_eq!(fixture.state.editor.brush.shape, BrushShape::Round);
+        assert_eq!(fixture.state.editor.brush.shape(), BrushShape::Round);
         assert!(
             fixture
                 .try_run("brush.set_shape", Params::new().with("shape", "star"))

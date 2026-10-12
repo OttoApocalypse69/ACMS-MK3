@@ -7,7 +7,8 @@ use crate::color::Rgba8;
 use crate::compositor::{self, Overlay};
 use crate::document::Document;
 use crate::geom::{Point, Rect};
-use crate::stroke::{Brush, Ink, Stroke, StrokeBuffer};
+use crate::pattern::Pattern;
+use crate::stroke::{Brush, Ink, Stroke, StrokeBuffer, StrokeSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerButton {
@@ -40,9 +41,56 @@ pub struct ToolContext<'a> {
     pub options: ToolOptions,
 }
 
+/// Which ink the pencil and the shape tools draw with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InkKind {
+    /// The primary or secondary colour.
+    #[default]
+    Simple,
+    /// Both colours in a pattern.
+    Dither,
+    /// One step along a palette ramp: forwards with the primary button, back with the other.
+    Shade,
+}
+
+impl InkKind {
+    pub const ALL: [Self; 3] = [Self::Simple, Self::Dither, Self::Shade];
+
+    /// Stable lower-case name, used in command arguments.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Dither => "dither",
+            Self::Shade => "shade",
+        }
+    }
+
+    /// Name shown in the UI.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Simple => "Simple",
+            Self::Dither => "Dither",
+            Self::Shade => "Shade",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|ink| ink.id() == id)
+    }
+}
+
 /// Settings shared by the tools that are not about the brush.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOptions {
+    pub ink: InkKind,
+    /// The pattern of the dither ink.
+    pub pattern: Pattern,
+    /// The share of the primary colour in a dither pattern, in percent.
+    pub dither_density: u8,
+    /// Freehand lines lose the corner pixel of every L-shaped step.
+    pub pixel_perfect: bool,
+    /// Strokes that leave the canvas on one side come back in on the other.
+    pub tiled: bool,
     /// Rectangle and ellipse are filled rather than outlined.
     pub shape_filled: bool,
     /// Bucket and magic wand only take pixels connected to the one clicked.
@@ -56,6 +104,11 @@ pub struct ToolOptions {
 impl Default for ToolOptions {
     fn default() -> Self {
         Self {
+            ink: InkKind::Simple,
+            pattern: Pattern::Bayer4,
+            dither_density: 50,
+            pixel_perfect: false,
+            tiled: false,
             shape_filled: false,
             fill_contiguous: true,
             tolerance: 0,
@@ -68,6 +121,11 @@ impl Default for ToolOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OptionKind {
     Brush,
+    /// Which ink, and the dither pattern.
+    Ink,
+    PixelPerfect,
+    /// Symmetry and wrap-around drawing.
+    Symmetry,
     ShapeFill,
     Similarity,
     Gradient,
@@ -134,6 +192,69 @@ pub trait Tool {
     }
 }
 
+/// The ink the settings ask for, for the button that was pressed: the two colours swap roles
+/// for the secondary button, and the shade ink steps the other way.
+pub(crate) fn ink_for(ctx: &ToolContext<'_>, button: PointerButton) -> Ink {
+    let (first, second) = match button {
+        PointerButton::Primary => (*ctx.primary, *ctx.secondary),
+        PointerButton::Secondary => (*ctx.secondary, *ctx.primary),
+    };
+    match ctx.options.ink {
+        InkKind::Simple => Ink::Simple(first),
+        InkKind::Dither => Ink::Dither {
+            first,
+            second,
+            pattern: ctx.options.pattern.clone(),
+            density: ctx.options.dither_density,
+        },
+        InkKind::Shade => Ink::Shade {
+            ramps: ctx.document.sprite().palette().ramps().into(),
+            step: if button == PointerButton::Primary {
+                1
+            } else {
+                -1
+            },
+        },
+    }
+}
+
+/// How a stroke is to go through the pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrokeKind {
+    /// Drawn by hand: pixel-perfect if that is on, and mirrored.
+    Freehand,
+    /// A shape: mirrored.
+    Shape,
+    /// Anything that fills an area or moves pixels: as it is.
+    Plain,
+}
+
+/// Starts a stroke on the selected layer. `None` if it cannot be drawn on: the active layer
+/// and frame always exist, so that is a locked or hidden layer, or one without pixels.
+pub(crate) fn begin_stroke(
+    ctx: &ToolContext<'_>,
+    ink: Ink,
+    kind: StrokeKind,
+    buffer: StrokeBuffer,
+) -> Option<Stroke> {
+    let document = &*ctx.document;
+    let settings = StrokeSettings {
+        brush: ctx.brush.clone(),
+        ink,
+        pixel_perfect: kind == StrokeKind::Freehand && ctx.options.pixel_perfect,
+        symmetric: kind != StrokeKind::Plain,
+        tiled: ctx.options.tiled,
+    };
+    Stroke::begin_with(
+        document.sprite(),
+        document.active_layer(),
+        document.active_frame(),
+        settings,
+        buffer,
+    )
+    .ok()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrushToolKind {
     Pencil,
@@ -185,26 +306,14 @@ impl Tool for BrushTool {
     fn pointer_down(&mut self, ctx: &mut ToolContext<'_>, event: PointerEvent) {
         self.cancel(ctx);
 
-        let ink = match (self.kind, event.button) {
-            (BrushToolKind::Eraser, _) => Ink::Erase,
-            (BrushToolKind::Pencil, PointerButton::Primary) => Ink::Simple(*ctx.primary),
-            (BrushToolKind::Pencil, PointerButton::Secondary) => Ink::Simple(*ctx.secondary),
+        let ink = match self.kind {
+            BrushToolKind::Eraser => Ink::Erase,
+            BrushToolKind::Pencil => ink_for(ctx, event.button),
         };
-        let document = &mut *ctx.document;
         let buffer = std::mem::take(&mut self.spare);
-        // The active layer and frame always exist, so this only fails if the document is
-        // broken; then the tool simply does nothing.
-        let started = Stroke::begin(
-            document.sprite(),
-            document.active_layer(),
-            document.active_frame(),
-            ctx.brush,
-            ink,
-            buffer,
-        );
-        if let Ok(mut stroke) = started {
-            let damage = stroke.extend_to(document.sprite(), event.position);
-            document.add_damage(damage);
+        if let Some(mut stroke) = begin_stroke(ctx, ink, StrokeKind::Freehand, buffer) {
+            let damage = stroke.extend_to(ctx.document.sprite(), event.position);
+            ctx.document.add_damage(damage);
             self.stroke = Some(stroke);
         }
     }
@@ -220,7 +329,7 @@ impl Tool for BrushTool {
         self.pointer_move(ctx, event);
         if let Some(stroke) = self.stroke.take() {
             let covered = stroke.buffer().bounds();
-            // See `pointer_down` for why an error is not expected here.
+            // The layer was drawable when the stroke began, so no error is expected here.
             if let Ok(buffer) = stroke.commit(ctx.document, self.name()) {
                 self.spare = buffer;
             }
@@ -249,7 +358,19 @@ impl Tool for BrushTool {
     }
 
     fn options(&self) -> &'static [OptionKind] {
-        &[OptionKind::Brush]
+        match self.kind {
+            BrushToolKind::Pencil => &[
+                OptionKind::Brush,
+                OptionKind::Ink,
+                OptionKind::PixelPerfect,
+                OptionKind::Symmetry,
+            ],
+            BrushToolKind::Eraser => &[
+                OptionKind::Brush,
+                OptionKind::PixelPerfect,
+                OptionKind::Symmetry,
+            ],
+        }
     }
 }
 

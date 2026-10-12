@@ -10,6 +10,8 @@ pub mod edit;
 pub mod editor;
 pub mod geom;
 pub mod image;
+pub mod palette;
+pub mod pattern;
 pub mod selection;
 pub mod sprite;
 pub mod stroke;

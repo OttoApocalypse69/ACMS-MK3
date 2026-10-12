@@ -35,8 +35,16 @@ pub enum SpriteError {
     UnknownLayer(u32),
     #[error("there is no frame {0}")]
     UnknownFrame(usize),
-    #[error("layer {0} is a group and has no pixels of its own")]
+    #[error("layer {0} is not an image layer and has no pixels to edit")]
     NotAnImageLayer(u32),
+    #[error("layer {0} is not a reference layer")]
+    NotAReference(u32),
+    #[error("the image has nothing in it")]
+    EmptyImage,
+    #[error("that is larger than a brush can be")]
+    TooLargeForBrush,
+    #[error("the palette has no colours")]
+    EmptyPalette,
     #[error("layer {0} is not a group")]
     NotAGroup(u32),
     #[error("the layer is locked")]
@@ -143,10 +151,77 @@ pub struct GroupLayer {
     pub collapsed: bool,
 }
 
+/// A picture to draw from. It is shown at the screen's resolution rather than the sprite's,
+/// is not part of the flattened sprite and is never exported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceLayer {
+    /// 0 is invisible, 255 fully opaque.
+    pub opacity: u8,
+    pub image: Arc<Image>,
+    /// The canvas area the picture is stretched over.
+    pub rect: Rect,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayerKind {
     Image(ImageLayer),
     Group(GroupLayer),
+    Reference(ReferenceLayer),
+}
+
+/// How strokes are mirrored. The mirror lines and the centre of rotation are in the middle of
+/// the canvas.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Symmetry {
+    #[default]
+    Off,
+    /// Left and right mirror each other.
+    Horizontal,
+    /// Top and bottom mirror each other.
+    Vertical,
+    Both,
+    /// The stroke is repeated this many times around the centre.
+    Radial(u8),
+}
+
+/// Most copies a radial symmetry can make.
+pub const MAX_RADIAL: u8 = 16;
+
+impl Symmetry {
+    /// Stable lower-case name, used in files and command arguments. A radial symmetry also
+    /// has its count.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
+            Self::Both => "both",
+            Self::Radial(_) => "radial",
+        }
+    }
+
+    /// Name shown in the UI.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Horizontal => "Horizontal",
+            Self::Vertical => "Vertical",
+            Self::Both => "Both",
+            Self::Radial(_) => "Radial",
+        }
+    }
+
+    /// `count` only matters for `"radial"`, where it is clamped to `2..=MAX_RADIAL`.
+    pub fn from_id(id: &str, count: u8) -> Option<Self> {
+        Some(match id {
+            "off" => Self::Off,
+            "horizontal" => Self::Horizontal,
+            "vertical" => Self::Vertical,
+            "both" => Self::Both,
+            "radial" => Self::Radial(count.clamp(2, MAX_RADIAL)),
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,18 +258,44 @@ impl Layer {
         }
     }
 
+    /// A visible reference layer showing `image` over `rect`, half transparent.
+    pub fn reference(id: LayerId, name: impl Into<String>, image: Arc<Image>, rect: Rect) -> Self {
+        let reference = ReferenceLayer {
+            opacity: 128,
+            image,
+            rect,
+        };
+        Self {
+            id,
+            name: name.into(),
+            visible: true,
+            kind: LayerKind::Reference(reference),
+        }
+    }
+
     pub fn as_image(&self) -> Option<&ImageLayer> {
         match &self.kind {
             LayerKind::Image(image) => Some(image),
-            LayerKind::Group(_) => None,
+            _ => None,
         }
     }
 
     pub fn as_group(&self) -> Option<&GroupLayer> {
         match &self.kind {
             LayerKind::Group(group) => Some(group),
-            LayerKind::Image(_) => None,
+            _ => None,
         }
+    }
+
+    pub fn as_reference(&self) -> Option<&ReferenceLayer> {
+        match &self.kind {
+            LayerKind::Reference(reference) => Some(reference),
+            _ => None,
+        }
+    }
+
+    pub fn is_reference(&self) -> bool {
+        self.as_reference().is_some()
     }
 
     pub fn is_group(&self) -> bool {
@@ -213,6 +314,10 @@ impl Layer {
             name: self.name.clone(),
             visible: self.visible,
             image: self.as_image().copied(),
+            reference: self.as_reference().map(|reference| ReferenceProps {
+                opacity: reference.opacity,
+                rect: reference.rect,
+            }),
         }
     }
 
@@ -225,12 +330,21 @@ impl Layer {
     }
 }
 
-/// A snapshot of a layer's changeable properties. `image` is `None` for a group.
+/// What can change about a reference layer besides its name and visibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReferenceProps {
+    pub opacity: u8,
+    pub rect: Rect,
+}
+
+/// A snapshot of a layer's changeable properties. `image` is only there for an image layer,
+/// `reference` only for a reference layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerProps {
     pub name: String,
     pub visible: bool,
     pub image: Option<ImageLayer>,
+    pub reference: Option<ReferenceProps>,
 }
 
 /// A position in the layer tree: `index` counts from the bottom among the children of
@@ -269,15 +383,22 @@ pub struct PaletteEntry {
     pub name: Option<String>,
 }
 
-/// An ordered list of colours.
+/// Colours in an order the shade ink steps through, by convention from dark to light.
+pub type Ramp = Vec<Rgba8>;
+
+/// An ordered list of colours, and the ramps made from them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Palette {
     entries: Vec<PaletteEntry>,
+    ramps: Vec<Ramp>,
 }
 
 impl Palette {
     pub fn new(entries: Vec<PaletteEntry>) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            ramps: Vec::new(),
+        }
     }
 
     pub fn from_colors(colors: impl IntoIterator<Item = Rgba8>) -> Self {
@@ -285,7 +406,25 @@ impl Palette {
             .into_iter()
             .map(|color| PaletteEntry { color, name: None })
             .collect();
-        Self { entries }
+        Self::new(entries)
+    }
+
+    /// The same colours with these ramps. Ramps with fewer than two colours are dropped.
+    pub fn with_ramps(mut self, ramps: Vec<Ramp>) -> Self {
+        self.ramps = ramps.into_iter().filter(|ramp| ramp.len() >= 2).collect();
+        self
+    }
+
+    pub fn ramps(&self) -> &[Ramp] {
+        &self.ramps
+    }
+
+    pub fn colors(&self) -> impl Iterator<Item = Rgba8> + '_ {
+        self.entries.iter().map(|entry| entry.color)
+    }
+
+    pub fn contains(&self, color: Rgba8) -> bool {
+        self.colors().any(|entry| entry == color)
     }
 
     /// The palette new sprites start with: seven neutrals, then three shades each of eight
@@ -440,6 +579,9 @@ pub struct Sprite {
     cels: HashMap<(LayerId, usize), Cel>,
     /// The pixels tools may change; `None` means all of them. Never an empty mask.
     selection: Option<Arc<Mask>>,
+    /// How strokes are mirrored. Saved with the sprite, but a way of working rather than
+    /// part of the picture: changing it is not an undo step.
+    symmetry: Symmetry,
 }
 
 /// The size of the canvas and everything whose coordinates depend on it.
@@ -449,6 +591,8 @@ pub(crate) struct CanvasState {
     pub height: u32,
     pub cels: HashMap<(LayerId, usize), Cel>,
     pub selection: Option<Arc<Mask>>,
+    /// Where each reference layer's picture is shown.
+    pub references: Vec<(LayerId, Rect)>,
 }
 
 impl Sprite {
@@ -496,6 +640,7 @@ impl Sprite {
             frames,
             cels: HashMap::new(),
             selection: None,
+            symmetry: Symmetry::Off,
         };
         let mut ids: Vec<LayerId> = sprite.walk().iter().map(|entry| entry.layer.id).collect();
         ids.sort();
@@ -526,6 +671,43 @@ impl Sprite {
 
     pub fn palette(&self) -> &Palette {
         &self.palette
+    }
+
+    pub(crate) fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+    }
+
+    pub fn symmetry(&self) -> Symmetry {
+        self.symmetry
+    }
+
+    /// The same sprite with a symmetry setting, for building one from a file.
+    pub fn with_symmetry(mut self, symmetry: Symmetry) -> Self {
+        self.symmetry = symmetry;
+        self
+    }
+
+    pub(crate) fn set_symmetry(&mut self, symmetry: Symmetry) {
+        self.symmetry = symmetry;
+    }
+
+    /// The rectangle a picture of the given size covers when it is made as large as fits on
+    /// the canvas, in the middle of it.
+    pub fn fitted(&self, width: u32, height: u32) -> Rect {
+        let (cw, ch) = (u64::from(self.width), u64::from(self.height));
+        let (iw, ih) = (u64::from(width.max(1)), u64::from(height.max(1)));
+        // Whichever side hits the edge of the canvas first decides the scale.
+        let (w, h) = if cw * ih <= ch * iw {
+            (cw, (ih * cw / iw).max(1))
+        } else {
+            ((iw * ch / ih).max(1), ch)
+        };
+        Rect::new(
+            ((cw - w) / 2) as i32,
+            ((ch - h) / 2) as i32,
+            w as u32,
+            h as u32,
+        )
     }
 
     /// The top-level layers, bottom to top.
@@ -615,6 +797,11 @@ impl Sprite {
             height: self.height,
             cels: self.cels.clone(),
             selection: self.selection.clone(),
+            references: self
+                .walk()
+                .iter()
+                .filter_map(|entry| Some((entry.layer.id, entry.layer.as_reference()?.rect)))
+                .collect(),
         }
     }
 
@@ -623,6 +810,13 @@ impl Sprite {
         self.height = state.height;
         self.cels = state.cels;
         self.selection = state.selection;
+        for (id, rect) in state.references {
+            if let Some(LayerKind::Reference(reference)) =
+                find_mut(&mut self.layers, id).map(|layer| &mut layer.kind)
+            {
+                reference.rect = rect;
+            }
+        }
     }
 
     /// Every cel as a full image positioned on the canvas, to rebuild them for another size.
@@ -641,12 +835,24 @@ impl Sprite {
         sources
     }
 
-    /// Replaces the canvas size and every cel. The cels are clipped and cropped as usual.
-    pub(crate) fn rebuild_canvas(&mut self, width: u32, height: u32, cels: Vec<CelSource>) {
-        self.width = width;
-        self.height = height;
-        self.cels.clear();
-        self.selection = None;
+    /// Replaces the canvas size and every cel. The cels are clipped and cropped as usual;
+    /// `place` says where a reference picture goes that was shown over a given rectangle.
+    pub(crate) fn rebuild_canvas(
+        &mut self,
+        width: u32,
+        height: u32,
+        cels: Vec<CelSource>,
+        place: impl Fn(Rect) -> Rect,
+    ) {
+        let mut state = self.canvas_state();
+        for (_, rect) in &mut state.references {
+            *rect = place(*rect);
+        }
+        state.width = width;
+        state.height = height;
+        state.cels.clear();
+        state.selection = None;
+        self.set_canvas_state(state);
         for cel in cels {
             let rect = cel.image.bounds().translated(cel.origin.x, cel.origin.y);
             self.write_region(cel.layer, cel.frame, rect, &cel.image);
@@ -788,7 +994,7 @@ impl Sprite {
             None => Some(&mut self.layers),
             Some(id) => match &mut find_mut(&mut self.layers, id)?.kind {
                 LayerKind::Group(group) => Some(&mut group.children),
-                LayerKind::Image(_) => None,
+                _ => None,
             },
         }
     }
@@ -840,8 +1046,13 @@ impl Sprite {
         };
         layer.name.clone_from(&props.name);
         layer.visible = props.visible;
-        if let (LayerKind::Image(image), Some(new)) = (&mut layer.kind, props.image) {
-            *image = new;
+        match (&mut layer.kind, props.image, props.reference) {
+            (LayerKind::Image(image), Some(new), _) => *image = new,
+            (LayerKind::Reference(reference), _, Some(new)) => {
+                reference.opacity = new.opacity;
+                reference.rect = new.rect;
+            }
+            _ => {}
         }
     }
 
@@ -1177,6 +1388,7 @@ mod tests {
                 locked: true,
                 alpha_lock: true,
             }),
+            reference: None,
         };
         sprite.set_layer_props(LayerId(1), &props);
         assert_eq!(sprite.layer(LayerId(1)).unwrap().props(), props);

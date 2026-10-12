@@ -11,8 +11,8 @@ use crate::geom::{Point, Rect};
 use crate::image::Image;
 use crate::selection::Mask;
 use crate::sprite::{
-    CanvasState, Cel, CelSource, Layer, LayerId, LayerKind, LayerProps, MAX_SPRITE_SIZE, PlacedCel,
-    Slot, Sprite, SpriteError,
+    CanvasState, Cel, CelSource, Layer, LayerId, LayerKind, LayerProps, MAX_SPRITE_SIZE, Palette,
+    PlacedCel, Slot, Sprite, SpriteError, Symmetry,
 };
 
 /// Default cap on the memory the undo history may hold.
@@ -76,6 +76,11 @@ enum Op {
         before: Box<CanvasState>,
         after: Box<CanvasState>,
     },
+    /// The palette's colours or ramps changed.
+    Palette {
+        before: Box<Palette>,
+        after: Box<Palette>,
+    },
 }
 
 impl Op {
@@ -94,6 +99,7 @@ impl Op {
             Self::Props { id, after, .. } => sprite.set_layer_props(*id, after),
             Self::Selection { after, .. } => sprite.set_selection(after.clone()),
             Self::Canvas { after, .. } => sprite.set_canvas_state((**after).clone()),
+            Self::Palette { after, .. } => sprite.set_palette((**after).clone()),
         }
     }
 
@@ -112,6 +118,7 @@ impl Op {
             Self::Props { id, before, .. } => sprite.set_layer_props(*id, before),
             Self::Selection { before, .. } => sprite.set_selection(before.clone()),
             Self::Canvas { before, .. } => sprite.set_canvas_state((**before).clone()),
+            Self::Palette { before, .. } => sprite.set_palette((**before).clone()),
         }
     }
 
@@ -123,7 +130,7 @@ impl Op {
             Self::Insert(placement) | Self::Remove(placement) => placement.bounds(),
             Self::Move { id, .. } | Self::Props { id, .. } => sprite.layer_bounds(*id),
             // The outline is drawn by the view, not composed into the picture.
-            Self::Selection { .. } => Rect::EMPTY,
+            Self::Selection { .. } | Self::Palette { .. } => Rect::EMPTY,
             Self::Canvas { .. } => Rect::from_size(MAX_SPRITE_SIZE, MAX_SPRITE_SIZE),
         }
     }
@@ -137,6 +144,9 @@ impl Op {
                 .map(|(_, _, cel)| cel.image().byte_size())
                 .sum(),
             Self::Move { .. } | Self::Props { .. } => 0,
+            Self::Palette { before, after } => {
+                (before.len() + after.len()) * std::mem::size_of::<crate::color::Rgba8>()
+            }
             Self::Selection { before, after } => [before, after]
                 .into_iter()
                 .flatten()
@@ -266,12 +276,25 @@ impl Transaction<'_> {
         Ok(())
     }
 
-    /// Gives the sprite a new canvas built from `cels`, dropping the selection.
+    /// Replaces the palette, colours and ramps.
+    pub fn set_palette(&mut self, palette: Palette) {
+        if *self.sprite.palette() != palette {
+            let before = Box::new(self.sprite.palette().clone());
+            self.push(Op::Palette {
+                before,
+                after: Box::new(palette),
+            });
+        }
+    }
+
+    /// Gives the sprite a new canvas built from `cels`, dropping the selection. `place` says
+    /// where a reference picture goes that was shown over a given rectangle.
     fn rebuild_canvas(
         &mut self,
         width: u32,
         height: u32,
         cels: Vec<CelSource>,
+        place: impl Fn(Rect) -> Rect,
     ) -> Result<(), SpriteError> {
         let valid = 1..=MAX_SPRITE_SIZE;
         if !valid.contains(&width) || !valid.contains(&height) {
@@ -279,7 +302,7 @@ impl Transaction<'_> {
         }
         let before = Box::new(self.sprite.canvas_state());
         let mut resized = self.sprite.clone();
-        resized.rebuild_canvas(width, height, cels);
+        resized.rebuild_canvas(width, height, cels, place);
         let after = Box::new(resized.canvas_state());
         if before != after {
             self.push(Op::Canvas { before, after });
@@ -300,7 +323,7 @@ impl Transaction<'_> {
         for cel in &mut cels {
             cel.origin = Point::new(cel.origin.x + dx, cel.origin.y + dy);
         }
-        self.rebuild_canvas(width, height, cels)
+        self.rebuild_canvas(width, height, cels, |rect| rect.translated(dx, dy))
     }
 
     /// Scales the whole sprite to a new size with nearest-neighbour sampling.
@@ -321,7 +344,39 @@ impl Transaction<'_> {
                 }
             })
             .collect();
-        self.rebuild_canvas(width, height, cels)
+        // A reference picture keeps covering the same part of the sprite.
+        let scale = |at: i32, old: u32, new: u32| {
+            (i64::from(at) * i64::from(new)).div_euclid(i64::from(old.max(1))) as i32
+        };
+        self.rebuild_canvas(width, height, cels, |rect| {
+            Rect::from_edges(
+                scale(rect.x, bounds.w, width),
+                scale(rect.y, bounds.h, height),
+                scale(rect.right(), bounds.w, width),
+                scale(rect.bottom(), bounds.h, height),
+            )
+        })
+    }
+
+    /// Adds a reference layer showing `image`, as large as fits on the canvas. Returns its id.
+    pub fn add_reference_layer(
+        &mut self,
+        slot: Slot,
+        name: &str,
+        image: Image,
+    ) -> Result<LayerId, SpriteError> {
+        self.check_slot(slot, false)?;
+        if image.is_empty() {
+            return Err(SpriteError::EmptyImage);
+        }
+        let rect = self.sprite.fitted(image.width(), image.height());
+        let id = self.new_layer_id();
+        self.push(Op::Insert(Box::new(Placement {
+            slot,
+            layer: Layer::reference(id, name, Arc::new(image), rect),
+            cels: Vec::new(),
+        })));
+        Ok(id)
     }
 
     /// Adds an empty image layer, or an empty group, at `slot`. Returns its id.
@@ -440,6 +495,11 @@ impl Transaction<'_> {
         } else if after.image.is_none() {
             after.image = before.image;
         }
+        if before.reference.is_none() {
+            after.reference = None;
+        } else if after.reference.is_none() {
+            after.reference = before.reference;
+        }
         if after != before {
             self.push(Op::Props { id, before, after });
         }
@@ -461,7 +521,7 @@ impl Transaction<'_> {
             .index
             .checked_sub(1)
             .and_then(|index| self.sprite.siblings(slot.parent).ok()?.get(index))
-            .filter(|layer| !layer.is_group())
+            .filter(|layer| layer.as_image().is_some())
             .ok_or(SpriteError::NothingBelow)?
             .id;
 
@@ -485,6 +545,7 @@ impl Transaction<'_> {
 
     /// Replaces all layers with a single image layer that looks like the sprite does now.
     /// Hidden layers are not part of what the sprite looks like, so they are dropped.
+    /// Reference layers at the top level are not part of the picture at all and stay.
     /// Returns the id of the new layer.
     pub fn flatten(&mut self) -> Result<LayerId, SpriteError> {
         let id = self.new_layer_id();
@@ -503,6 +564,7 @@ impl Transaction<'_> {
         })));
         let old: Vec<LayerId> = self.sprite.layers()[1..]
             .iter()
+            .filter(|layer| !layer.is_reference())
             .map(|layer| layer.id)
             .collect();
         for layer in old {
@@ -614,6 +676,12 @@ impl Document {
         self.sprite.set_collapsed(id, collapsed)
     }
 
+    /// Sets how strokes are mirrored. Like folding a group, this is about how the sprite is
+    /// worked on, not what is in it: it is not an undo step.
+    pub fn set_symmetry(&mut self, symmetry: Symmetry) {
+        self.sprite.set_symmetry(symmetry);
+    }
+
     /// Makes sure the active layer exists, falling back to the topmost image layer.
     fn repair_active_layer(&mut self) {
         if self.sprite.layer(self.active_layer).is_some() {
@@ -622,7 +690,7 @@ impl Document {
         let entries = self.sprite.walk_top_down();
         let fallback = entries
             .iter()
-            .find(|entry| !entry.layer.is_group())
+            .find(|entry| entry.layer.as_image().is_some())
             .or(entries.first());
         if let Some(entry) = fallback {
             self.active_layer = entry.layer.id;
@@ -1609,6 +1677,192 @@ mod tests {
         );
         assert!(!doc.set_group_collapsed(L1, true));
         assert_eq!((doc.history().len(), doc.revision()), (steps, revision));
+    }
+
+    #[test]
+    fn palette_changes_are_undo_steps() {
+        use crate::sprite::Palette;
+
+        let mut doc = document();
+        let original = doc.sprite().palette().clone();
+        let new = Palette::from_colors([RED, BLUE]).with_ramps(vec![vec![RED, BLUE]]);
+        doc.transact("Palette", |tx| {
+            tx.set_palette(new.clone());
+            Ok::<_, SpriteError>(())
+        })
+        .unwrap();
+        assert_eq!(*doc.sprite().palette(), new);
+        assert_eq!(doc.history().collect::<Vec<_>>(), ["Palette"]);
+        // Nothing is redrawn for a palette change.
+        assert!(doc.take_damage().is_empty());
+
+        doc.undo();
+        assert_eq!(*doc.sprite().palette(), original);
+        doc.redo();
+        assert_eq!(*doc.sprite().palette(), new);
+
+        // Setting the palette it already has is not a step.
+        doc.transact("Palette", |tx| {
+            tx.set_palette(new.clone());
+            Ok::<_, SpriteError>(())
+        })
+        .unwrap();
+        assert_eq!(doc.history().len(), 1);
+    }
+
+    #[test]
+    fn symmetry_is_a_setting_not_an_undo_step() {
+        use crate::sprite::Symmetry;
+
+        let mut doc = document();
+        let revision = doc.revision();
+        doc.set_symmetry(Symmetry::Radial(6));
+        assert_eq!(doc.sprite().symmetry(), Symmetry::Radial(6));
+        assert_eq!(doc.revision(), revision);
+        assert!(!doc.can_undo());
+
+        // Undoing something else leaves it alone.
+        paint(&mut doc, "Paint", Rect::new(0, 0, 2, 2), RED);
+        doc.undo();
+        assert_eq!(doc.sprite().symmetry(), Symmetry::Radial(6));
+    }
+
+    /// A 16×16 document with a 32×16 reference picture on top. Returns the layer's id.
+    fn with_reference(doc: &mut Document) -> LayerId {
+        doc.transact("Reference", |tx| {
+            tx.add_reference_layer(Slot::new(None, 1), "Photo", filled(32, 16, BLUE))
+        })
+        .unwrap()
+    }
+
+    fn reference_rect(doc: &Document, id: LayerId) -> Rect {
+        doc.sprite().layer(id).unwrap().as_reference().unwrap().rect
+    }
+
+    #[test]
+    fn a_reference_layer_is_fitted_shown_and_never_part_of_the_picture() {
+        let mut doc = document();
+        paint(&mut doc, "Paint", Rect::new(0, 0, 2, 2), RED);
+        let before = doc.sprite().clone();
+        let flat = compositor::compose(doc.sprite(), 0);
+
+        let id = with_reference(&mut doc);
+        let layer = doc.sprite().layer(id).unwrap();
+        assert!(layer.is_reference() && layer.visible);
+        assert_eq!(layer.as_reference().unwrap().opacity, 128);
+        // Twice as wide as high: full width, half the height, in the middle.
+        assert_eq!(reference_rect(&doc, id), Rect::new(0, 4, 16, 8));
+        assert_eq!(compositor::compose(doc.sprite(), 0), flat);
+
+        // It has no pixels to draw on, select or merge.
+        assert_eq!(
+            doc.sprite().check_drawable(id, 0),
+            Err(SpriteError::NotAnImageLayer(id.0))
+        );
+        assert_eq!(
+            doc.transact("Merge", |tx| tx.merge_down(id)),
+            Err(SpriteError::NotAnImageLayer(id.0))
+        );
+        let upper = doc
+            .transact("Add", |tx| tx.add_layer(Slot::new(None, 2), "Upper", false))
+            .unwrap();
+        assert_eq!(
+            doc.transact("Merge", |tx| tx.merge_down(upper)),
+            Err(SpriteError::NothingBelow)
+        );
+        doc.undo();
+
+        doc.undo();
+        assert_eq!(*doc.sprite(), before);
+        doc.redo();
+        assert!(doc.sprite().layer(id).is_some());
+
+        assert_eq!(
+            doc.transact("Reference", |tx| {
+                tx.add_reference_layer(Slot::new(None, 0), "Nothing", Image::new(0, 0))
+            }),
+            Err(SpriteError::EmptyImage)
+        );
+    }
+
+    #[test]
+    fn reference_properties_change_like_any_layer_property() {
+        let mut doc = document();
+        let id = with_reference(&mut doc);
+        let before = doc.sprite().clone();
+
+        doc.transact("Opacity", |tx| {
+            tx.update_layer(id, |props| {
+                props.visible = false;
+                if let Some(reference) = &mut props.reference {
+                    reference.opacity = 40;
+                    reference.rect = Rect::new(1, 1, 4, 2);
+                }
+                // A reference layer has no image properties to set.
+                props.image = Some(ImageLayer::default());
+            })
+        })
+        .unwrap();
+        let layer = doc.sprite().layer(id).unwrap();
+        assert!(!layer.visible && layer.as_image().is_none());
+        assert_eq!(layer.as_reference().unwrap().opacity, 40);
+        assert_eq!(reference_rect(&doc, id), Rect::new(1, 1, 4, 2));
+
+        doc.undo();
+        assert_eq!(*doc.sprite(), before);
+
+        // And an image layer cannot be given reference properties.
+        doc.transact("Props", |tx| {
+            tx.update_layer(L1, |props| {
+                props.reference = Some(crate::sprite::ReferenceProps {
+                    opacity: 1,
+                    rect: Rect::EMPTY,
+                });
+            })
+        })
+        .unwrap();
+        assert!(doc.sprite().layer(L1).unwrap().as_reference().is_none());
+    }
+
+    #[test]
+    fn a_reference_follows_the_canvas_and_survives_flattening() {
+        let mut doc = document();
+        paint(&mut doc, "Paint", Rect::new(0, 0, 2, 2), RED);
+        let id = with_reference(&mut doc);
+        let before = doc.sprite().clone();
+
+        doc.transact("Resize", |tx| tx.resize_canvas(20, 20, 2, 3))
+            .unwrap();
+        assert_eq!(reference_rect(&doc, id), Rect::new(2, 7, 16, 8));
+        doc.undo();
+        assert_eq!(*doc.sprite(), before);
+
+        doc.transact("Scale", |tx| tx.scale_sprite(32, 48)).unwrap();
+        assert_eq!(reference_rect(&doc, id), Rect::new(0, 12, 32, 24));
+        doc.undo();
+        assert_eq!(*doc.sprite(), before);
+
+        let copy = doc.transact("Copy", |tx| tx.duplicate_layer(id)).unwrap();
+        assert_eq!(reference_rect(&doc, copy), reference_rect(&doc, id));
+
+        let flat = doc.transact("Flatten", |tx| tx.flatten()).unwrap();
+        let kinds: Vec<(LayerId, bool)> = doc
+            .sprite()
+            .layers()
+            .iter()
+            .map(|layer| (layer.id, layer.is_reference()))
+            .collect();
+        assert_eq!(kinds, [(flat, false), (id, true), (copy, true)]);
+        assert_eq!(doc.active_layer(), flat);
+    }
+
+    #[test]
+    fn pictures_are_fitted_inside_the_canvas() {
+        let sprite = Sprite::new(8, 8).unwrap();
+        assert_eq!(sprite.fitted(16, 8), Rect::new(0, 2, 8, 4));
+        assert_eq!(sprite.fitted(4, 16), Rect::new(3, 0, 2, 8));
+        assert_eq!(sprite.fitted(2, 2), Rect::new(0, 0, 8, 8));
+        assert_eq!(sprite.fitted(1000, 1), Rect::new(0, 3, 8, 1));
     }
 }
 

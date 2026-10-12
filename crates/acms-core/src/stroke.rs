@@ -3,9 +3,11 @@
 //! ```text
 //! pointer positions
 //!   → interpolate     [`line`]: no gaps between two samples
+//!   → pixel-perfect   [`is_corner`]: takes back the corner pixel of an L-shaped step
+//!   → symmetry        [`Symmetry`]: every sample is repeated in its mirror images
 //!   → brush stamp     [`Brush::footprint`]: the pixels one sample covers
 //!   → ink             [`Ink::apply`]: what happens to each covered pixel
-//!   → mask            [`lock_alpha`] and the canvas edge: where the ink may land
+//!   → mask            the selection, [`lock_alpha`], wrap-around and the canvas edge
 //!   → preview buffer  [`StrokeBuffer`]: shown live, nothing in the sprite changes
 //!   → commit          [`Stroke::commit`]: one transaction, one undo step
 //! ```
@@ -16,8 +18,9 @@ use std::sync::Arc;
 use crate::document::{Document, Transaction};
 use crate::geom::{Point, Rect};
 use crate::image::Image;
+use crate::pattern::Pattern;
 use crate::selection::Mask;
-use crate::sprite::{LayerId, Sprite, SpriteError};
+use crate::sprite::{LayerId, Ramp, Sprite, SpriteError, Symmetry};
 
 pub const MAX_BRUSH_SIZE: u32 = 64;
 
@@ -50,17 +53,87 @@ pub fn line(from: Point, to: Point) -> impl Iterator<Item = Point> {
     })
 }
 
+/// The pixel-perfect filter: whether `b` is the corner of an L-shaped step from `a` to `c`.
+/// Without it a one-pixel line still connects, diagonally, and looks cleaner.
+pub fn is_corner(a: Point, b: Point, c: Point) -> bool {
+    let diagonal = (a.x - c.x).abs() == 1 && (a.y - c.y).abs() == 1;
+    diagonal && (b.x == a.x || b.y == a.y) && (b.x == c.x || b.y == c.y) && b != a && b != c
+}
+
+fn touching(a: Point, b: Point) -> bool {
+    (a.x - b.x).abs() <= 1 && (a.y - b.y).abs() <= 1
+}
+
+impl Symmetry {
+    /// How many times a stroke is drawn, the original included.
+    pub fn copies(self) -> usize {
+        match self {
+            Self::Off => 1,
+            Self::Horizontal | Self::Vertical => 2,
+            Self::Both => 4,
+            Self::Radial(count) => usize::from(count.max(1)),
+        }
+    }
+
+    /// Whether every copy is an exact image of the original, pixel for pixel. Turning by
+    /// anything but a quarter turn has to round, which can leave gaps to fill in.
+    pub fn is_exact(self) -> bool {
+        !matches!(self, Self::Radial(count) if !matches!(count, 1 | 2 | 4))
+    }
+
+    /// Where copy number `copy` (0 is the original) of a pixel lands on a canvas of the given
+    /// size. The mirror lines and the centre of rotation are in the middle of the canvas.
+    pub fn image(self, copy: usize, p: Point, width: u32, height: u32) -> Point {
+        let (w, h) = (width as i32, height as i32);
+        let flip_x = Point::new(w - 1 - p.x, p.y);
+        let flip_y = Point::new(p.x, h - 1 - p.y);
+        match (self, copy) {
+            (Self::Off, _) | (_, 0) => p,
+            (Self::Horizontal, _) => flip_x,
+            (Self::Vertical, _) => flip_y,
+            (Self::Both, 1) => flip_x,
+            (Self::Both, 2) => flip_y,
+            (Self::Both, _) => Point::new(flip_x.x, flip_y.y),
+            (Self::Radial(count), copy) => {
+                let count = usize::from(count.max(1));
+                // Twice the offset of the pixel's centre from the centre of the canvas, which
+                // is a whole number whatever the canvas size.
+                let (dx, dy) = (2 * p.x + 1 - w, 2 * p.y + 1 - h);
+                let (rx, ry) = if 4 * copy % count == 0 {
+                    match 4 * copy / count % 4 {
+                        1 => (-dy, dx),
+                        2 => (-dx, -dy),
+                        3 => (dy, -dx),
+                        _ => (dx, dy),
+                    }
+                } else {
+                    let angle = std::f64::consts::TAU * copy as f64 / count as f64;
+                    let (sin, cos) = angle.sin_cos();
+                    let (dx, dy) = (f64::from(dx), f64::from(dy));
+                    (
+                        (dx * cos - dy * sin).round() as i32,
+                        (dx * sin + dy * cos).round() as i32,
+                    )
+                };
+                Point::new((rx + w - 1).div_euclid(2), (ry + h - 1).div_euclid(2))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrushShape {
     Square,
     Round,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Brush {
-    pub shape: BrushShape,
+    shape: BrushShape,
     /// Diameter in pixels, `1..=MAX_BRUSH_SIZE`.
     size: u32,
+    /// A custom brush: these pixels are stamped instead of a square or circle.
+    image: Option<Arc<Image>>,
 }
 
 impl Default for Brush {
@@ -75,25 +148,89 @@ impl Brush {
         Self {
             shape,
             size: size.clamp(1, MAX_BRUSH_SIZE),
+            image: None,
         }
+    }
+
+    /// A brush that stamps `image`, cropped to what is visible in it. `None` if nothing is,
+    /// or if that is larger than `MAX_BRUSH_SIZE` on a side.
+    pub fn custom(image: &Image) -> Option<Self> {
+        let content = image.content_bounds();
+        let fits = 1..=MAX_BRUSH_SIZE;
+        if !fits.contains(&content.w) || !fits.contains(&content.h) {
+            return None;
+        }
+        Some(Self {
+            shape: BrushShape::Square,
+            size: content.w.max(content.h),
+            image: Some(Arc::new(image.crop(content))),
+        })
+    }
+
+    pub fn shape(&self) -> BrushShape {
+        self.shape
+    }
+
+    /// Makes this a plain brush of the given shape.
+    pub fn set_shape(&mut self, shape: BrushShape) {
+        self.shape = shape;
+        self.image = None;
     }
 
     pub fn size(&self) -> u32 {
         self.size
     }
 
+    /// Changes the size of a plain brush; a custom brush keeps the size of its image.
     pub fn set_size(&mut self, size: u32) {
-        self.size = size.clamp(1, MAX_BRUSH_SIZE);
+        if self.image.is_none() {
+            self.size = size.clamp(1, MAX_BRUSH_SIZE);
+        }
     }
 
-    /// The square the brush fits in when stamped at `center`.
+    /// The image of a custom brush.
+    pub fn image(&self) -> Option<&Image> {
+        self.image.as_deref()
+    }
+
+    pub fn is_custom(&self) -> bool {
+        self.image.is_some()
+    }
+
+    fn extent(&self) -> (u32, u32) {
+        match &self.image {
+            Some(image) => (image.width(), image.height()),
+            None => (self.size, self.size),
+        }
+    }
+
+    /// The rectangle the brush fits in when stamped at `center`.
     pub fn bounds_at(&self, center: Point) -> Rect {
-        let half = (self.size / 2) as i32;
-        Rect::new(center.x - half, center.y - half, self.size, self.size)
+        let (w, h) = self.extent();
+        Rect::new(center.x - (w / 2) as i32, center.y - (h / 2) as i32, w, h)
     }
 
     /// The pixels the brush covers, as offsets from the pixel it is stamped on.
     pub fn footprint(&self) -> Vec<Point> {
+        self.stamp().into_iter().map(|(offset, _)| offset).collect()
+    }
+
+    /// The footprint, with the colour each pixel of a custom brush carries.
+    fn stamp(&self) -> Vec<(Point, Option<Rgba8>)> {
+        if let Some(image) = &self.image {
+            let (half_w, half_h) = ((image.width() / 2) as i32, (image.height() / 2) as i32);
+            let mut pixels = Vec::new();
+            for y in 0..image.height() as i32 {
+                for x in 0..image.width() as i32 {
+                    let color = image.get(x, y);
+                    if color.a != 0 {
+                        pixels.push((Point::new(x - half_w, y - half_h), Some(color)));
+                    }
+                }
+            }
+            return pixels;
+        }
+
         let size = self.size as i32;
         let half = size / 2;
         let radius = self.size as f32 / 2.0;
@@ -113,7 +250,7 @@ impl Brush {
                     }
                 };
                 if inside {
-                    offsets.push(Point::new(x - half, y - half));
+                    offsets.push((Point::new(x - half, y - half), None));
                 }
             }
         }
@@ -122,20 +259,54 @@ impl Brush {
 }
 
 /// How a covered pixel changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ink {
     /// Sets the pixel to a colour.
     Simple(Rgba8),
     /// Makes the pixel transparent.
     Erase,
+    /// Sets the pixel to one of two colours, chosen by a pattern.
+    Dither {
+        first: Rgba8,
+        second: Rgba8,
+        pattern: Pattern,
+        /// The share of pixels that get `first`, in percent.
+        density: u8,
+    },
+    /// Moves the pixel's colour `step` places along the first ramp that contains it. Colours
+    /// that are in no ramp are left alone, and the ends of a ramp are as far as it goes.
+    Shade { ramps: Arc<[Ramp]>, step: i32 },
 }
 
 impl Ink {
-    /// The new value of a pixel, given what the sprite held before the stroke began.
-    pub fn apply(self, _original: Rgba8) -> Rgba8 {
+    /// The new value of the pixel at a canvas position, given what the sprite held there
+    /// before the stroke began.
+    pub fn apply(&self, original: Rgba8, x: i32, y: i32) -> Rgba8 {
         match self {
             Self::Simple(color) => color.normalized(),
             Self::Erase => Rgba8::TRANSPARENT,
+            Self::Dither {
+                first,
+                second,
+                pattern,
+                density,
+            } => {
+                let picked = if pattern.picks_first(x, y, *density) {
+                    first
+                } else {
+                    second
+                };
+                picked.normalized()
+            }
+            Self::Shade { ramps, step } => ramps
+                .iter()
+                .find_map(|ramp| {
+                    let at = ramp.iter().position(|color| *color == original)?;
+                    let last = ramp.len() as i64 - 1;
+                    let to = (at as i64 + i64::from(*step)).clamp(0, last);
+                    ramp.get(to as usize).copied()
+                })
+                .unwrap_or(original),
         }
     }
 }
@@ -157,8 +328,12 @@ pub struct StrokeBuffer {
     canvas: Rect,
     pixels: Vec<Rgba8>,
     touched: Vec<bool>,
-    /// The smallest rectangle containing every touched pixel.
+    /// A rectangle containing every touched pixel. It only ever grows during a stroke.
     bounds: Rect,
+    /// The area whose pixels were written or taken back since [`StrokeBuffer::take_dirty`].
+    dirty: Rect,
+    /// While `Some`, the index of every pixel that gets written is noted here.
+    journal: Option<Vec<usize>>,
 }
 
 impl StrokeBuffer {
@@ -181,6 +356,8 @@ impl StrokeBuffer {
             self.touched = vec![false; canvas.area()];
         }
         self.bounds = Rect::EMPTY;
+        self.dirty = Rect::EMPTY;
+        self.journal = None;
     }
 
     fn index(&self, x: i32, y: i32) -> Option<usize> {
@@ -195,9 +372,14 @@ impl StrokeBuffer {
         self.touched[index].then(|| self.pixels[index])
     }
 
-    /// The area the stroke has touched so far.
+    /// An area containing everything the stroke has touched so far.
     pub fn bounds(&self) -> Rect {
         self.bounds
+    }
+
+    /// The area that changed since the last call.
+    fn take_dirty(&mut self) -> Rect {
+        std::mem::take(&mut self.dirty)
     }
 
     /// Whether this pixel can still be written: it is on the canvas and not yet touched.
@@ -209,9 +391,105 @@ impl StrokeBuffer {
         if let Some(index) = self.index(x, y) {
             self.pixels[index] = color;
             self.touched[index] = true;
-            self.bounds = self.bounds.union(Rect::new(x, y, 1, 1));
+            let pixel = Rect::new(x, y, 1, 1);
+            self.bounds = self.bounds.union(pixel);
+            self.dirty = self.dirty.union(pixel);
+            if let Some(journal) = &mut self.journal {
+                journal.push(index);
+            }
         }
     }
+
+    /// Makes pixels untouched again, as if the stroke had never reached them.
+    fn take_back(&mut self, indices: &[usize]) {
+        let width = self.canvas.w as usize;
+        for &index in indices {
+            self.touched[index] = false;
+            let (x, y) = ((index % width) as i32, (index / width) as i32);
+            let pixel = Rect::new(self.canvas.x + x, self.canvas.y + y, 1, 1);
+            self.dirty = self.dirty.union(pixel);
+        }
+    }
+}
+
+/// Everything about a stroke that is decided when it starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StrokeSettings {
+    pub brush: Brush,
+    pub ink: Ink,
+    /// Freehand lines lose the corner pixel of every L-shaped step.
+    pub pixel_perfect: bool,
+    /// The stroke is repeated in the mirror images the sprite's symmetry asks for.
+    pub symmetric: bool,
+    /// What leaves the canvas on one side comes back in on the other.
+    pub tiled: bool,
+}
+
+impl StrokeSettings {
+    /// A plain stroke: no filter, no symmetry, no wrap-around.
+    pub fn new(brush: Brush, ink: Ink) -> Self {
+        Self {
+            brush,
+            ink,
+            pixel_perfect: false,
+            symmetric: false,
+            tiled: false,
+        }
+    }
+}
+
+/// Where a stroke's pixels go, and the masks in their way.
+struct Target {
+    layer: LayerId,
+    frame: usize,
+    canvas: Rect,
+    alpha_lock: bool,
+    tiled: bool,
+    /// The selection when the stroke began; pixels outside it are left alone.
+    selection: Option<Arc<Mask>>,
+}
+
+impl Target {
+    /// Runs one pixel through ink and masks into the preview. Each pixel is inked once per
+    /// stroke, from what the sprite held before it.
+    fn plot(&self, buffer: &mut StrokeBuffer, sprite: &Sprite, x: i32, y: i32, ink: &Ink) {
+        let (x, y) = if self.tiled && !self.canvas.is_empty() {
+            (
+                x.rem_euclid(self.canvas.w as i32),
+                y.rem_euclid(self.canvas.h as i32),
+            )
+        } else {
+            (x, y)
+        };
+        if !buffer.is_free(x, y) {
+            return;
+        }
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|mask| !mask.contains(x, y))
+        {
+            return;
+        }
+        let original = sprite.pixel(self.layer, self.frame, x, y);
+        let inked = ink.apply(original, x, y);
+        let masked = if self.alpha_lock {
+            lock_alpha(original, inked)
+        } else {
+            inked
+        };
+        buffer.put(x, y, masked);
+    }
+}
+
+/// The newest point of a pixel-perfect freehand line, which the next point may still turn
+/// into a corner that has to go.
+struct Tail {
+    point: Point,
+    /// The buffer pixels only this point wrote.
+    wrote: Vec<usize>,
+    /// Where each symmetry copy of the line stood before this point.
+    copies_before: Vec<Option<Point>>,
 }
 
 /// A stroke in progress on one cel: everything a tool draws between pointer down and up.
@@ -219,56 +497,90 @@ impl StrokeBuffer {
 /// Pencil-like tools call [`Stroke::extend_to`]. Tools that redraw their whole shape while the
 /// pointer moves call [`Stroke::reset`] and then [`Stroke::stamp`] or [`Stroke::plot`] again.
 pub struct Stroke {
-    layer: LayerId,
-    frame: usize,
-    canvas: Rect,
-    footprint: Vec<Point>,
+    target: Target,
+    /// The brush's pixels, with the colour each carries if it is a custom brush.
+    footprint: Vec<(Point, Option<Rgba8>)>,
     brush: Brush,
     ink: Ink,
-    alpha_lock: bool,
-    /// The selection when the stroke began; pixels outside it are left alone.
-    selection: Option<Arc<Mask>>,
+    pixel_perfect: bool,
+    symmetry: Symmetry,
+    /// The last pointer position of a freehand line.
     last: Option<Point>,
+    /// The freehand point before `tail`.
+    before_tail: Option<Point>,
+    tail: Option<Tail>,
+    /// The last pixel stamped for each symmetry copy of the line being drawn.
+    copies: Vec<Option<Point>>,
     buffer: StrokeBuffer,
 }
 
 impl Stroke {
-    /// Starts a stroke on an image layer that is neither locked nor hidden. `buffer` is an old
-    /// preview buffer to reuse, or a new one.
+    /// Starts a plain stroke on an image layer that is neither locked nor hidden. `buffer` is
+    /// an old preview buffer to reuse, or a new one.
     pub fn begin(
         sprite: &Sprite,
         layer: LayerId,
         frame: usize,
         brush: Brush,
         ink: Ink,
+        buffer: StrokeBuffer,
+    ) -> Result<Self, SpriteError> {
+        Self::begin_with(
+            sprite,
+            layer,
+            frame,
+            StrokeSettings::new(brush, ink),
+            buffer,
+        )
+    }
+
+    /// Like [`Stroke::begin`], with every stage of the pipeline configurable.
+    pub fn begin_with(
+        sprite: &Sprite,
+        layer: LayerId,
+        frame: usize,
+        settings: StrokeSettings,
         mut buffer: StrokeBuffer,
     ) -> Result<Self, SpriteError> {
         let alpha_lock = sprite.check_drawable(layer, frame)?.alpha_lock;
         buffer.reset(sprite.bounds());
+        let symmetry = if settings.symmetric {
+            sprite.symmetry()
+        } else {
+            Symmetry::Off
+        };
         Ok(Self {
-            layer,
-            frame,
-            canvas: sprite.bounds(),
-            footprint: brush.footprint(),
-            brush,
-            ink,
-            alpha_lock,
-            selection: sprite.selection().cloned(),
+            target: Target {
+                layer,
+                frame,
+                canvas: sprite.bounds(),
+                alpha_lock,
+                tiled: settings.tiled,
+                selection: sprite.selection().cloned(),
+            },
+            footprint: settings.brush.stamp(),
+            brush: settings.brush,
+            ink: settings.ink,
+            pixel_perfect: settings.pixel_perfect,
+            symmetry,
             last: None,
+            before_tail: None,
+            tail: None,
+            copies: vec![None; symmetry.copies()],
             buffer,
         })
     }
 
     pub fn layer(&self) -> LayerId {
-        self.layer
+        self.target.layer
     }
 
     pub fn frame(&self) -> usize {
-        self.frame
+        self.target.frame
     }
 
-    pub fn brush(&self) -> Brush {
-        self.brush
+    pub fn brush(&self) -> &Brush {
+        &self.brush
     }
 
     /// What the stroke has drawn so far.
@@ -280,32 +592,18 @@ impl Stroke {
     /// canvas area that was covered.
     pub fn reset(&mut self) -> Rect {
         let covered = self.buffer.bounds();
-        self.buffer.reset(self.canvas);
+        self.buffer.reset(self.target.canvas);
         self.last = None;
+        self.before_tail = None;
+        self.tail = None;
+        self.copies.fill(None);
         covered
     }
 
-    /// Runs one pixel through ink and masks into the preview. Each pixel is inked once per
-    /// stroke, from what the sprite held before it.
-    pub fn plot(&mut self, sprite: &Sprite, x: i32, y: i32, ink: Ink) {
-        if !self.buffer.is_free(x, y) {
-            return;
-        }
-        if self
-            .selection
-            .as_ref()
-            .is_some_and(|mask| !mask.contains(x, y))
-        {
-            return;
-        }
-        let original = sprite.pixel(self.layer, self.frame, x, y);
-        let inked = ink.apply(original);
-        let masked = if self.alpha_lock {
-            lock_alpha(original, inked)
-        } else {
-            inked
-        };
-        self.buffer.put(x, y, masked);
+    /// Runs one pixel through ink and masks into the preview, without brush or symmetry.
+    /// Each pixel is inked once per stroke, from what the sprite held before it.
+    pub fn plot(&mut self, sprite: &Sprite, x: i32, y: i32, ink: &Ink) {
+        self.target.plot(&mut self.buffer, sprite, x, y, ink);
     }
 
     /// Sets one pixel regardless of selection and alpha lock, for tools that move pixels
@@ -316,48 +614,117 @@ impl Stroke {
         }
     }
 
-    /// Paints one pixel with the stroke's ink, without the brush.
+    /// Paints one pixel, and its mirror images, with the stroke's ink but without the brush.
     pub fn fill(&mut self, sprite: &Sprite, x: i32, y: i32) {
-        self.plot(sprite, x, y, self.ink);
+        let canvas = self.target.canvas;
+        for copy in 0..self.symmetry.copies() {
+            let p = self
+                .symmetry
+                .image(copy, Point::new(x, y), canvas.w, canvas.h);
+            self.target
+                .plot(&mut self.buffer, sprite, p.x, p.y, &self.ink);
+        }
     }
 
-    /// Stamps the brush at `center` with the stroke's ink.
-    pub fn stamp(&mut self, sprite: &Sprite, center: Point) {
-        for index in 0..self.footprint.len() {
-            let offset = self.footprint[index];
-            self.plot(sprite, center.x + offset.x, center.y + offset.y, self.ink);
+    /// Stamps the brush at one place, with the stroke's ink. A custom brush carries its own
+    /// colours, which a plain colour ink lets through.
+    fn stamp_at(&mut self, sprite: &Sprite, center: Point) {
+        let own_colors = matches!(self.ink, Ink::Simple(_));
+        for &(offset, color) in &self.footprint {
+            let (x, y) = (center.x + offset.x, center.y + offset.y);
+            match color.filter(|_| own_colors) {
+                Some(color) => {
+                    let ink = Ink::Simple(color);
+                    self.target.plot(&mut self.buffer, sprite, x, y, &ink);
+                }
+                None => self.target.plot(&mut self.buffer, sprite, x, y, &self.ink),
+            }
         }
+    }
+
+    /// Stamps the brush at `center` and at its mirror images. With `connected`, a copy that
+    /// had to be rounded into place is joined up with where that copy was stamped last.
+    fn stamp_copies(&mut self, sprite: &Sprite, center: Point, connected: bool) {
+        let canvas = self.target.canvas;
+        for copy in 0..self.symmetry.copies() {
+            let at = self.symmetry.image(copy, center, canvas.w, canvas.h);
+            let previous = self.copies[copy].filter(|_| connected && !self.symmetry.is_exact());
+            match previous.filter(|previous| !touching(*previous, at)) {
+                Some(previous) => {
+                    for between in line(previous, at).skip(1) {
+                        self.stamp_at(sprite, between);
+                    }
+                }
+                None => self.stamp_at(sprite, at),
+            }
+            self.copies[copy] = Some(at);
+        }
+    }
+
+    /// Stamps the brush at `center` with the stroke's ink, and at its mirror images.
+    pub fn stamp(&mut self, sprite: &Sprite, center: Point) {
+        self.stamp_copies(sprite, center, false);
     }
 
     /// Stamps the brush on every pixel of the straight line between two points.
     pub fn stamp_line(&mut self, sprite: &Sprite, from: Point, to: Point) {
+        self.copies.fill(None);
         for center in line(from, to) {
-            self.stamp(sprite, center);
+            self.stamp_copies(sprite, center, true);
         }
+    }
+
+    /// Adds one pixel to a freehand line, taking the previous one back if that turned out
+    /// to be the corner of an L.
+    fn freehand_point(&mut self, sprite: &Sprite, point: Point) {
+        if !self.pixel_perfect {
+            self.stamp_copies(sprite, point, true);
+            return;
+        }
+        match self.tail.take() {
+            Some(tail)
+                if self
+                    .before_tail
+                    .is_some_and(|a| is_corner(a, tail.point, point)) =>
+            {
+                self.buffer.take_back(&tail.wrote);
+                self.copies = tail.copies_before;
+            }
+            Some(tail) => self.before_tail = Some(tail.point),
+            None => {}
+        }
+        let copies_before = self.copies.clone();
+        self.buffer.journal = Some(Vec::new());
+        self.stamp_copies(sprite, point, true);
+        self.tail = Some(Tail {
+            point,
+            wrote: self.buffer.journal.take().unwrap_or_default(),
+            copies_before,
+        });
     }
 
     /// Continues the stroke to `point`, filling every pixel on the way from the previous
     /// point. Returns the canvas area whose preview changed.
     pub fn extend_to(&mut self, sprite: &Sprite, point: Point) -> Rect {
-        let from = self.last.unwrap_or(point);
-        self.last = Some(point);
-        self.stamp_line(sprite, from, point);
+        let from = self.last.replace(point);
+        // The line from the last point starts on a pixel that is already drawn.
+        let skip = usize::from(from.is_some());
+        let from = from.unwrap_or(point);
+        for center in line(from, point).skip(skip) {
+            self.freehand_point(sprite, center);
+        }
 
         self.brush
             .bounds_at(from)
             .union(self.brush.bounds_at(point))
+            .union(self.buffer.take_dirty())
             .intersect(sprite.bounds())
     }
 
     /// Writes the stroke into a transaction that is already open, and hands the preview
     /// buffer back for the next stroke.
     pub fn apply(self, tx: &mut Transaction<'_>) -> Result<StrokeBuffer, SpriteError> {
-        let Self {
-            layer,
-            frame,
-            buffer,
-            ..
-        } = self;
+        let (layer, frame, buffer) = (self.target.layer, self.target.frame, self.buffer);
         let rect = buffer.bounds();
         if !rect.is_empty() {
             let mut pixels = tx.sprite().read_region(layer, frame, rect);
@@ -385,12 +752,13 @@ impl Stroke {
         (self.buffer, rect)
     }
 }
+
 /// Renders a brush footprint into a small image, for tests and brush previews.
-pub fn footprint_image(brush: Brush, color: Rgba8) -> Image {
-    let half = (brush.size() / 2) as i32;
-    let mut image = Image::new(brush.size(), brush.size());
+pub fn footprint_image(brush: &Brush, color: Rgba8) -> Image {
+    let bounds = brush.bounds_at(Point::new(0, 0));
+    let mut image = Image::new(bounds.w, bounds.h);
     for offset in brush.footprint() {
-        image.set(offset.x + half, offset.y + half, color);
+        image.set(offset.x - bounds.x, offset.y - bounds.y, color);
     }
     image
 }
@@ -445,7 +813,7 @@ mod tests {
     }
 
     fn rows(brush: Brush) -> Vec<String> {
-        let image = footprint_image(brush, RED);
+        let image = footprint_image(&brush, RED);
         (0..image.height() as i32)
             .map(|y| {
                 (0..image.width() as i32)
@@ -499,12 +867,12 @@ mod tests {
     #[test]
     fn inks() {
         let blue = Rgba8::rgb(0, 0, 255);
-        assert_eq!(Ink::Simple(RED).apply(blue), RED);
-        assert_eq!(Ink::Simple(RED).apply(Rgba8::TRANSPARENT), RED);
-        assert_eq!(Ink::Erase.apply(blue), Rgba8::TRANSPARENT);
+        assert_eq!(Ink::Simple(RED).apply(blue, 0, 0), RED);
+        assert_eq!(Ink::Simple(RED).apply(Rgba8::TRANSPARENT, 0, 0), RED);
+        assert_eq!(Ink::Erase.apply(blue, 0, 0), Rgba8::TRANSPARENT);
         // Painting with an invisible colour is the same as erasing.
         assert_eq!(
-            Ink::Simple(Rgba8::new(9, 9, 9, 0)).apply(blue),
+            Ink::Simple(Rgba8::new(9, 9, 9, 0)).apply(blue, 0, 0),
             Rgba8::TRANSPARENT
         );
     }
@@ -757,5 +1125,431 @@ mod tests {
             Some(SpriteError::NotAnImageLayer(group.0))
         );
         assert_eq!(begin(&grouped, L1), None);
+    }
+    const BLUE: Rgba8 = Rgba8::rgb(0, 0, 255);
+
+    fn settings(edit: impl FnOnce(&mut StrokeSettings)) -> StrokeSettings {
+        let mut settings = StrokeSettings::new(Brush::default(), Ink::Simple(RED));
+        edit(&mut settings);
+        settings
+    }
+
+    fn stroke_with(doc: &Document, settings: StrokeSettings) -> Stroke {
+        Stroke::begin_with(doc.sprite(), L1, 0, settings, StrokeBuffer::new()).unwrap()
+    }
+
+    /// Draws a freehand line through `path` and commits it.
+    fn draw(doc: &mut Document, settings: StrokeSettings, path: &[(i32, i32)]) {
+        let mut s = stroke_with(doc, settings);
+        for &(x, y) in path {
+            s.extend_to(doc.sprite(), Point::new(x, y));
+        }
+        s.commit(doc, "Draw").unwrap();
+    }
+
+    /// The painted pixels of the layer, sorted.
+    fn painted(doc: &Document) -> Vec<(i32, i32)> {
+        let bounds = doc.sprite().bounds();
+        let mut pixels = Vec::new();
+        for y in 0..bounds.h as i32 {
+            for x in 0..bounds.w as i32 {
+                if doc.sprite().pixel(L1, 0, x, y).a != 0 {
+                    pixels.push((x, y));
+                }
+            }
+        }
+        pixels
+    }
+
+    fn sorted(mut pixels: Vec<(i32, i32)>) -> Vec<(i32, i32)> {
+        pixels.sort_unstable_by_key(|&(x, y)| (y, x));
+        pixels
+    }
+
+    fn document_with_symmetry(size: u32, symmetry: Symmetry) -> Document {
+        let mut doc = Document::new(Sprite::new(size, size).unwrap());
+        doc.set_symmetry(symmetry);
+        doc
+    }
+
+    #[test]
+    fn corners_of_an_l_are_recognised() {
+        let p = Point::new;
+        assert!(is_corner(p(0, 0), p(1, 0), p(1, 1)));
+        assert!(is_corner(p(0, 0), p(0, 1), p(1, 1)));
+        assert!(is_corner(p(5, 5), p(5, 4), p(4, 4)));
+        // Straight on, a diagonal, and a step back are not.
+        assert!(!is_corner(p(0, 0), p(1, 0), p(2, 0)));
+        assert!(!is_corner(p(0, 0), p(1, 1), p(2, 2)));
+        assert!(!is_corner(p(0, 0), p(1, 0), p(0, 0)));
+        assert!(!is_corner(p(0, 0), p(1, 1), p(2, 1)));
+    }
+
+    #[test]
+    fn pixel_perfect_turns_a_staircase_into_a_diagonal() {
+        let stairs = [(1, 1), (2, 1), (2, 2), (3, 2), (3, 3), (4, 3), (4, 4)];
+
+        let mut plain = Document::new(Sprite::new(8, 8).unwrap());
+        draw(&mut plain, settings(|_| {}), &stairs);
+        assert_eq!(painted(&plain), sorted(stairs.to_vec()));
+
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        draw(&mut doc, settings(|s| s.pixel_perfect = true), &stairs);
+        assert_eq!(painted(&doc), [(1, 1), (2, 2), (3, 3), (4, 4)]);
+        assert_eq!(doc.history().len(), 1);
+        doc.undo();
+        assert!(painted(&doc).is_empty());
+    }
+
+    #[test]
+    fn pixel_perfect_shows_the_newest_pixel_until_it_turns_out_to_be_a_corner() {
+        let doc = Document::new(Sprite::new(8, 8).unwrap());
+        let mut s = stroke_with(&doc, settings(|s| s.pixel_perfect = true));
+        s.extend_to(doc.sprite(), Point::new(1, 1));
+        s.extend_to(doc.sprite(), Point::new(2, 1));
+        // Nothing says yet that (2, 1) is a corner: it is under the pointer and shown.
+        assert_eq!(s.buffer().get(2, 1), Some(RED));
+
+        let damage = s.extend_to(doc.sprite(), Point::new(2, 2));
+        assert_eq!(s.buffer().get(2, 1), None);
+        assert_eq!(s.buffer().get(2, 2), Some(RED));
+        // The pixel that went away is part of what has to be redrawn.
+        assert!(damage.contains(Point::new(2, 1)));
+
+        // Straight lines and long strokes are left as they are.
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        draw(
+            &mut doc,
+            settings(|s| s.pixel_perfect = true),
+            &[(0, 6), (7, 6)],
+        );
+        assert_eq!(painted(&doc).len(), 8);
+    }
+
+    #[test]
+    fn pixel_perfect_cuts_the_corner_of_a_turn() {
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        draw(
+            &mut doc,
+            settings(|s| s.pixel_perfect = true),
+            &[(1, 1), (5, 1), (5, 5)],
+        );
+        let pixels = painted(&doc);
+        assert!(!pixels.contains(&(5, 1)));
+        assert!(pixels.contains(&(4, 1)) && pixels.contains(&(5, 2)));
+        assert_eq!(pixels.len(), 8);
+    }
+
+    #[test]
+    fn mirror_symmetries_repeat_every_pixel() {
+        let path = [(1, 2), (3, 2)];
+        let cases: [(Symmetry, &[(i32, i32)]); 3] = [
+            (Symmetry::Horizontal, &[(4, 2), (5, 2), (6, 2)]),
+            (Symmetry::Vertical, &[(1, 5), (2, 5), (3, 5)]),
+            (
+                Symmetry::Both,
+                &[
+                    (4, 2),
+                    (5, 2),
+                    (6, 2),
+                    (1, 5),
+                    (2, 5),
+                    (3, 5),
+                    (4, 5),
+                    (5, 5),
+                    (6, 5),
+                ],
+            ),
+        ];
+        for (symmetry, mirrored) in cases {
+            let mut doc = document_with_symmetry(8, symmetry);
+            draw(&mut doc, settings(|s| s.symmetric = true), &path);
+            let mut expected = vec![(1, 2), (2, 2), (3, 2)];
+            expected.extend_from_slice(mirrored);
+            assert_eq!(painted(&doc), sorted(expected), "{symmetry:?}");
+            assert_eq!(doc.history().len(), 1);
+        }
+
+        // A stroke that does not ask for symmetry ignores the sprite's setting.
+        let mut doc = document_with_symmetry(8, Symmetry::Both);
+        draw(&mut doc, settings(|_| {}), &path);
+        assert_eq!(painted(&doc).len(), 3);
+    }
+
+    #[test]
+    fn mirrors_work_on_canvases_of_odd_size() {
+        let mut doc = document_with_symmetry(7, Symmetry::Both);
+        draw(
+            &mut doc,
+            settings(|s| s.symmetric = true),
+            &[(0, 3), (3, 3)],
+        );
+        // The middle row is its own mirror image; the middle pixel too.
+        assert_eq!(painted(&doc), (0..7).map(|x| (x, 3)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn radial_symmetry_of_four_is_exact_quarter_turns() {
+        let mut doc = document_with_symmetry(8, Symmetry::Radial(4));
+        draw(&mut doc, settings(|s| s.symmetric = true), &[(1, 2)]);
+        assert_eq!(painted(&doc), sorted(vec![(1, 2), (5, 1), (6, 5), (2, 6)]));
+
+        let mut doc = document_with_symmetry(8, Symmetry::Radial(2));
+        draw(&mut doc, settings(|s| s.symmetric = true), &[(1, 2)]);
+        assert_eq!(painted(&doc), sorted(vec![(1, 2), (6, 5)]));
+    }
+
+    /// How many groups of touching pixels there are.
+    fn components(pixels: &[(i32, i32)]) -> usize {
+        let mut left: Vec<(i32, i32)> = pixels.to_vec();
+        let mut count = 0;
+        while let Some(start) = left.pop() {
+            count += 1;
+            let mut stack = vec![start];
+            while let Some((x, y)) = stack.pop() {
+                let (near, far): (Vec<_>, Vec<_>) = left
+                    .iter()
+                    .partition(|&&(ox, oy)| (ox - x).abs() <= 1 && (oy - y).abs() <= 1);
+                left = far;
+                stack.extend(near);
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn radial_symmetry_at_other_angles_leaves_no_gaps() {
+        for count in [3, 5, 6, 7] {
+            let mut doc = document_with_symmetry(64, Symmetry::Radial(count));
+            // Well away from the centre, so the copies do not run into each other.
+            let path = [(40, 8), (47, 9), (52, 14), (50, 20)];
+            draw(&mut doc, settings(|s| s.symmetric = true), &path);
+            let pixels = painted(&doc);
+            assert_eq!(components(&pixels), usize::from(count), "{count}");
+            // Each copy has about as many pixels as the original line.
+            let per_copy = pixels.len() / usize::from(count);
+            assert!((16..=26).contains(&per_copy), "{count}: {per_copy}");
+        }
+    }
+
+    #[test]
+    fn symmetry_images_stay_in_step_with_the_copy_count() {
+        let p = Point::new(3, 9);
+        for symmetry in [
+            Symmetry::Off,
+            Symmetry::Horizontal,
+            Symmetry::Vertical,
+            Symmetry::Both,
+            Symmetry::Radial(4),
+            Symmetry::Radial(7),
+        ] {
+            assert_eq!(symmetry.image(0, p, 20, 20), p);
+            let mut images: Vec<(i32, i32)> = (0..symmetry.copies())
+                .map(|copy| symmetry.image(copy, p, 20, 20))
+                .map(|p| (p.x, p.y))
+                .collect();
+            images.sort_unstable();
+            images.dedup();
+            assert_eq!(images.len(), symmetry.copies(), "{symmetry:?}");
+        }
+        assert!(Symmetry::Both.is_exact() && Symmetry::Radial(4).is_exact());
+        assert!(!Symmetry::Radial(3).is_exact());
+    }
+
+    #[test]
+    fn tiled_strokes_wrap_around_the_canvas() {
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        draw(&mut doc, settings(|s| s.tiled = true), &[(6, 3), (10, 3)]);
+        assert_eq!(painted(&doc), [(0, 3), (1, 3), (2, 3), (6, 3), (7, 3)]);
+
+        // A brush stamped on the corner shows up in all four corners.
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        let brush = Brush::new(BrushShape::Square, 2);
+        draw(
+            &mut doc,
+            settings(|s| {
+                s.tiled = true;
+                s.brush = brush;
+            }),
+            &[(0, 0)],
+        );
+        assert_eq!(painted(&doc), [(0, 0), (7, 0), (0, 7), (7, 7)]);
+
+        // Without it, the same strokes are cut off at the edge.
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        draw(&mut doc, settings(|_| {}), &[(6, 3), (10, 3)]);
+        assert_eq!(painted(&doc), [(6, 3), (7, 3)]);
+    }
+
+    fn two_pixel_brush() -> Brush {
+        let mut image = Image::new(4, 4);
+        image.set(1, 1, RED);
+        image.set(2, 2, BLUE);
+        Brush::custom(&image).unwrap()
+    }
+
+    #[test]
+    fn a_custom_brush_is_cropped_and_centred() {
+        let brush = two_pixel_brush();
+        assert!(brush.is_custom());
+        assert_eq!(brush.size(), 2);
+        assert_eq!(brush.bounds_at(Point::new(4, 4)), Rect::new(3, 3, 2, 2));
+        assert_eq!(brush.footprint(), [Point::new(-1, -1), Point::new(0, 0)]);
+
+        assert_eq!(Brush::custom(&Image::new(4, 4)), None);
+        let too_large = Image::from_pixels(65, 1, vec![RED; 65]).unwrap();
+        assert_eq!(Brush::custom(&too_large), None);
+
+        // Changing the size does nothing to a custom brush; picking a shape makes it plain.
+        let mut brush = brush;
+        brush.set_size(9);
+        assert_eq!(brush.size(), 2);
+        brush.set_shape(BrushShape::Round);
+        assert!(!brush.is_custom());
+        brush.set_size(9);
+        assert_eq!(brush.size(), 9);
+    }
+
+    #[test]
+    fn a_custom_brush_stamps_its_own_colours_with_a_plain_ink() {
+        let green = Rgba8::rgb(0, 255, 0);
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        draw(
+            &mut doc,
+            settings(|s| {
+                s.brush = two_pixel_brush();
+                s.ink = Ink::Simple(green);
+            }),
+            &[(4, 4)],
+        );
+        assert_eq!(doc.sprite().pixel(L1, 0, 3, 3), RED);
+        assert_eq!(doc.sprite().pixel(L1, 0, 4, 4), BLUE);
+        assert_eq!(painted(&doc).len(), 2);
+
+        // Other inks only use its shape.
+        draw(
+            &mut doc,
+            settings(|s| {
+                s.brush = two_pixel_brush();
+                s.ink = Ink::Dither {
+                    first: green,
+                    second: Rgba8::WHITE,
+                    pattern: Pattern::Checker,
+                    density: 50,
+                };
+            }),
+            &[(4, 4)],
+        );
+        assert_eq!(doc.sprite().pixel(L1, 0, 3, 3), green);
+        assert_eq!(doc.sprite().pixel(L1, 0, 4, 4), green);
+        draw(
+            &mut doc,
+            settings(|s| {
+                s.brush = two_pixel_brush();
+                s.ink = Ink::Erase;
+            }),
+            &[(4, 4)],
+        );
+        assert!(painted(&doc).is_empty());
+    }
+
+    #[test]
+    fn dither_ink_lays_two_colours_in_a_pattern() {
+        let ink = |pattern, density| Ink::Dither {
+            first: RED,
+            second: BLUE,
+            pattern,
+            density,
+        };
+        assert_eq!(ink(Pattern::Checker, 0).apply(Rgba8::WHITE, 0, 0), RED);
+        assert_eq!(ink(Pattern::Checker, 0).apply(Rgba8::WHITE, 1, 0), BLUE);
+        assert_eq!(ink(Pattern::Bayer4, 0).apply(Rgba8::WHITE, 0, 0), BLUE);
+        assert_eq!(ink(Pattern::Bayer4, 100).apply(Rgba8::WHITE, 3, 1), RED);
+
+        let mut doc = Document::new(Sprite::new(8, 8).unwrap());
+        draw(
+            &mut doc,
+            settings(|s| {
+                s.brush = Brush::new(BrushShape::Square, 4);
+                s.ink = ink(Pattern::Bayer2, 50);
+            }),
+            &[(2, 2), (5, 2)],
+        );
+        for y in 0..4 {
+            for x in 0..7 {
+                let expected = if (x + y) % 2 == 0 { RED } else { BLUE };
+                assert_eq!(doc.sprite().pixel(L1, 0, x, y), expected, "({x}, {y})");
+            }
+        }
+
+        // A transparent second colour leaves holes rather than painting nothing.
+        let holes = Ink::Dither {
+            first: RED,
+            second: Rgba8::new(1, 2, 3, 0),
+            pattern: Pattern::Checker,
+            density: 50,
+        };
+        assert_eq!(holes.apply(BLUE, 1, 0), Rgba8::TRANSPARENT);
+    }
+
+    #[test]
+    fn shade_ink_steps_along_a_ramp_once_per_stroke() {
+        let (dark, mid, light) = (
+            Rgba8::rgb(60, 0, 0),
+            Rgba8::rgb(150, 0, 0),
+            Rgba8::rgb(250, 0, 0),
+        );
+        let ramps: Arc<[Ramp]> = vec![vec![BLUE, Rgba8::WHITE], vec![dark, mid, light]].into();
+        let shade = |step| Ink::Shade {
+            ramps: ramps.clone(),
+            step,
+        };
+        assert_eq!(shade(1).apply(dark, 0, 0), mid);
+        assert_eq!(shade(1).apply(light, 0, 0), light);
+        assert_eq!(shade(-1).apply(mid, 0, 0), dark);
+        assert_eq!(shade(-1).apply(dark, 0, 0), dark);
+        assert_eq!(shade(2).apply(dark, 0, 0), light);
+        assert_eq!(shade(1).apply(BLUE, 0, 0), Rgba8::WHITE);
+        // Colours in no ramp, and empty pixels, are left alone.
+        assert_eq!(shade(1).apply(RED, 0, 0), RED);
+        assert_eq!(shade(1).apply(Rgba8::TRANSPARENT, 0, 0), Rgba8::TRANSPARENT);
+
+        let mut doc = Document::new(Sprite::new(8, 1).unwrap());
+        let row = Image::from_pixels(4, 1, vec![dark, mid, light, RED]).unwrap();
+        doc.transact("Paint", |tx| {
+            tx.set_pixels(L1, 0, Rect::new(0, 0, 4, 1), &row)
+        })
+        .unwrap();
+        // Back and forth over the same pixels: each still moves one step only.
+        draw(
+            &mut doc,
+            settings(|s| s.ink = shade(1)),
+            &[(0, 0), (7, 0), (0, 0), (7, 0)],
+        );
+        let after: Vec<Rgba8> = (0..5).map(|x| doc.sprite().pixel(L1, 0, x, 0)).collect();
+        assert_eq!(after, [mid, light, light, RED, Rgba8::TRANSPARENT]);
+        assert_eq!(doc.history().len(), 2);
+    }
+
+    #[test]
+    fn shapes_are_mirrored_too() {
+        let mut doc = document_with_symmetry(8, Symmetry::Horizontal);
+        let mut s = stroke_with(&doc, settings(|s| s.symmetric = true));
+        s.stamp_line(doc.sprite(), Point::new(0, 0), Point::new(2, 2));
+        s.fill(doc.sprite(), 1, 6);
+        s.commit(&mut doc, "Shape").unwrap();
+        assert_eq!(
+            painted(&doc),
+            [
+                (0, 0),
+                (7, 0),
+                (1, 1),
+                (6, 1),
+                (2, 2),
+                (5, 2),
+                (1, 6),
+                (6, 6)
+            ]
+        );
     }
 }

@@ -661,7 +661,7 @@ mod tests {
         let group = active(&f);
         f.run_with("layer.select", on(L1));
         f.run_with("layer.set_locked", on(group));
-        assert!(message(&mut f).contains("is a group"));
+        assert!(message(&mut f).contains("is not an image layer"));
     }
 
     #[test]
@@ -694,7 +694,7 @@ mod tests {
         f.run("layer.new_group");
         let group = active(&f);
         f.run_with("layer.set_opacity", on(group).with("opacity", 10_i64));
-        assert!(message(&mut f).contains("is a group"));
+        assert!(message(&mut f).contains("is not an image layer"));
     }
 
     #[test]

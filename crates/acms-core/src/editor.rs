@@ -207,8 +207,8 @@ impl Editor {
             document,
             primary: &mut self.primary,
             secondary: &mut self.secondary,
-            brush: self.brush,
-            options: self.options,
+            brush: self.brush.clone(),
+            options: self.options.clone(),
         };
         action(self.tools[self.active_tool].as_mut(), &mut ctx);
     }
@@ -548,5 +548,220 @@ mod tests {
         let before = editor.generation();
         editor.set_document(Some(Document::new(Sprite::new(4, 4).unwrap())));
         assert_ne!(editor.generation(), before);
+    }
+    /// The painted pixels of the first layer, sorted.
+    fn painted(editor: &Editor) -> Vec<(i32, i32)> {
+        let sprite = editor.document().unwrap().sprite();
+        let bounds = sprite.bounds();
+        let mut pixels = Vec::new();
+        for y in 0..bounds.h as i32 {
+            for x in 0..bounds.w as i32 {
+                if sprite.pixel(L1, 0, x, y).a != 0 {
+                    pixels.push((x, y));
+                }
+            }
+        }
+        pixels
+    }
+
+    /// For tests that already have a variable called editor.
+    fn new_editor() -> Editor {
+        editor()
+    }
+
+    fn large_editor(size: u32) -> Editor {
+        let mut editor = Editor::new();
+        editor.add_document(Document::new(Sprite::new(size, size).unwrap()));
+        editor.primary = RED;
+        editor.secondary = GREEN;
+        editor
+    }
+
+    /// The "done when" of Phase 4: symmetry, the pixel-perfect filter and the dither ink in
+    /// one pencil stroke.
+    #[test]
+    fn symmetry_pixel_perfect_and_dither_work_together_in_one_stroke() {
+        use crate::pattern::Pattern;
+        use crate::sprite::Symmetry;
+        use crate::tool::InkKind;
+
+        const SIZE: i32 = 32;
+        // Down and to the right all the way, with a step at every joint.
+        let path = [
+            (2, 2),
+            (3, 2),
+            (3, 3),
+            (6, 3),
+            (6, 4),
+            (9, 9),
+            (12, 9),
+            (12, 10),
+            (14, 14),
+        ];
+
+        let mut editor = large_editor(SIZE as u32);
+        let before = editor.document().unwrap().sprite().clone();
+        editor.document_mut().unwrap().set_symmetry(Symmetry::Both);
+        let with_setting = editor.document().unwrap().sprite().clone();
+        editor.options.pixel_perfect = true;
+        editor.options.ink = InkKind::Dither;
+        editor.options.pattern = Pattern::Checker;
+        drag(&mut editor, PointerButton::Primary, &path);
+
+        let pixels = painted(&editor);
+        let has = |x: i32, y: i32| pixels.contains(&(x, y));
+
+        // Symmetry: every pixel has its three mirror images.
+        assert!(!pixels.is_empty());
+        for &(x, y) in &pixels {
+            assert!(has(SIZE - 1 - x, y), "({x}, {y}) has no left-right image");
+            assert!(has(x, SIZE - 1 - y), "({x}, {y}) has no top-bottom image");
+        }
+        let quadrant: Vec<(i32, i32)> = pixels
+            .iter()
+            .copied()
+            .filter(|&(x, y)| x < SIZE / 2 && y < SIZE / 2)
+            .collect();
+        assert_eq!(pixels.len(), quadrant.len() * 4);
+
+        // Pixel-perfect: the line still joins both ends without a break, but no pixel is the
+        // corner of an L.
+        assert!(has(2, 2) && has(14, 14));
+        for &(x, y) in &quadrant {
+            let beside = has(x - 1, y) || has(x + 1, y);
+            let above_or_below = has(x, y - 1) || has(x, y + 1);
+            assert!(!(beside && above_or_below), "({x}, {y}) is a corner");
+        }
+        for &(x, y) in &quadrant {
+            let neighbours = quadrant
+                .iter()
+                .filter(|&&(ox, oy)| {
+                    (ox, oy) != (x, y) && (ox - x).abs() <= 1 && (oy - y).abs() <= 1
+                })
+                .count();
+            let is_end = (x, y) == (2, 2) || (x, y) == (14, 14);
+            assert_eq!(neighbours, if is_end { 1 } else { 2 }, "({x}, {y})");
+        }
+        // Dither: both colours, laid out by the pattern at each pixel's own position.
+        let sprite = editor.document().unwrap().sprite();
+        for &(x, y) in &pixels {
+            let expected = if (x + y) % 2 == 0 { RED } else { GREEN };
+            assert_eq!(sprite.pixel(L1, 0, x, y), expected, "({x}, {y})");
+        }
+        let reds = pixels.iter().filter(|(x, y)| (x + y) % 2 == 0).count();
+        assert!(reds > 0 && reds < pixels.len());
+
+        // One stroke, one undo step.
+        let document = editor.document_mut().unwrap();
+        assert_eq!(document.history().collect::<Vec<_>>(), ["Pencil"]);
+        let after = document.sprite().clone();
+        document.undo();
+        assert_eq!(*document.sprite(), with_setting);
+        assert_ne!(*document.sprite(), before);
+        document.redo();
+        assert_eq!(*document.sprite(), after);
+
+        // Without the filter the same stroke keeps its corners.
+        let mut plain = large_editor(SIZE as u32);
+        drag(&mut plain, PointerButton::Primary, &path);
+        assert!(painted(&plain).len() > quadrant.len());
+    }
+
+    #[test]
+    fn the_inks_follow_the_button_that_draws() {
+        use crate::pattern::Pattern;
+        use crate::sprite::Palette;
+        use crate::tool::InkKind;
+
+        // Dither: the two colours swap roles for the secondary button.
+        let mut editor = editor();
+        editor.options.ink = InkKind::Dither;
+        editor.options.pattern = Pattern::Checker;
+        drag(&mut editor, PointerButton::Primary, &[(0, 0), (3, 0)]);
+        drag(&mut editor, PointerButton::Secondary, &[(0, 1), (3, 1)]);
+        let row =
+            |editor: &Editor, y| -> Vec<Rgba8> { (0..4).map(|x| pixel(editor, x, y)).collect() };
+        assert_eq!(row(&editor, 0), [RED, GREEN, RED, GREEN]);
+        assert_eq!(row(&editor, 1), [RED, GREEN, RED, GREEN]);
+
+        // Shade: forwards along the sprite's ramp with one button, back with the other.
+        let blue = Rgba8::rgb(0, 0, 255);
+        let mut editor = editor_with_ramp(vec![RED, GREEN, blue]);
+        editor.options.ink = InkKind::Simple;
+        editor.primary = GREEN;
+        drag(&mut editor, PointerButton::Primary, &[(0, 0), (3, 0)]);
+        editor.options.ink = InkKind::Shade;
+        drag(&mut editor, PointerButton::Primary, &[(0, 0), (1, 0)]);
+        drag(&mut editor, PointerButton::Secondary, &[(3, 0)]);
+        assert_eq!(row(&editor, 0), [blue, blue, GREEN, RED]);
+        // Where there is nothing to shade, nothing happens.
+        let steps = editor.document().unwrap().history().len();
+        drag(&mut editor, PointerButton::Primary, &[(0, 5), (9, 5)]);
+        assert_eq!(editor.document().unwrap().history().len(), steps);
+
+        fn editor_with_ramp(ramp: Vec<Rgba8>) -> Editor {
+            let mut editor = new_editor();
+            let palette = Palette::from_colors(ramp.clone()).with_ramps(vec![ramp]);
+            editor
+                .document_mut()
+                .unwrap()
+                .transact("Palette", |tx| {
+                    tx.set_palette(palette);
+                    Ok::<_, SpriteError>(())
+                })
+                .unwrap();
+            editor
+        }
+    }
+
+    #[test]
+    fn symmetry_applies_to_drawing_tools_but_not_to_fills() {
+        use crate::sprite::Symmetry;
+
+        let mut editor = editor();
+        editor
+            .document_mut()
+            .unwrap()
+            .set_symmetry(Symmetry::Horizontal);
+
+        assert!(editor.set_active_tool("line"));
+        drag(&mut editor, PointerButton::Primary, &[(1, 1), (3, 1)]);
+        assert_eq!(
+            painted(&editor),
+            [(1, 1), (2, 1), (3, 1), (12, 1), (13, 1), (14, 1)]
+        );
+        assert!(editor.set_active_tool("eraser"));
+        drag(&mut editor, PointerButton::Primary, &[(1, 1)]);
+        assert_eq!(painted(&editor), [(2, 1), (3, 1), (12, 1), (13, 1)]);
+
+        // The bucket fills the area clicked, once.
+        assert!(editor.set_active_tool("bucket"));
+        drag(&mut editor, PointerButton::Primary, &[(2, 1)]);
+        assert_eq!(pixel(&editor, 2, 1), RED);
+        editor.primary = GREEN;
+        drag(&mut editor, PointerButton::Primary, &[(2, 1)]);
+        assert_eq!(pixel(&editor, 3, 1), GREEN);
+        assert_eq!(pixel(&editor, 12, 1), RED);
+    }
+
+    #[test]
+    fn tiled_mode_and_custom_brushes_reach_the_tools() {
+        use crate::image::Image;
+
+        let mut editor = editor();
+        editor.options.tiled = true;
+        drag(&mut editor, PointerButton::Primary, &[(14, 2), (17, 2)]);
+        assert_eq!(painted(&editor), [(0, 2), (1, 2), (14, 2), (15, 2)]);
+
+        let mut editor = new_editor();
+        let mut image = Image::new(3, 1);
+        image.set(0, 0, GREEN);
+        image.set(2, 0, RED);
+        editor.brush = Brush::custom(&image).unwrap();
+        editor.primary = Rgba8::BLACK;
+        drag(&mut editor, PointerButton::Primary, &[(5, 5)]);
+        assert_eq!(pixel(&editor, 4, 5), GREEN);
+        assert_eq!(pixel(&editor, 5, 5), Rgba8::TRANSPARENT);
+        assert_eq!(pixel(&editor, 6, 5), RED);
     }
 }

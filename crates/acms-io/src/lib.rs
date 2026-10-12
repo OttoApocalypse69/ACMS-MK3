@@ -1,6 +1,7 @@
 //! ACMS IO: the `.acms` project format and import/export.
 
 pub mod acms;
+pub mod palette;
 pub mod png;
 
 use std::fs::File;
@@ -29,6 +30,8 @@ pub enum IoError {
     TooNew { found: u64, supported: u32 },
     #[error("the file is damaged: {0}")]
     Invalid(String),
+    #[error("{0}")]
+    Unsupported(String),
     #[error("the file does not describe a valid sprite: {0}")]
     Sprite(#[from] SpriteError),
 }

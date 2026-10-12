@@ -10,7 +10,8 @@ use crate::image::Image;
 use crate::selection::{Combine, Mask};
 use crate::stroke::{Ink, Stroke, StrokeBuffer};
 use crate::tool::{
-    CursorHint, Modifiers, OptionKind, Outline, PointerButton, PointerEvent, Tool, ToolContext,
+    CursorHint, Modifiers, OptionKind, Outline, PointerButton, PointerEvent, StrokeKind, Tool,
+    ToolContext, begin_stroke, ink_for,
 };
 
 /// The rectangle with `a` and `b` as opposite corner pixels, both included.
@@ -39,25 +40,9 @@ fn in_ellipse(bounds: Rect, x: i32, y: i32) -> bool {
     bounds.contains(Point::new(x, y)) && (dx * dx) / (rx * rx) + (dy * dy) / (ry * ry) <= 1.0
 }
 
-fn ink_for(ctx: &ToolContext<'_>, button: PointerButton) -> Ink {
-    match button {
-        PointerButton::Primary => Ink::Simple(*ctx.primary),
-        PointerButton::Secondary => Ink::Simple(*ctx.secondary),
-    }
-}
-
-/// Starts a stroke on the selected layer. `None` if it cannot be drawn on.
+/// Starts a stroke that fills or moves pixels as they are: no symmetry, no filter.
 fn begin(ctx: &ToolContext<'_>, ink: Ink, buffer: StrokeBuffer) -> Option<Stroke> {
-    let document = &*ctx.document;
-    Stroke::begin(
-        document.sprite(),
-        document.active_layer(),
-        document.active_frame(),
-        ctx.brush,
-        ink,
-        buffer,
-    )
-    .ok()
+    begin_stroke(ctx, ink, StrokeKind::Plain, buffer)
 }
 
 fn overlay_of(stroke: Option<&Stroke>) -> Option<Overlay<'_>> {
@@ -178,7 +163,8 @@ impl Tool for ShapeTool {
     fn pointer_down(&mut self, ctx: &mut ToolContext<'_>, event: PointerEvent) {
         self.cancel(ctx);
         let ink = ink_for(ctx, event.button);
-        self.stroke = begin(ctx, ink, std::mem::take(&mut self.spare));
+        let buffer = std::mem::take(&mut self.spare);
+        self.stroke = begin_stroke(ctx, ink, StrokeKind::Shape, buffer);
         self.start = event.position;
         self.redraw(ctx, event);
     }
@@ -216,8 +202,13 @@ impl Tool for ShapeTool {
 
     fn options(&self) -> &'static [OptionKind] {
         match self.shape {
-            Shape::Line => &[OptionKind::Brush],
-            _ => &[OptionKind::Brush, OptionKind::ShapeFill],
+            Shape::Line => &[OptionKind::Brush, OptionKind::Ink, OptionKind::Symmetry],
+            _ => &[
+                OptionKind::Brush,
+                OptionKind::ShapeFill,
+                OptionKind::Ink,
+                OptionKind::Symmetry,
+            ],
         }
     }
 }
@@ -245,7 +236,7 @@ impl Tool for BucketTool {
         let sprite = ctx.document.sprite();
         // The area is found on the layer being filled, as it is before the fill.
         let layer = sprite.read_region(stroke.layer(), stroke.frame(), sprite.bounds());
-        let options = ctx.options;
+        let options = ctx.options.clone();
         let area = Mask::similar(
             &layer,
             event.position,
@@ -325,7 +316,7 @@ impl GradientTool {
                     0.0
                 };
                 let color = gradient_color(from, to, t, x, y, ctx.options.gradient_dither);
-                stroke.plot(sprite, x, y, Ink::Simple(color));
+                stroke.plot(sprite, x, y, &Ink::Simple(color));
             }
         }
         let after = stroke.buffer().bounds();
@@ -477,7 +468,7 @@ impl Tool for SelectTool {
             document.active_frame(),
             sprite.bounds(),
         );
-        let options = ctx.options;
+        let options = ctx.options.clone();
         let area = Mask::similar(
             &layer,
             event.position,

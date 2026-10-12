@@ -229,8 +229,8 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
         ui.label(RichText::new("This tool has no options.").weak());
         return;
     }
-    let brush = state.editor.brush;
-    let options = state.editor.options;
+    let brush = state.editor.brush.clone();
+    let options = state.editor.options.clone();
     // A checkbox that runs a command with its new value.
     let toggle = |ui: &mut Ui, state: &mut AppState, on: bool, label: &str, id: &str, arg: &str| {
         let mut value = on;
@@ -257,7 +257,7 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                         (BrushShape::Square, "Square", "square"),
                     ];
                     for (shape, label, value) in shapes {
-                        if ui.selectable_label(brush.shape == shape, label).clicked() {
+                        if ui.selectable_label(brush.shape() == shape, label).clicked() {
                             let params = Params::new().with("shape", value);
                             commands::run(registry, state, "brush.set_shape", &params);
                         }
@@ -292,6 +292,8 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                 toggle(ui, state, on, "Dithered", "tool.set_dither", "dither");
                 ui.label(RichText::new("From the primary to the secondary colour.").weak());
             }
+            // Their controls come with the rest of the Phase 4 interface.
+            OptionKind::Ink | OptionKind::PixelPerfect | OptionKind::Symmetry => {}
             OptionKind::SelectionMode => {
                 ui.label(RichText::new("Shift adds, Alt subtracts, both intersect.").weak());
             }

@@ -5,6 +5,7 @@
 //! ```text
 //! manifest.json     format version and the structure of the sprite
 //! cels/<id>.png     the pixels of each cel
+//! refs/<id>.png     the picture of each reference layer
 //! thumb.png         the first frame, flattened, for file browsers
 //! ```
 
@@ -14,10 +15,11 @@ use std::path::Path;
 
 use acms_core::color::Rgba8;
 use acms_core::compositor;
-use acms_core::geom::Point;
+use acms_core::geom::{Point, Rect};
+use acms_core::image::Image;
 use acms_core::sprite::{
     BlendMode, CelSource, Frame, GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Palette,
-    PaletteEntry, Sprite,
+    PaletteEntry, ReferenceLayer, Sprite, Symmetry,
 };
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
@@ -32,7 +34,9 @@ use crate::{IoError, write_atomically};
 /// - **1**: a flat list of image layers with an id and a name.
 /// - **2**: layers have visibility, opacity, blend mode, lock and alpha lock, and can be
 ///   groups with children.
-pub const FORMAT_VERSION: u32 = 2;
+/// - **3**: the palette has ramps, the sprite has a symmetry setting, and there are reference
+///   layers, whose pictures are stored under `refs/`.
+pub const FORMAT_VERSION: u32 = 3;
 
 const MANIFEST: &str = "manifest.json";
 const THUMBNAIL: &str = "thumb.png";
@@ -41,12 +45,19 @@ fn cel_path(image: u32) -> String {
     format!("cels/{image}.png")
 }
 
+fn reference_path(image: u32) -> String {
+    format!("refs/{image}.png")
+}
+
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     format_version: u32,
     width: u32,
     height: u32,
     palette: Vec<PaletteEntryData>,
+    /// Each ramp is a list of colours, written like the palette's.
+    ramps: Vec<Vec<String>>,
+    symmetry: SymmetryData,
     /// Bottom to top.
     layers: Vec<LayerData>,
     frames: Vec<FrameData>,
@@ -59,6 +70,15 @@ struct PaletteEntryData {
     color: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SymmetryData {
+    /// One of [`Symmetry::id`].
+    mode: String,
+    /// How many copies a radial symmetry makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    count: Option<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,12 +103,42 @@ enum LayerData {
         /// Bottom to top.
         children: Vec<LayerData>,
     },
+    Reference {
+        id: u32,
+        name: String,
+        visible: bool,
+        /// 0 to 255.
+        opacity: u8,
+        /// The canvas area the picture is stretched over.
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        /// The picture is stored as `refs/<image>.png`.
+        image: u32,
+    },
 }
 
 impl LayerData {
-    fn from_layer(layer: &Layer) -> Self {
+    /// `pictures` collects the reference pictures met on the way; each is stored under its
+    /// position in that list, counted from 1.
+    fn from_layer<'a>(layer: &'a Layer, pictures: &mut Vec<&'a Image>) -> Self {
         let (id, name, visible) = (layer.id.0, layer.name.clone(), layer.visible);
         match &layer.kind {
+            LayerKind::Reference(reference) => {
+                pictures.push(&reference.image);
+                Self::Reference {
+                    id,
+                    name,
+                    visible,
+                    opacity: reference.opacity,
+                    x: reference.rect.x,
+                    y: reference.rect.y,
+                    width: reference.rect.w,
+                    height: reference.rect.h,
+                    image: pictures.len() as u32,
+                }
+            }
             LayerKind::Image(image) => Self::Image {
                 id,
                 name,
@@ -103,13 +153,41 @@ impl LayerData {
                 name,
                 visible,
                 collapsed: group.collapsed,
-                children: group.children.iter().map(Self::from_layer).collect(),
+                children: group
+                    .children
+                    .iter()
+                    .map(|child| Self::from_layer(child, pictures))
+                    .collect(),
             },
         }
     }
 
-    fn into_layer(self) -> Result<Layer, IoError> {
+    /// `picture` loads the reference picture stored under a number.
+    fn into_layer(
+        self,
+        picture: &mut impl FnMut(u32) -> Result<Image, IoError>,
+    ) -> Result<Layer, IoError> {
         Ok(match self {
+            Self::Reference {
+                id,
+                name,
+                visible,
+                opacity,
+                x,
+                y,
+                width,
+                height,
+                image,
+            } => Layer {
+                id: LayerId(id),
+                name,
+                visible,
+                kind: LayerKind::Reference(ReferenceLayer {
+                    opacity,
+                    image: std::sync::Arc::new(picture(image)?),
+                    rect: Rect::new(x, y, width, height),
+                }),
+            },
             Self::Image {
                 id,
                 name,
@@ -142,7 +220,7 @@ impl LayerData {
             } => {
                 let children = children
                     .into_iter()
-                    .map(Self::into_layer)
+                    .map(|child| child.into_layer(picture))
                     .collect::<Result<_, _>>()?;
                 Layer {
                     id: LayerId(id),
@@ -182,6 +260,14 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
     let layer_order = |id: LayerId| painted.iter().position(|&layer| layer == id);
     cels.sort_by_key(|&(layer, frame, _)| (layer_order(layer), frame));
 
+    let mut pictures = Vec::new();
+    let layers = sprite
+        .layers()
+        .iter()
+        .map(|layer| LayerData::from_layer(layer, &mut pictures))
+        .collect();
+    let symmetry = sprite.symmetry();
+
     let manifest = Manifest {
         format_version: FORMAT_VERSION,
         width: sprite.width(),
@@ -195,7 +281,20 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
                 name: entry.name.clone(),
             })
             .collect(),
-        layers: sprite.layers().iter().map(LayerData::from_layer).collect(),
+        ramps: sprite
+            .palette()
+            .ramps()
+            .iter()
+            .map(|ramp| ramp.iter().map(|color| color.to_hex()).collect())
+            .collect(),
+        symmetry: SymmetryData {
+            mode: symmetry.id().to_owned(),
+            count: match symmetry {
+                Symmetry::Radial(count) => Some(count),
+                _ => None,
+            },
+        },
+        layers,
         frames: sprite
             .frames()
             .iter()
@@ -228,6 +327,10 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
         zip.start_file(cel_path(id), image)?;
         encode_png(cel.image(), &mut zip)?;
     }
+    for (picture, id) in pictures.into_iter().zip(1..) {
+        zip.start_file(reference_path(id), image)?;
+        encode_png(picture, &mut zip)?;
+    }
 
     zip.start_file(THUMBNAIL, image)?;
     encode_png(&compositor::compose(sprite, 0), &mut zip)?;
@@ -253,7 +356,17 @@ fn migrate(mut manifest: serde_json::Value, version: u64) -> Result<serde_json::
     if version == 1 {
         upgrade_1_to_2(&mut manifest);
     }
+    if version <= 2 {
+        upgrade_2_to_3(&mut manifest);
+    }
     Ok(manifest)
+}
+
+/// Version 2 had neither ramps nor a symmetry setting: none, and off.
+fn upgrade_2_to_3(manifest: &mut serde_json::Value) {
+    manifest["ramps"] = serde_json::json!([]);
+    manifest["symmetry"] = serde_json::json!({ "mode": Symmetry::Off.id() });
+    manifest["format_version"] = 3.into();
 }
 
 /// Version 1 only knew plain image layers. In version 2 terms they are all visible, fully
@@ -293,23 +406,35 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
         .ok_or_else(|| IoError::Invalid("the manifest has no format version".to_owned()))?;
     let manifest: Manifest = serde_json::from_value(migrate(manifest, version)?)?;
 
+    let color = |text: &str| {
+        Rgba8::from_hex(text).ok_or_else(|| IoError::Invalid(format!("`{text}` is not a colour")))
+    };
     let palette = manifest
         .palette
         .into_iter()
         .map(|entry| {
-            let color = Rgba8::from_hex(&entry.color)
-                .ok_or_else(|| IoError::Invalid(format!("`{}` is not a colour", entry.color)))?;
             Ok(PaletteEntry {
-                color,
+                color: color(&entry.color)?,
                 name: entry.name,
             })
         })
         .collect::<Result<Vec<_>, IoError>>()?;
+    let ramps = manifest
+        .ramps
+        .iter()
+        .map(|ramp| ramp.iter().map(|text| color(text)).collect())
+        .collect::<Result<Vec<_>, IoError>>()?;
+    let symmetry = Symmetry::from_id(
+        &manifest.symmetry.mode,
+        manifest.symmetry.count.unwrap_or(0),
+    )
+    .ok_or_else(|| IoError::Invalid(format!("`{}` is not a symmetry", manifest.symmetry.mode)))?;
 
+    let mut picture = |id: u32| decode_png(&read_entry(&mut zip, &reference_path(id))?);
     let layers = manifest
         .layers
         .into_iter()
-        .map(LayerData::into_layer)
+        .map(|layer| layer.into_layer(&mut picture))
         .collect::<Result<Vec<_>, IoError>>()?;
 
     let frames = manifest
@@ -334,14 +459,15 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
         })
         .collect::<Result<Vec<_>, IoError>>()?;
 
-    Ok(Sprite::from_parts(
+    let sprite = Sprite::from_parts(
         manifest.width,
         manifest.height,
-        Palette::new(palette),
+        Palette::new(palette).with_ramps(ramps),
         layers,
         frames,
         cels,
-    )?)
+    )?;
+    Ok(sprite.with_symmetry(symmetry))
 }
 
 /// Saves a sprite to a file. An existing file is replaced only once the new one is complete.
@@ -456,7 +582,7 @@ mod tests {
         assert_eq!(sprite.palette().entries()[1].name.as_deref(), Some("glass"));
 
         // Saving writes the current version.
-        assert_eq!(manifest_json(&sprite)["format_version"], 2);
+        assert_eq!(manifest_json(&sprite)["format_version"], 3);
     }
 
     #[test]
@@ -501,7 +627,7 @@ mod tests {
         assert_eq!(names, ["cels/1.png", "manifest.json", "thumb.png"]);
 
         let manifest = manifest_json(&sprite);
-        assert_eq!(manifest["format_version"], 2);
+        assert_eq!(manifest["format_version"], 3);
         assert_eq!(manifest["width"], 24);
         assert_eq!(manifest["layers"][0]["kind"], "image");
         assert_eq!(manifest["layers"][0]["opacity"], 255);
@@ -524,7 +650,7 @@ mod tests {
             err,
             IoError::TooNew {
                 found: 99,
-                supported: 2
+                supported: 3
             }
         ));
         assert!(err.to_string().contains("format version 99"));
@@ -642,5 +768,150 @@ mod tests {
     fn loading_a_missing_file_is_an_io_error() {
         let target = TempPath::new("missing.acms");
         assert!(matches!(load_acms(target.path()), Err(IoError::Io(_))));
+    }
+    /// The layered sprite with everything format version 3 added: ramps, a symmetry setting
+    /// and a reference layer inside the group.
+    fn phase_4_sprite() -> Sprite {
+        use acms_core::document::Document;
+        use acms_core::image::Image;
+        use acms_core::sprite::Slot;
+
+        let mut document = Document::new(layered_sprite());
+        let (red, blue) = (Rgba8::rgb(200, 30, 40), Rgba8::new(40, 90, 220, 128));
+        let mut picture = Image::new(6, 3);
+        picture.set(0, 0, red);
+        picture.set(5, 2, blue);
+        document
+            .transact("Setup", |tx| {
+                let palette = Palette::from_colors([red, blue, Rgba8::WHITE])
+                    .with_ramps(vec![vec![red, Rgba8::WHITE], vec![blue, red, Rgba8::WHITE]]);
+                tx.set_palette(palette);
+                let id =
+                    tx.add_reference_layer(Slot::new(Some(LayerId(10)), 1), "Sketch", picture)?;
+                tx.update_layer(id, |props| {
+                    if let Some(reference) = &mut props.reference {
+                        reference.opacity = 77;
+                    }
+                })
+            })
+            .unwrap();
+        document.set_symmetry(Symmetry::Radial(6));
+        document.sprite().clone()
+    }
+
+    #[test]
+    fn ramps_symmetry_and_reference_layers_round_trip() {
+        let sprite = phase_4_sprite();
+        let bytes = archive(&sprite);
+        let loaded = read_acms(Cursor::new(bytes.clone())).unwrap();
+        assert_eq!(loaded, sprite);
+
+        // Spot checks, in case both sides agreed on losing something.
+        assert_eq!(loaded.symmetry(), Symmetry::Radial(6));
+        assert_eq!(loaded.palette().ramps().len(), 2);
+        assert_eq!(loaded.palette().ramps()[1].len(), 3);
+        let reference = loaded.walk()[4].layer.as_reference().unwrap().clone();
+        assert_eq!(reference.opacity, 77);
+        assert_eq!(reference.rect, Rect::new(0, 2, 16, 8));
+        assert_eq!(reference.image.get(5, 2), Rgba8::new(40, 90, 220, 128));
+
+        let manifest = manifest_json(&sprite);
+        assert_eq!(manifest["symmetry"]["mode"], "radial");
+        assert_eq!(manifest["symmetry"]["count"], 6);
+        assert_eq!(manifest["ramps"][0][1], "#FFFFFF");
+        assert_eq!(manifest["layers"][2]["children"][1]["kind"], "reference");
+        assert_eq!(manifest["layers"][2]["children"][1]["image"], 1);
+
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        assert!(zip.by_name("refs/1.png").is_ok());
+        // The reference is not part of the picture, so not of the thumbnail either.
+        let thumb = decode_png(&read_entry(&mut zip, THUMBNAIL).unwrap()).unwrap();
+        assert_eq!(thumb, compositor::compose(&layered_sprite(), 0));
+    }
+
+    #[test]
+    fn symmetry_modes_round_trip() {
+        for symmetry in [
+            Symmetry::Off,
+            Symmetry::Horizontal,
+            Symmetry::Vertical,
+            Symmetry::Both,
+            Symmetry::Radial(3),
+        ] {
+            let sprite = Sprite::new(4, 4).unwrap().with_symmetry(symmetry);
+            let loaded = read_acms(Cursor::new(archive(&sprite))).unwrap();
+            assert_eq!(loaded.symmetry(), symmetry);
+        }
+    }
+
+    #[test]
+    fn a_version_2_file_is_upgraded_on_load() {
+        let sprite = layered_sprite();
+        let bytes = archive(&sprite);
+        // What the Phase 3 build wrote: the same manifest without the version 3 fields.
+        let mut manifest = manifest_json(&sprite);
+        let fields = manifest.as_object_mut().unwrap();
+        fields.remove("ramps");
+        fields.remove("symmetry");
+        fields.insert("format_version".to_owned(), 2.into());
+
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let cels: Vec<(String, Vec<u8>)> = (1..=4)
+            .map(|id| (cel_path(id), read_entry(&mut zip, &cel_path(id)).unwrap()))
+            .collect();
+        let manifest = manifest.to_string();
+        let mut files: Vec<(&str, &[u8])> = vec![(MANIFEST, manifest.as_bytes())];
+        files.extend(cels.iter().map(|(name, bytes)| (name.as_str(), &bytes[..])));
+
+        let loaded = read_acms(Cursor::new(archive_with(&files))).unwrap();
+        assert_eq!(loaded, sprite);
+        assert_eq!(loaded.symmetry(), Symmetry::Off);
+        assert!(loaded.palette().ramps().is_empty());
+    }
+
+    #[test]
+    fn a_file_saved_by_the_phase_3_build_still_opens() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/phase3-v2.acms");
+        assert_eq!(load_acms(&path).unwrap(), layered_sprite());
+    }
+
+    #[test]
+    fn damaged_version_3_parts_are_errors_not_panics() {
+        let sprite = phase_4_sprite();
+        let good = manifest_json(&sprite);
+        let mut zip = ZipArchive::new(Cursor::new(archive(&sprite))).unwrap();
+        let cels: Vec<(String, Vec<u8>)> = (1..=4)
+            .map(|id| (cel_path(id), read_entry(&mut zip, &cel_path(id)).unwrap()))
+            .collect();
+        let read = |manifest: &serde_json::Value, extra: &[(&str, &[u8])]| {
+            let manifest = manifest.to_string();
+            let mut files: Vec<(&str, &[u8])> = vec![(MANIFEST, manifest.as_bytes())];
+            files.extend(cels.iter().map(|(name, bytes)| (name.as_str(), &bytes[..])));
+            files.extend_from_slice(extra);
+            read_acms(Cursor::new(archive_with(&files)))
+        };
+
+        // The reference picture is missing, or is not a picture.
+        assert!(matches!(read(&good, &[]), Err(IoError::Invalid(_))));
+        assert!(matches!(
+            read(&good, &[("refs/1.png", b"not a png")]),
+            Err(IoError::PngDecode(_))
+        ));
+        let picture = read_entry(&mut zip, "refs/1.png").unwrap();
+        let with_picture: [(&str, &[u8]); 1] = [("refs/1.png", &picture)];
+        assert!(read(&good, &with_picture).is_ok());
+
+        let mut odd_symmetry = good.clone();
+        odd_symmetry["symmetry"]["mode"] = "kaleidoscope".into();
+        assert!(matches!(
+            read(&odd_symmetry, &with_picture),
+            Err(IoError::Invalid(_))
+        ));
+        let mut bad_ramp = good.clone();
+        bad_ramp["ramps"][0][0] = "reddish".into();
+        assert!(matches!(
+            read(&bad_ramp, &with_picture),
+            Err(IoError::Invalid(_))
+        ));
     }
 }

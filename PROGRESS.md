@@ -5,7 +5,31 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 ## Current state
 
 **Phases 0 to 4 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
-features). Next is Phase 5 (not started).
+features). **Phase 5 is in progress.**
+
+## Phase 5 task list
+
+Core:
+
+- [ ] Frames: add, duplicate, delete, move, per-frame duration; the active frame; all undoable
+- [ ] Cels: move and copy between frames and layers, clear; linked cels (drawing on one changes all of them)
+- [ ] Tags: name, range, direction (forward / reverse / ping-pong), colour; they follow frame changes
+- [ ] Playback: which frame is shown after a given time, for the whole sprite or one tag
+- [ ] Onion skin: previous / next frames as a tinted, faded picture
+
+IO:
+
+- [ ] `.acms` format version 4 (tags, linked cels) with a migration from version 3
+- [ ] Export: GIF; spritesheet (rows / columns / packed, padding, trim) with Aseprite-style JSON; PNG sequence
+- [ ] Round-trip tests: export → decode for GIF and spritesheets
+
+App:
+
+- [ ] Commands, shortcuts and menus for frames, cels, tags, playback, onion skin and the exports
+- [ ] Timeline panel: layers × frames grid, select several cels, drag to move / copy cels and frames, tags, playback controls
+- [ ] Preview panel: the sprite at a chosen scale, playing, with an optional 3 × 3 tiled mode
+- [ ] Canvas shows the active frame, with onion skin
+- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, directories 6, serde 1,
@@ -332,9 +356,9 @@ App (`acms-app`):
 - **Palette changes are undo steps**; replacing a colour and reducing to the palette skip locked
   layers rather than fail.
 - **`.acms` format version 3.** Version 1 and 2 files are upgraded when loaded.
-- **Added without being in the plan's list** (2026-10-12, to be confirmed): "Add Primary Colour
-  to Palette" and "Remove Selected Colours" — without them ramps could only be made from
-  imported or generated colours.
+- **Adding, removing and dragging palette colours** are part of Phase 4 (agreed 2026-10-12).
+  Dragging a swatch onto another moves it there; the selection is cleared, since it is made of
+  positions.
 
 ## Open questions
 
@@ -342,13 +366,12 @@ The four section 5 items without a phase were placed on 2026-10-11 and written i
 `PLAN.md`: menu bar and status bar → Phase 2, tabs for several sprites → Phase 3, Preview
 panel → Phase 5.
 
-Open since Phase 4:
+The three questions left by Phase 4 were settled on 2026-10-12 ("go with your suggestions") and
+written into `PLAN.md`: adding and removing palette colours stays; dragging a swatch to reorder
+the palette was added to Phase 4 and built (`palette.move_color`); section 4.1 now describes the
+reference layer as built.
 
-- **Palette grid with drag-reorder** (section 5) is in no phase. The palette can be sorted, and
-  colours added and removed, but not dragged into an order.
-- **Should `PLAN.md` 4.1 describe the reference layer as built** (picture and rectangle in the
-  layer, drawn by the view)? Not changed yet; see "Decisions".
-- **Keep "Add / Remove colour"?** They are not in the Phase 4 list of palette tools.
+None open.
 
 ## The keymap file
 

@@ -90,6 +90,17 @@ pub fn with_color(palette: &Palette, color: Rgba8) -> Palette {
     Palette::new(entries).with_ramps(palette.ramps().to_vec())
 }
 
+/// The palette with the entry at `from` moved so that it ends up at position `to`. Positions
+/// that do not exist leave the palette as it is.
+pub fn with_moved(palette: &Palette, from: usize, to: usize) -> Palette {
+    let mut entries = palette.entries().to_vec();
+    if from < entries.len() && to < entries.len() {
+        let entry = entries.remove(from);
+        entries.insert(to, entry);
+    }
+    Palette::new(entries).with_ramps(palette.ramps().to_vec())
+}
+
 /// The palette without the entries at `indices`. Ramps lose those colours too, and a ramp
 /// left with fewer than two colours goes.
 pub fn without_entries(palette: &Palette, indices: &[usize]) -> Palette {
@@ -283,6 +294,23 @@ mod tests {
         assert_eq!(colors(&smaller), [GREEN]);
         assert!(smaller.ramps().is_empty());
         assert_eq!(without_entries(&palette, &[9]), palette);
+    }
+
+    #[test]
+    fn moving_a_colour_keeps_the_others_in_order() {
+        let palette =
+            Palette::from_colors([RED, GREEN, BLUE, GREY]).with_ramps(vec![vec![RED, GREY]]);
+        assert_eq!(
+            colors(&with_moved(&palette, 0, 2)),
+            [GREEN, BLUE, RED, GREY]
+        );
+        assert_eq!(
+            colors(&with_moved(&palette, 3, 0)),
+            [GREY, RED, GREEN, BLUE]
+        );
+        assert_eq!(with_moved(&palette, 1, 1), palette);
+        assert_eq!(with_moved(&palette, 1, 9), palette);
+        assert_eq!(with_moved(&palette, 0, 3).ramps(), palette.ramps());
     }
 
     #[test]

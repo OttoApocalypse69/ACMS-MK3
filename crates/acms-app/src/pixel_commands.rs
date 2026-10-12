@@ -211,6 +211,21 @@ fn palette_add(state: &mut AppState, params: &Params) -> CommandResult {
     set_palette(state, "Add Colour", with)
 }
 
+fn palette_move(state: &mut AppState, params: &Params) -> CommandResult {
+    let position = |name| usize::try_from(params.int(name).unwrap_or(-1)).unwrap_or(usize::MAX);
+    let (from, to) = (position("from"), position("to"));
+    let palette = sprite(state)?.palette();
+    if from >= palette.len() || to >= palette.len() {
+        return Err(CommandError::failed(
+            "There is no such position in the palette.",
+        ));
+    }
+    let moved = palette::with_moved(palette, from, to);
+    set_palette(state, "Move Colour", moved)?;
+    state.swatch_selection.clear();
+    Ok(())
+}
+
 fn palette_remove(state: &mut AppState, params: &Params) -> CommandResult {
     let indices = indices(state, params)?;
     if indices.is_empty() {
@@ -472,6 +487,12 @@ pub fn register(registry: &mut CommandRegistry<AppState>) -> Result<(), CommandE
         )
         .optional_param("color", Color)
         .enabled_when(has_document),
+    )?;
+    registry.register(
+        Command::new("palette.move_color", "Move Palette Colour", palette_move)
+            .param("from", Int)
+            .param("to", Int)
+            .enabled_when(has_document),
     )?;
     registry.register(
         Command::new(
@@ -801,6 +822,22 @@ mod tests {
         for _ in 0..5 {
             f.run("edit.undo");
         }
+        assert_eq!(colors(&f), start);
+    }
+
+    #[test]
+    fn a_colour_is_moved_to_another_place_in_the_palette() {
+        let mut f = Fixture::with_sprite();
+        let start = colors(&f);
+        f.state.swatch_selection = vec![0];
+        let places = |from: i64, to: i64| Params::new().with("from", from).with("to", to);
+        f.run_with("palette.move_color", places(0, 3));
+        assert_eq!(colors(&f)[..4], [start[1], start[2], start[3], start[0]]);
+        assert!(f.state.swatch_selection.is_empty());
+        assert_eq!(history(&f), ["Move Colour"]);
+        f.run_with("palette.move_color", places(0, 99));
+        assert!(message(&mut f).contains("no such position"));
+        f.run("edit.undo");
         assert_eq!(colors(&f), start);
     }
 

@@ -465,7 +465,7 @@ fn symmetry_options(ui: &mut Ui, state: &mut AppState, registry: &Registry, tile
 
 /// A clickable colour swatch. `ring` draws the accent outline that marks a selection.
 fn swatch(ui: &mut Ui, color: Rgba8, size: Vec2, ring: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
     color_picker::show_color_at(ui.painter(), color32(color), rect);
     let visuals = ui.visuals();
     let stroke = if ring {
@@ -620,7 +620,7 @@ fn palette(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
             let name = entry.name.clone().unwrap_or_else(|| entry.color.to_hex());
             let tip = format!(
                 "{name}\nClick: primary colour\nRight click: secondary colour\nCtrl or Shift \
-                 click: select several"
+                 click: select several\nDrag: move"
             );
             let selected = state.swatch_selection.contains(&index);
             let response = swatch(ui, entry.color, Vec2::splat(20.0), selected);
@@ -642,6 +642,34 @@ fn palette(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                 corner(response.rect.right_bottom(), Vec2::splat(-7.0));
             }
 
+            // Dragging a swatch onto another one moves it there.
+            let drag_id = egui::Id::new("palette_drag");
+            if response.drag_started() {
+                ui.data_mut(|data| data.insert_temp(drag_id, index));
+            }
+            let dragged: Option<usize> = ui.data(|data| data.get_temp(drag_id));
+            let pointer = ui.input(|input| input.pointer.interact_pos());
+            let over = pointer.is_some_and(|pos| response.rect.contains(pos));
+            if let Some(from) = dragged.filter(|from| over && *from != index) {
+                let accent = ui.visuals().selection.stroke.color;
+                let edge = if from < index {
+                    response.rect.right()
+                } else {
+                    response.rect.left()
+                };
+                ui.painter()
+                    .vline(edge, response.rect.y_range(), Stroke::new(2.0, accent));
+                if ui.input(|input| input.pointer.any_released()) {
+                    let params = Params::new()
+                        .with("from", from as i64)
+                        .with("to", index as i64);
+                    commands::run(registry, state, "palette.move_color", &params);
+                }
+            }
+            if response.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+
             let response = response.on_hover_text(tip);
             if response.clicked() {
                 let modifiers = ui.input(|input| input.modifiers);
@@ -655,6 +683,10 @@ fn palette(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
             }
         }
     });
+
+    if ui.input(|input| !input.pointer.any_down()) {
+        ui.data_mut(|data| data.remove::<usize>(egui::Id::new("palette_drag")));
+    }
 
     if ramps.is_empty() {
         return;

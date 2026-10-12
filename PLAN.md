@@ -96,7 +96,7 @@ Sprite
 Layer = Image { opacity, blend, visible, locked, alpha_lock }
       | Group { children, visible, collapsed }
       | Tilemap { tileset_id, opacity, visible, locked }
-      | Reference { visible, opacity }     # never exported
+      | Reference { visible, opacity, image, rect }   # never exported; see below
 
 Cel
   origin: (x, y)
@@ -106,6 +106,7 @@ Cel
 - Pixels are RGBA8, straight alpha. Colours are picked from the palette but stored as RGBA. (True indexed mode is a later, optional phase.)
 - Use stable IDs (`LayerId`, `TilesetId`) rather than vector indices in anything that is stored in undo history or in a script.
 - Cels are cropped to their content and have an origin, so a small sprite on a big canvas is cheap.
+- A reference layer keeps its picture at the picture's own resolution and a canvas rectangle to stretch it over. It has no cels and is drawn by the view, not by the compositor, so it stays readable on a tiny sprite.
 
 ### 4.2 Commands — the centre of the app
 
@@ -232,7 +233,7 @@ Work through the phases in order. The app must build and run at the end of every
 ### Phase 4 — Pro pixel features
 - Pixel-perfect filter, symmetry modes, custom brushes (make brush from selection).
 - Dither ink and shade ink; pattern picker.
-- Palette tools: import/export (`.gpl`, `.hex`, `.pal`, from image), sort, ramps, generate ramp between two colours, replace colour across sprite, reduce image to palette.
+- Palette tools: import/export (`.gpl`, `.hex`, `.pal`, from image), add and remove colours, drag to reorder, sort, ramps, generate ramp between two colours, replace colour across sprite, reduce image to palette.
 - Tiled drawing mode (wrap-around strokes) with seamless preview.
 - Reference image layer.
 

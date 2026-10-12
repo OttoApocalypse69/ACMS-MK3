@@ -17,6 +17,7 @@ mod layers_panel;
 mod menu;
 mod palette;
 mod panels;
+mod pixel_commands;
 mod state;
 mod status;
 mod theme;

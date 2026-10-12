@@ -7,6 +7,7 @@ use acms_core::compositor::FrameCache;
 use acms_core::editor::Editor;
 use acms_core::geom::{Point, Rect as PixelRect};
 use acms_core::image::Image;
+use acms_core::sprite::Symmetry;
 use acms_core::tool::{self, CursorHint, Outline, PointerEvent};
 use egui::{
     Color32, ColorImage, CursorIcon, Event, Key, MouseWheelUnit, PointerButton, Pos2, Rect,
@@ -77,9 +78,21 @@ fn color_image(image: &Image) -> ColorImage {
     ColorImage::from_rgba_unmultiplied(size, &image.to_rgba_bytes())
 }
 
+/// A reference layer as the canvas draws it this frame.
+struct ReferenceView {
+    texture: egui::TextureId,
+    /// The canvas area the picture is stretched over.
+    rect: PixelRect,
+    opacity: u8,
+    /// Drawn under the sprite rather than over it.
+    below: bool,
+}
+
 /// What the canvas keeps between frames. None of it is part of the document.
 #[derive(Default)]
 pub struct CanvasView {
+    /// One texture per reference picture in use.
+    references: Vec<(std::sync::Arc<Image>, TextureHandle)>,
     /// The flattened frame; only what changed is recomposed.
     cache: FrameCache,
     /// The texture showing `cache`, and the editor generation it was made for.
@@ -162,9 +175,40 @@ impl CanvasView {
         let checker_uv = Rect::from_min_size(Pos2::ZERO, squares);
         painter.image(checker, sprite_rect, checker_uv, Color32::WHITE);
 
-        if let Some(texture) = self.sprite(ui.ctx(), &mut state.editor) {
-            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-            painter.image(texture, sprite_rect, uv, Color32::WHITE);
+        let whole = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        let references = self.reference_views(ui.ctx(), &state.editor);
+        let draw_references = |below: bool| {
+            // Clipped to the canvas, like everything else that belongs to the sprite.
+            let clipped = painter.with_clip_rect(sprite_rect.intersect(viewport));
+            for view in references.iter().filter(|view| view.below == below) {
+                let tint = Color32::from_white_alpha(view.opacity);
+                clipped.image(view.texture, geometry.screen_rect(view.rect), whole, tint);
+            }
+        };
+        draw_references(true);
+
+        let sprite_texture = self.sprite(ui.ctx(), &mut state.editor);
+        if let Some(texture) = sprite_texture {
+            painter.image(texture, sprite_rect, whole, Color32::WHITE);
+        }
+        draw_references(false);
+
+        // Tiled mode: the sprite repeated all around, to see how its edges meet.
+        if let Some(texture) = sprite_texture.filter(|_| state.editor.options.tiled) {
+            let dim = tokens.surface.gamma_multiply(0.35);
+            for (dx, dy) in (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy))) {
+                if (dx, dy) == (0, 0) {
+                    continue;
+                }
+                let offset = Vec2::new(dx as f32, dy as f32) * sprite_rect.size();
+                let copy = sprite_rect.translate(offset);
+                if !copy.intersects(viewport) {
+                    continue;
+                }
+                painter.image(checker, copy, checker_uv, Color32::WHITE);
+                painter.image(texture, copy, whole, Color32::WHITE);
+                painter.rect_filled(copy, 0.0, dim);
+            }
         }
 
         if state.view.show_grid && state.view.zoom() >= GRID_MIN_ZOOM {
@@ -190,6 +234,30 @@ impl CanvasView {
             Stroke::new(1.0, tokens.border),
             StrokeKind::Outside,
         );
+
+        // The mirror lines, or the spokes between the copies of a radial symmetry.
+        let symmetry = state
+            .editor
+            .document()
+            .map_or(Symmetry::Off, |document| document.sprite().symmetry());
+        let axis = Stroke::new(1.0, tokens.accent.gamma_multiply(0.8));
+        let center = sprite_rect.center();
+        let clipped = painter.with_clip_rect(sprite_rect.intersect(viewport));
+        if matches!(symmetry, Symmetry::Horizontal | Symmetry::Both) {
+            clipped.vline(center.x, sprite_rect.y_range(), axis);
+        }
+        if matches!(symmetry, Symmetry::Vertical | Symmetry::Both) {
+            clipped.hline(sprite_rect.x_range(), center.y, axis);
+        }
+        if let Symmetry::Radial(count) = symmetry {
+            let reach = sprite_rect.size().length();
+            for spoke in 0..count {
+                let angle = std::f32::consts::TAU * f32::from(spoke) / f32::from(count.max(1))
+                    - std::f32::consts::FRAC_PI_2;
+                let end = center + Vec2::angled(angle) * reach;
+                clipped.line_segment([center, end], axis);
+            }
+        }
 
         // The selection, and whatever shape the tool is dragging out, as marching ants.
         let segments = self.selection_outline(&state.editor);
@@ -494,6 +562,52 @@ impl CanvasView {
             .as_ref()
             .map(|(_, texture)| texture.id())
     }
+    /// The visible reference layers, with a texture for each picture. A reference below
+    /// every image layer is drawn under the sprite; any other one over it.
+    fn reference_views(&mut self, ctx: &egui::Context, editor: &Editor) -> Vec<ReferenceView> {
+        let Some(document) = editor.document() else {
+            self.references.clear();
+            return Vec::new();
+        };
+        let entries = document.sprite().walk();
+        let first_image = entries
+            .iter()
+            .position(|entry| entry.layer.as_image().is_some());
+
+        let mut views = Vec::new();
+        let mut in_use = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(reference) = entry.layer.as_reference() else {
+                continue;
+            };
+            let known = self
+                .references
+                .iter()
+                .position(|(image, _)| std::sync::Arc::ptr_eq(image, &reference.image));
+            let slot = known.unwrap_or_else(|| {
+                let texture = ctx.load_texture(
+                    "reference",
+                    color_image(&reference.image),
+                    TextureOptions::LINEAR,
+                );
+                self.references.push((reference.image.clone(), texture));
+                self.references.len() - 1
+            });
+            in_use.push(self.references[slot].1.id());
+            if entry.shown && reference.opacity > 0 {
+                views.push(ReferenceView {
+                    texture: self.references[slot].1.id(),
+                    rect: reference.rect,
+                    opacity: reference.opacity,
+                    below: first_image.is_none_or(|first| index < first),
+                });
+            }
+        }
+        self.references
+            .retain(|(_, texture)| in_use.contains(&texture.id()));
+        views
+    }
+
     /// A 2×2 texture that repeats into the checkerboard behind transparent pixels.
     fn checker(&mut self, ctx: &egui::Context, theme: ThemeKind) -> egui::TextureId {
         if !matches!(&self.checker_texture, Some((made_for, _)) if *made_for == theme) {

@@ -157,7 +157,7 @@ fn selected_layer(state: &AppState) -> Option<(&Sprite, &Layer)> {
 }
 
 fn image_layer_selected(state: &AppState) -> bool {
-    selected_layer(state).is_some_and(|(_, layer)| !layer.is_group())
+    selected_layer(state).is_some_and(|(_, layer)| layer.as_image().is_some())
 }
 
 fn can_delete(state: &AppState) -> bool {
@@ -172,7 +172,7 @@ fn can_merge_down(state: &AppState) -> bool {
         let siblings = sprite.siblings(slot.parent).ok()?;
         siblings.get(slot.index.checked_sub(1)?)
     });
-    !layer.is_group() && below.is_some_and(|below| !below.is_group())
+    layer.as_image().is_some() && below.is_some_and(|below| below.as_image().is_some())
 }
 
 fn merge_down(state: &mut AppState, params: &Params) -> CommandResult {
@@ -219,7 +219,7 @@ fn set_image_property(
     if document(state)?
         .sprite()
         .layer(id)
-        .is_some_and(Layer::is_group)
+        .is_some_and(|layer| layer.as_image().is_none())
     {
         return Err(failed(SpriteError::NotAnImageLayer(id.0)));
     }
@@ -272,9 +272,28 @@ fn set_alpha_lock(state: &mut AppState, params: &Params) -> CommandResult {
 fn set_opacity(state: &mut AppState, params: &Params) -> CommandResult {
     let opacity = params.int("opacity").unwrap_or(255).clamp(0, 255) as u8;
     let merge = params.int("merge").map(|token| token as u64);
-    set_image_property(state, params, "Layer Opacity", merge, |image| {
-        image.opacity = opacity;
-    })
+    let id = target(state, params)?;
+    let is_reference = document(state)?
+        .sprite()
+        .layer(id)
+        .is_some_and(Layer::is_reference);
+    if !is_reference {
+        return set_image_property(state, params, "Layer Opacity", merge, |image| {
+            image.opacity = opacity;
+        });
+    }
+    let Some(document) = state.editor.document_mut() else {
+        return Ok(());
+    };
+    document
+        .transact_merging("Layer Opacity", merge, |tx| {
+            tx.update_layer(id, |props| {
+                if let Some(reference) = &mut props.reference {
+                    reference.opacity = opacity;
+                }
+            })
+        })
+        .map_err(failed)
 }
 
 fn set_blend(state: &mut AppState, params: &Params) -> CommandResult {

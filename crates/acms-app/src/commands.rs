@@ -260,6 +260,7 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
 
     crate::layer_commands::register(registry)?;
     crate::edit_commands::register(registry)?;
+    crate::pixel_commands::register(registry)?;
 
     // Tools: one command per registered tool, so each can have its own shortcut.
     let tools: Vec<_> = Editor::new().tools().collect();

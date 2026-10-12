@@ -9,6 +9,7 @@ use crate::compositor::Overlay;
 use crate::document::Document;
 use crate::edit::Clip;
 use crate::geom::Rect;
+use crate::pattern::Pattern;
 use crate::sprite::SpriteError;
 use crate::stroke::Brush;
 use crate::tool::{
@@ -36,6 +37,8 @@ pub struct Editor {
     pub options: ToolOptions,
     /// What Copy and Cut took; shared by all open documents.
     pub clipboard: Option<Clip>,
+    /// The dither pattern the user made last, kept while a built-in one is in use.
+    pub custom_pattern: Option<Pattern>,
     /// The tool registry.
     tools: Vec<Box<dyn Tool>>,
     active_tool: usize,
@@ -62,6 +65,7 @@ impl Editor {
             brush: Brush::default(),
             options: ToolOptions::default(),
             clipboard: None,
+            custom_pattern: None,
             tools: vec![
                 Box::new(BrushTool::pencil()),
                 Box::new(BrushTool::eraser()),

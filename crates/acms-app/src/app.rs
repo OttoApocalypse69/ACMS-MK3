@@ -962,4 +962,76 @@ mod tests {
         h.press(CTRL.plus(Modifiers::SHIFT), Key::R);
         assert_eq!(h.app.state.dock.iter_all_tabs().count(), all);
     }
+    #[test]
+    fn drawing_on_the_canvas_is_mirrored_and_wraps_with_the_overlays_shown() {
+        use acms_core::image::Image;
+        use acms_core::sprite::Slot;
+
+        let mut h = Harness::with_sprite();
+        h.app.run_command("symmetry.horizontal", &Params::new());
+        h.app.run_command("view.toggle_tiled", &Params::new());
+        // A reference picture under the drawing layer and one over it.
+        let document = h.app.state.editor.document_mut().unwrap();
+        document
+            .transact("References", |tx| {
+                let picture = || Image::from_pixels(2, 1, vec![Rgba8::WHITE; 2]).unwrap();
+                tx.add_reference_layer(Slot::new(None, 0), "Under", picture())?;
+                tx.add_reference_layer(Slot::new(None, 2), "Over", picture())
+            })
+            .unwrap();
+        document.set_active_layer(LayerId(1));
+        h.frame(vec![]);
+
+        h.app.state.editor.primary = Rgba8::rgb(200, 0, 0);
+        h.drag_pixels(PointerButton::Primary, &[(1, 3), (3, 3)]);
+        for x in [1, 2, 3, 12, 13, 14] {
+            assert_eq!(h.pixel(x, 3), Rgba8::rgb(200, 0, 0), "x = {x}");
+        }
+        assert_eq!(h.pixel(8, 3), Rgba8::TRANSPARENT);
+        assert_eq!(h.history().last().map(String::as_str), Some("Pencil"));
+
+        // Radial symmetry draws its spokes without trouble too.
+        h.app.run_command("symmetry.radial", &Params::new());
+        h.frame(vec![]);
+    }
+
+    #[test]
+    fn tool_options_show_for_every_tool_and_ink() {
+        let mut h = Harness::with_sprite();
+        let tools: Vec<&str> = h.app.state.editor.tools().map(|(id, _)| id).collect();
+        for ink in ["simple", "dither", "shade"] {
+            h.app
+                .run_command("tool.set_ink", &Params::new().with("ink", ink));
+            for tool in &tools {
+                h.app.run_command(&format!("tool.{tool}"), &Params::new());
+                h.frame(vec![]);
+            }
+        }
+        // With a custom brush, a custom pattern and a ramp in the palette.
+        h.app.run_command("tool.pencil", &Params::new());
+        h.app.run_command("ink.simple", &Params::new());
+        h.drag_pixels(PointerButton::Primary, &[(1, 1), (4, 2)]);
+        h.app.run_command("brush.from_selection", &Params::new());
+        h.app.run_command("pattern.from_selection", &Params::new());
+        let steps = Params::new().with("steps", 4_i64);
+        h.app.run_command("palette.generate_ramp", &steps);
+        h.app.run_command("ink.shade", &Params::new());
+        h.frame(vec![]);
+        h.frame(vec![]);
+        assert!(h.app.state.editor.brush.is_custom());
+        assert_eq!(h.app.state.dialog, None);
+    }
+
+    #[test]
+    fn ctrl_b_makes_a_brush_from_the_selection() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (5, 2)]);
+        h.press(CTRL, Key::B);
+        let brush = &h.app.state.editor.brush;
+        assert_eq!(brush.image().map(|image| image.width()), Some(4));
+        // B alone still picks the pencil.
+        h.app.run_command("tool.eraser", &Params::new());
+        h.press(Modifiers::NONE, Key::B);
+        assert_eq!(h.app.state.editor.active_tool(), "pencil");
+    }
 }

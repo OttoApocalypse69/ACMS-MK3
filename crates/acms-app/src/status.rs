@@ -13,7 +13,9 @@ pub fn draw_block_message(block: &SpriteError) -> &'static str {
     match block {
         SpriteError::LayerLocked(_) => "The selected layer is locked",
         SpriteError::LayerHidden(_) => "The selected layer is hidden",
-        SpriteError::NotAnImageLayer(_) => "A group is selected: select a layer to draw on",
+        SpriteError::NotAnImageLayer(_) => {
+            "A group or reference layer is selected: select a layer to draw on"
+        }
         _ => "Nothing can be drawn here",
     }
 }

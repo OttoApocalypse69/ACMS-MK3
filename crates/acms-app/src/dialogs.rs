@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use acms_core::command::{CommandRegistry, Params};
+use acms_core::palette::MAX_RAMP_STEPS;
 use acms_core::sprite::MAX_SPRITE_SIZE;
 use acms_io::png::MAX_EXPORT_SCALE;
 use egui::{DragValue, Grid, Id, Modal, RichText, Ui};
@@ -39,6 +40,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &CommandRegistr
                 height,
                 anchor,
             } => size(ui, purpose, width, height, anchor),
+            Dialog::Ramp { steps } => ramp(ui, state, steps),
         }
     });
 
@@ -205,6 +207,30 @@ fn size(
     }
 }
 
+/// How many colours the ramp from the primary to the secondary colour gets.
+fn ramp(ui: &mut Ui, state: &AppState, mut steps: u32) -> Outcome {
+    ui.heading("Generate Ramp");
+    ui.label(format!(
+        "From {} to {}. The colours are added to the palette.",
+        state.editor.primary.to_hex(),
+        state.editor.secondary.to_hex()
+    ));
+    Grid::new("ramp").num_columns(2).show(ui, |ui| {
+        ui.label("Colours");
+        ui.add(DragValue::new(&mut steps).range(2..=MAX_RAMP_STEPS as u32));
+        ui.end_row();
+    });
+
+    match buttons(ui, "Generate") {
+        (true, _) => Outcome::Run(
+            "palette.generate_ramp".to_owned(),
+            Params::new().with("steps", steps),
+        ),
+        (_, true) => Outcome::Dismissed,
+        _ => Outcome::Open(Dialog::Ramp { steps }),
+    }
+}
+
 /// Shows the native file dialog a command asked for, then runs the command with the chosen
 /// path. This blocks until the user has picked a file or cancelled.
 pub fn resolve_file_request(
@@ -259,6 +285,32 @@ pub fn resolve_file_request(
             let path = with_extension(path, "png");
             let params = Params::new().with("path", text(path)).with("scale", scale);
             ("file.export_png", params)
+        }
+        FileRequest::ImportPalette => {
+            let picked = dialog
+                .add_filter("Palettes and pictures", &["gpl", "hex", "pal", "png"])
+                .pick_file();
+            let Some(path) = picked else { return };
+            ("palette.import", Params::new().with("path", text(path)))
+        }
+        FileRequest::ExportPalette => {
+            let picked = dialog
+                .add_filter("GIMP palette", &["gpl"])
+                .add_filter("Hex list", &["hex"])
+                .add_filter("JASC palette", &["pal"])
+                .set_file_name(format!("{stem}.gpl"))
+                .save_file();
+            let Some(path) = picked else { return };
+            let path = with_extension(path, "gpl");
+            ("palette.export", Params::new().with("path", text(path)))
+        }
+        FileRequest::ReferenceImage => {
+            let picked = dialog.add_filter("PNG image", &["png"]).pick_file();
+            let Some(path) = picked else { return };
+            (
+                "layer.add_reference",
+                Params::new().with("path", text(path)),
+            )
         }
     };
     commands::run(registry, state, command, &params);

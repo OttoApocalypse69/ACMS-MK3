@@ -37,6 +37,7 @@ struct Item {
     group: Option<(bool, usize)>,
     /// For an image layer: whether it is locked, and whether its alpha is.
     locks: Option<(bool, bool)>,
+    reference: bool,
 }
 
 /// Where a row ended up on screen.
@@ -155,9 +156,12 @@ pub fn show(
     };
     let sprite = document.sprite();
     let active = document.active_layer();
-    let active_image = sprite
-        .layer(active)
-        .and_then(|layer| layer.as_image().copied());
+    let active_layer = sprite.layer(active);
+    let active_image = active_layer.and_then(|layer| layer.as_image().copied());
+    // A reference layer has an opacity too, but no blend mode.
+    let reference_opacity = active_layer
+        .and_then(|layer| layer.as_reference())
+        .map(|reference| reference.opacity);
 
     let mut items = Vec::new();
     let mut folded_at: Option<usize> = None;
@@ -185,6 +189,7 @@ pub fn show(
                 .layer
                 .as_image()
                 .map(|image| (image.locked, image.alpha_lock)),
+            reference: entry.layer.is_reference(),
         });
     }
 
@@ -200,9 +205,16 @@ pub fn show(
 
     toolbar(ui, state, registry, keymap);
     // Shown greyed out for a group rather than hidden, so the rows below never jump.
-    ui.add_enabled_ui(active_image.is_some(), |ui| {
-        properties(ui, state, registry, me, active_image.unwrap_or_default());
+    let shown = active_image.unwrap_or(ImageLayer {
+        opacity: reference_opacity.unwrap_or(255),
+        ..ImageLayer::default()
     });
+    ui.add_enabled_ui(
+        active_image.is_some() || reference_opacity.is_some(),
+        |ui| {
+            properties(ui, state, registry, me, shown, active_image.is_some());
+        },
+    );
     ui.separator();
     rows(ui, state, registry, me, &items, active);
 }
@@ -229,31 +241,18 @@ fn toolbar(ui: &mut Ui, state: &mut AppState, registry: &Registry, keymap: &Keym
     });
 }
 
-/// Blend mode and opacity of the selected image layer.
+/// Blend mode and opacity of the selected layer. `blends` is false for a layer that has an
+/// opacity but no blend mode.
 fn properties(
     ui: &mut Ui,
     state: &mut AppState,
     registry: &Registry,
     me: &mut LayersUi,
     image: ImageLayer,
+    blends: bool,
 ) {
     ui.horizontal(|ui| {
-        ComboBox::from_id_salt("layer_blend")
-            .selected_text(image.blend.name())
-            .width(92.0)
-            .show_ui(ui, |ui| {
-                for mode in BlendMode::ALL {
-                    if ui
-                        .selectable_label(mode == image.blend, mode.name())
-                        .clicked()
-                    {
-                        let params = Params::new().with("blend", mode.id());
-                        run(registry, state, "layer.set_blend", params);
-                    }
-                }
-            })
-            .response
-            .on_hover_text("Blend mode");
+        ui.add_enabled_ui(blends, |ui| blend_mode(ui, state, registry, image));
 
         let mut percent = (f32::from(image.opacity) / 255.0 * 100.0).round() as u32;
         ui.spacing_mut().slider_width = (ui.available_width() - 62.0).max(40.0);
@@ -275,6 +274,25 @@ fn properties(
             run(registry, state, "layer.set_opacity", params);
         }
     });
+}
+
+fn blend_mode(ui: &mut Ui, state: &mut AppState, registry: &Registry, image: ImageLayer) {
+    ComboBox::from_id_salt("layer_blend")
+        .selected_text(image.blend.name())
+        .width(92.0)
+        .show_ui(ui, |ui| {
+            for mode in BlendMode::ALL {
+                if ui
+                    .selectable_label(mode == image.blend, mode.name())
+                    .clicked()
+                {
+                    let params = Params::new().with("blend", mode.id());
+                    run(registry, state, "layer.set_blend", params);
+                }
+            }
+        })
+        .response
+        .on_hover_text("Blend mode");
 }
 
 fn rows(
@@ -362,6 +380,10 @@ fn rows(
             if alpha.clicked() {
                 pending.push(("layer.set_alpha_lock", on(item.id)));
             }
+        } else if item.reference {
+            ui.interact(lock_rect, id.with("reference"), Sense::hover())
+                .on_hover_text("Reference layer: shown, never drawn on or exported");
+            paint_reference(&painter, lock_rect.center(), color);
         }
 
         match me.rename.as_mut().filter(|rename| rename.id == item.id) {
@@ -510,6 +532,19 @@ fn paint_eye(painter: &egui::Painter, center: Pos2, visible: bool, color: Color3
 }
 
 /// A padlock: solid when locked, a faint outline when not.
+/// A small framed picture: a sun over a hill.
+fn paint_reference(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let frame = Rect::from_center_size(center, Vec2::new(12.0, 10.0));
+    painter.rect_stroke(frame, 1.0, Stroke::new(1.0, color), StrokeKind::Inside);
+    painter.circle_filled(center + Vec2::new(2.5, -1.5), 1.2, color);
+    let hill = [
+        center + Vec2::new(-4.0, 3.0),
+        center + Vec2::new(-1.0, -0.5),
+        center + Vec2::new(2.0, 3.0),
+    ];
+    painter.add(Shape::line(hill.to_vec(), Stroke::new(1.0, color)));
+}
+
 fn paint_lock(painter: &egui::Painter, center: Pos2, locked: bool, color: Color32, weak: Color32) {
     let body = Rect::from_center_size(center + Vec2::new(0.0, 2.5), Vec2::new(10.0, 7.0));
     let shackle = center + Vec2::new(0.0, -2.0);

@@ -132,6 +132,10 @@ pub enum Dialog {
         /// For a canvas resize: which corner or edge the existing picture stays against.
         anchor: Anchor,
     },
+    /// Asks how many colours a ramp from the primary to the secondary colour should have.
+    Ramp {
+        steps: u32,
+    },
 }
 
 /// What a [`Dialog::Size`] is asking the size for.
@@ -204,6 +208,9 @@ pub enum FileRequest {
     Open,
     SaveAs,
     ExportPng { scale: u32 },
+    ImportPalette,
+    ExportPalette,
+    ReferenceImage,
 }
 
 /// What the app knows about an open sprite besides the sprite itself.
@@ -227,6 +234,10 @@ pub struct AppState {
     shown: Option<DocId>,
     /// The same three things for the open sprites that are not the active one.
     parked: HashMap<DocId, DocState>,
+    /// The palette positions selected in the Palette panel, in the order they were picked.
+    pub swatch_selection: Vec<usize>,
+    /// How many copies a radial symmetry makes when it is switched on.
+    pub radial_count: u8,
     /// Copy and paste also go through the system clipboard. Off in tests.
     pub system_clipboard: bool,
     pub dock: DockState<Panel>,
@@ -253,6 +264,8 @@ impl Default for AppState {
             view: ViewState::default(),
             shown: None,
             parked: HashMap::new(),
+            swatch_selection: Vec::new(),
+            radial_count: 6,
             system_clipboard: false,
             dock: panels::default_layout(),
             layout_generation: 0,
@@ -276,6 +289,8 @@ impl AppState {
         if active == self.shown {
             return;
         }
+        // The selected swatches were positions in the other sprite's palette.
+        self.swatch_selection.clear();
         let previous = DocState {
             path: self.file_path.take(),
             saved_revision: self.saved_revision,

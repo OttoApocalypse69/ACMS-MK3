@@ -42,6 +42,7 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("W", "tool.magic_wand"),
     ("X", "color.swap"),
     ("Ctrl+Shift+N", "layer.new"),
+    ("Ctrl+B", "brush.from_selection"),
     ("F2", "layer.rename"),
     ("Ctrl+Plus", "view.zoom_in"),
     ("Ctrl+Equals", "view.zoom_in"),

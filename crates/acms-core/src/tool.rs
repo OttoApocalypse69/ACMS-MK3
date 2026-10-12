@@ -163,10 +163,10 @@ pub enum CursorHint {
 
 pub trait Tool {
     /// Stable id, used in command ids (`tool.<id>`) and by scripts.
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
 
     /// Name shown in the UI.
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     fn pointer_down(&mut self, ctx: &mut ToolContext<'_>, event: PointerEvent);
 

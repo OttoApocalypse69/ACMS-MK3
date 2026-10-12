@@ -998,6 +998,9 @@ pub struct Document {
     active_frame: usize,
     /// The slice that is selected, if any. Not part of undo.
     active_slice: Option<usize>,
+    /// How many steps were applied when the open undo group began; see
+    /// [`Document::begin_group`].
+    group: Option<usize>,
 }
 
 impl Document {
@@ -1015,6 +1018,7 @@ impl Document {
             active_layer: LayerId(0),
             active_frame: 0,
             active_slice: None,
+            group: None,
         };
         document.repair_active_layer();
         document
@@ -1170,12 +1174,62 @@ impl Document {
         Ok(value)
     }
 
+    /// Starts an undo group: every step made until [`Document::end_group`] becomes part of
+    /// one step. Undo and redo wait until the group is closed. Returns `false`, changing
+    /// nothing, if a group is already open.
+    pub fn begin_group(&mut self) -> bool {
+        if self.group.is_some() {
+            return false;
+        }
+        self.group = Some(self.cursor);
+        true
+    }
+
+    pub fn in_group(&self) -> bool {
+        self.group.is_some()
+    }
+
+    /// Closes the undo group, leaving everything done in it as one step called `name` — or
+    /// no step, if nothing was done.
+    pub fn end_group(&mut self, name: &str) {
+        let Some(start) = self.group.take() else {
+            return;
+        };
+        // Steps made in the group are the applied ones after `start`; nothing can have been
+        // undone meanwhile.
+        if self.cursor > start {
+            let mut ops = Vec::new();
+            for entry in self.entries.drain(start..) {
+                ops.extend(entry.ops);
+            }
+            self.entries.push_back(Entry {
+                revision: self.last_revision,
+                name: name.to_owned(),
+                ops,
+                merge: None,
+            });
+            self.cursor = self.entries.len();
+        }
+        self.enforce_history_limit();
+    }
+
+    /// Closes the undo group and takes back everything done in it.
+    pub fn abort_group(&mut self) {
+        let Some(start) = self.group.take() else {
+            return;
+        };
+        if self.cursor > start {
+            self.jump_to(start);
+            self.entries.truncate(start);
+        }
+    }
+
     pub fn can_undo(&self) -> bool {
-        self.cursor > 0
+        self.cursor > 0 && self.group.is_none()
     }
 
     pub fn can_redo(&self) -> bool {
-        self.cursor < self.entries.len()
+        self.cursor < self.entries.len() && self.group.is_none()
     }
 
     /// Reverts the most recent applied step. Returns `false` if there was none.
@@ -1222,12 +1276,8 @@ impl Document {
     /// Undoes or redoes until exactly `cursor` steps are applied.
     pub fn jump_to(&mut self, cursor: usize) {
         let cursor = cursor.min(self.entries.len());
-        while self.cursor > cursor {
-            self.undo();
-        }
-        while self.cursor < cursor {
-            self.redo();
-        }
+        while self.cursor > cursor && self.undo() {}
+        while self.cursor < cursor && self.redo() {}
     }
 
     /// A number that identifies the current state of the sprite: it changes with every edit,
@@ -1251,6 +1301,10 @@ impl Document {
     }
 
     fn enforce_history_limit(&mut self) {
+        // The steps of an open group are counted from the front of the list.
+        if self.group.is_some() {
+            return;
+        }
         // The newest step always stays, and only steps that are applied can be forgotten.
         while self.history_bytes() > self.history_limit && self.entries.len() > 1 && self.cursor > 0
         {
@@ -1332,6 +1386,81 @@ mod tests {
         assert!(doc.redo());
         assert_eq!(*doc.sprite(), after, "redo did not restore the edit");
         value
+    }
+
+    #[test]
+    fn a_group_folds_its_steps_into_one() {
+        let mut doc = document();
+        paint(&mut doc, "Before", Rect::new(0, 0, 1, 1), Rgba8::BLACK);
+        let before = doc.sprite().clone();
+
+        assert!(doc.begin_group());
+        assert!(!doc.begin_group(), "groups do not nest");
+        paint(&mut doc, "One", Rect::new(2, 2, 2, 2), Rgba8::WHITE);
+        paint(&mut doc, "Two", Rect::new(3, 3, 4, 4), Rgba8::BLACK);
+        doc.transact("Layer", |tx| tx.add_layer(top(1), "Above", false))
+            .unwrap();
+        // Undo waits for the group to close.
+        assert!(!doc.can_undo() && !doc.undo());
+        doc.end_group("Script");
+        assert!(!doc.in_group());
+        let after = doc.sprite().clone();
+
+        assert_eq!(doc.history().collect::<Vec<_>>(), ["Before", "Script"]);
+        assert!(doc.undo());
+        assert_eq!(*doc.sprite(), before);
+        assert!(doc.redo());
+        assert_eq!(*doc.sprite(), after);
+        assert_eq!(doc.revision(), 4);
+    }
+
+    #[test]
+    fn an_empty_group_is_no_step_and_keeps_what_could_be_redone() {
+        let mut doc = document();
+        paint(&mut doc, "One", Rect::new(0, 0, 1, 1), Rgba8::BLACK);
+        doc.undo();
+        doc.begin_group();
+        doc.end_group("Nothing");
+        assert_eq!(doc.history().len(), 1);
+        assert!(doc.redo());
+    }
+
+    #[test]
+    fn an_aborted_group_leaves_no_trace() {
+        let mut doc = document();
+        paint(&mut doc, "Before", Rect::new(0, 0, 1, 1), Rgba8::BLACK);
+        let before = doc.sprite().clone();
+        let revision = doc.revision();
+
+        doc.begin_group();
+        paint(&mut doc, "One", Rect::new(2, 2, 2, 2), Rgba8::WHITE);
+        paint(&mut doc, "Two", Rect::new(3, 3, 4, 4), Rgba8::BLACK);
+        doc.abort_group();
+
+        assert_eq!(*doc.sprite(), before);
+        assert_eq!(doc.revision(), revision);
+        assert_eq!(doc.history().collect::<Vec<_>>(), ["Before"]);
+        assert!(!doc.can_redo());
+        // Closing again does nothing.
+        doc.end_group("Late");
+        doc.abort_group();
+        assert_eq!(doc.history().len(), 1);
+    }
+
+    #[test]
+    fn the_history_limit_waits_for_a_group_to_close() {
+        let mut doc = document();
+        paint(&mut doc, "Before", Rect::new(0, 0, 16, 16), Rgba8::BLACK);
+        doc.set_history_limit(16);
+        doc.begin_group();
+        paint(&mut doc, "One", Rect::new(0, 0, 16, 16), Rgba8::WHITE);
+        paint(&mut doc, "Two", Rect::new(0, 0, 16, 16), Rgba8::BLACK);
+        assert_eq!(doc.history().len(), 3);
+        doc.end_group("Script");
+        assert_eq!(doc.history().collect::<Vec<_>>(), ["Script"]);
+        assert!(doc.undo());
+        let pixel = doc.sprite().read_region(L1, 0, Rect::new(0, 0, 1, 1));
+        assert_eq!(pixel.get(0, 0), Rgba8::BLACK);
     }
 
     #[test]

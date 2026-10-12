@@ -119,6 +119,13 @@ impl Editor {
             .find_map(|(doc_id, document)| (*doc_id == id).then_some(document))
     }
 
+    /// Any open document, for changing it while another one may be the active one.
+    pub fn document_mut_by_id(&mut self, id: DocId) -> Option<&mut Document> {
+        self.documents
+            .iter_mut()
+            .find_map(|(doc_id, document)| (*doc_id == id).then_some(document))
+    }
+
     /// Opens a document in a new tab and makes it the one being edited.
     pub fn add_document(&mut self, document: Document) -> DocId {
         self.cancel_interaction();
@@ -184,12 +191,43 @@ impl Editor {
     }
 
     /// Ids and names of all tools, in registration order.
-    pub fn tools(&self) -> impl Iterator<Item = (&'static str, &'static str)> {
+    pub fn tools(&self) -> impl Iterator<Item = (&str, &str)> {
         self.tools.iter().map(|tool| (tool.id(), tool.name()))
     }
 
-    pub fn active_tool(&self) -> &'static str {
+    pub fn active_tool(&self) -> &str {
         self.tools[self.active_tool].id()
+    }
+
+    /// Adds a tool after the others. Returns `false`, adding nothing, if there is one with
+    /// its id already.
+    pub fn add_tool(&mut self, tool: Box<dyn Tool>) -> bool {
+        if self.tools.iter().any(|known| known.id() == tool.id()) {
+            return false;
+        }
+        self.tools.push(tool);
+        true
+    }
+
+    /// Takes a tool out again, abandoning its stroke if it was in one; the first tool takes
+    /// over if it was the active one. Returns `false` for an unknown id, and for the last
+    /// tool there is.
+    pub fn remove_tool(&mut self, id: &str) -> bool {
+        let Some(index) = self.tools.iter().position(|tool| tool.id() == id) else {
+            return false;
+        };
+        if self.tools.len() == 1 {
+            return false;
+        }
+        if index == self.active_tool {
+            self.cancel_interaction();
+            self.active_tool = 0;
+        }
+        self.tools.remove(index);
+        if self.active_tool > index {
+            self.active_tool -= 1;
+        }
+        true
     }
 
     /// Switches tool, abandoning any stroke in progress. Returns `false` for an unknown id.
@@ -554,6 +592,41 @@ mod tests {
 
     fn pixel_on(editor: &Editor, layer: LayerId, x: i32, y: i32) -> Rgba8 {
         editor.document().unwrap().sprite().pixel(layer, 0, x, y)
+    }
+
+    #[test]
+    fn tools_can_be_added_and_removed() {
+        struct Named(String);
+        impl Tool for Named {
+            fn id(&self) -> &str {
+                &self.0
+            }
+            fn name(&self) -> &str {
+                "Named"
+            }
+            fn pointer_down(&mut self, _: &mut ToolContext<'_>, _: PointerEvent) {}
+            fn pointer_move(&mut self, _: &mut ToolContext<'_>, _: PointerEvent) {}
+            fn pointer_up(&mut self, _: &mut ToolContext<'_>, _: PointerEvent) {}
+            fn cancel(&mut self, _: &mut ToolContext<'_>) {}
+        }
+        let mut editor = editor();
+        let built_in = editor.tools().count();
+        assert!(editor.add_tool(Box::new(Named("spray".to_owned()))));
+        assert!(!editor.add_tool(Box::new(Named("spray".to_owned()))));
+        assert!(!editor.add_tool(Box::new(Named("pencil".to_owned()))));
+        assert_eq!(editor.tools().count(), built_in + 1);
+
+        // Removing the active tool falls back to the first one.
+        assert!(editor.set_active_tool("spray"));
+        assert!(editor.remove_tool("spray"));
+        assert!(!editor.remove_tool("spray"));
+        assert_eq!(editor.active_tool(), "pencil");
+        // Removing a tool before the active one keeps the active one.
+        assert!(editor.set_active_tool("eraser"));
+        assert!(editor.add_tool(Box::new(Named("spray".to_owned()))));
+        assert!(editor.set_active_tool("spray"));
+        assert!(editor.remove_tool("eraser"));
+        assert_eq!(editor.active_tool(), "spray");
     }
 
     #[test]

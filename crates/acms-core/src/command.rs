@@ -332,6 +332,18 @@ impl<C> CommandRegistry<C> {
         Ok(())
     }
 
+    /// Takes a command out again. Returns `false` if there is none with that id.
+    pub fn remove(&mut self, id: &str) -> bool {
+        let Some(index) = self.by_id.remove(id) else {
+            return false;
+        };
+        self.commands.remove(index);
+        for later in self.by_id.values_mut().filter(|at| **at > index) {
+            *later -= 1;
+        }
+        true
+    }
+
     pub fn get(&self, id: &str) -> Option<&Command<C>> {
         self.by_id.get(id).map(|&index| &self.commands[index])
     }
@@ -459,6 +471,33 @@ mod tests {
             Err(CommandError::Duplicate("count.increment".to_owned()))
         );
         assert_eq!(registry.len(), 4);
+    }
+
+    #[test]
+    fn a_command_can_be_removed_and_registered_again() {
+        let mut registry = registry();
+        let count = registry.len();
+        assert!(registry.remove("count.reset"));
+        assert!(!registry.remove("count.reset"));
+        assert_eq!(registry.len(), count - 1);
+        assert!(registry.get("count.reset").is_none());
+        // The others are still found under their own ids.
+        for command in registry.iter() {
+            let found = registry.get(command.id()).map(Command::id);
+            assert_eq!(found, Some(command.id()));
+        }
+        let mut n = 0;
+        let two = Params::new().with("amount", 2_i64);
+        registry.run("count.add", &mut n, &two).unwrap();
+        assert_eq!(n, 2);
+        registry
+            .register(Command::new("count.reset", "Reset", |n, _| {
+                *n = 0;
+                Ok(())
+            }))
+            .unwrap();
+        registry.run("count.reset", &mut n, &Params::new()).unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

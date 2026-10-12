@@ -313,14 +313,11 @@ fn add_reference(state: &mut AppState, params: &Params) -> CommandResult {
         |stem| stem.to_string_lossy().into_owned(),
     );
 
-    // On top of everything, so it is seen whatever the layers hold.
-    let top = Slot::new(None, sprite(state)?.layers().len());
-    let id = transact(state, "Add Reference Layer", |tx| {
-        tx.add_reference_layer(top, &name, image)
+    // Underneath everything, so the drawing stays as it is and covers the picture where
+    // it is opaque. Moved above an image layer, the picture is laid over the sprite.
+    transact(state, "Add Reference Layer", |tx| {
+        tx.add_reference_layer(Slot::new(None, 0), &name, image)
     })?;
-    if let Some(document) = state.editor.document_mut() {
-        document.set_active_layer(id);
-    }
     Ok(())
 }
 
@@ -961,9 +958,10 @@ mod tests {
 
         let file = picture("reference.png", 8, 4);
         f.run_with("layer.add_reference", with_path(&file));
+        // It goes underneath, and the layer being drawn on stays selected.
         let document = f.document();
-        let top = document.sprite().layers().last().unwrap().clone();
-        assert_eq!(document.active_layer(), top.id);
+        let top = document.sprite().layers()[0].clone();
+        assert_eq!(document.active_layer(), LayerId(1));
         assert!(top.name.ends_with("reference"));
         let reference = top.as_reference().unwrap();
         assert_eq!(reference.rect, Rect::new(0, 4, 16, 8));
@@ -973,6 +971,7 @@ mod tests {
         );
 
         // Its opacity changes like a layer's; it has no blend mode and cannot be drawn on.
+        f.run_with("layer.select", Params::new().with("layer", top.id.0));
         f.run_with("layer.set_opacity", Params::new().with("opacity", 60_u32));
         let opacity = |f: &Fixture| {
             let layer = f.document().sprite().layer(top.id).unwrap();

@@ -86,7 +86,7 @@ pub fn default_layout() -> DockState<Panel> {
 
     let [main, _bottom] = tree.split_below(main, 0.78, vec![Timeline, Tileset, ScriptConsole, Log]);
     let [_canvas, tools] = tree.split_left(main, 0.17, vec![Tools]);
-    tree.split_below(tools, 0.72, vec![ToolOptions, Preview]);
+    tree.split_below(tools, 0.6, vec![ToolOptions, Preview]);
 
     dock
 }
@@ -210,7 +210,10 @@ fn tools(ui: &mut Ui, state: &mut AppState, registry: &Registry, keymap: &Keymap
     let active = state.editor.active_tool();
     let tools: Vec<_> = state.editor.tools().collect();
     ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
-        ui.spacing_mut().item_spacing.y = 2.0;
+        // Compact rows: the whole list should fit without scrolling in the default layout.
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.spacing_mut().interact_size.y = 22.0;
+        ui.spacing_mut().button_padding.y = 2.0;
         for (id, name) in tools {
             let command = format!("tool.{id}");
             let tip = with_shortcut(ui, keymap, name, &command);
@@ -278,7 +281,7 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
             }
             OptionKind::Ink => {
                 ui.label("Ink");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for ink in InkKind::ALL {
                         if ui
                             .selectable_label(options.ink == ink, ink.name())
@@ -589,9 +592,10 @@ fn palette(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
         commands::run(registry, state, command, &params);
     };
 
+    // Small, so the swatches keep most of the panel.
     let buttons = [
-        ("palette.add_color", "Add"),
-        ("palette.remove_colors", "Remove"),
+        ("palette.add_color", "+"),
+        ("palette.remove_colors", "−"),
         ("palette.new_ramp", "Ramp"),
         ("palette.generate_ramp", "Generate…"),
     ];
@@ -602,7 +606,8 @@ fn palette(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                 continue;
             };
             let tip = command.name().trim_end_matches('…').to_owned();
-            let button = ui.add_enabled(command.is_enabled(state), egui::Button::new(label));
+            let button = egui::Button::new(label).small();
+            let button = ui.add_enabled(command.is_enabled(state), button);
             if button.on_hover_text(tip).clicked() {
                 commands::run(registry, state, id, &Params::new());
             }

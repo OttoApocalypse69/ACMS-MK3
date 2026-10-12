@@ -19,8 +19,9 @@ use acms_core::geom::{Point, Rect};
 use acms_core::image::Image;
 use acms_core::sprite::{
     BlendMode, CelSource, Direction, Frame, GroupLayer, ImageLayer, Layer, LayerId, LayerKind,
-    Palette, PaletteEntry, ReferenceLayer, Sprite, Symmetry, Tag,
+    Palette, PaletteEntry, ReferenceLayer, Sprite, Symmetry, Tag, TilemapLayer,
 };
+use acms_core::tiles::{MAX_TILE_SIZE, Slice, TileGrid, Tileset, TilesetId};
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -37,13 +38,19 @@ use crate::{IoError, write_atomically};
 /// - **3**: the palette has ramps, the sprite has a symmetry setting, and there are reference
 ///   layers, whose pictures are stored under `refs/`.
 /// - **4**: tags, and linked cels (which share one image).
-pub const FORMAT_VERSION: u32 = 4;
+/// - **5**: tilesets (stored under `tiles/`), tilemap layers with the tiles of their cels,
+///   and slices.
+pub const FORMAT_VERSION: u32 = 5;
 
 const MANIFEST: &str = "manifest.json";
 const THUMBNAIL: &str = "thumb.png";
 
 fn cel_path(image: u32) -> String {
     format!("cels/{image}.png")
+}
+
+fn tileset_path(id: u32) -> String {
+    format!("tiles/{id}.png")
 }
 
 fn reference_path(image: u32) -> String {
@@ -66,6 +73,63 @@ struct Manifest {
     tags: Vec<TagData>,
     /// Cels that are one and the same.
     links: Vec<LinkData>,
+    tilesets: Vec<TilesetData>,
+    /// The tiles of each tilemap cel. Their pixels are not stored: the tiles are.
+    grids: Vec<GridData>,
+    slices: Vec<SliceData>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TilesetData {
+    id: u32,
+    name: String,
+    tile_width: u32,
+    tile_height: u32,
+    /// How many tiles the picture `tiles/<id>.png` holds, and how many are in a row of it.
+    count: usize,
+    columns: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GridData {
+    layer: u32,
+    frame: usize,
+    width: u32,
+    height: u32,
+    /// Tile numbers row by row; 0 is no tile.
+    cells: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SliceData {
+    name: String,
+    /// `[x, y, width, height]` on the canvas.
+    rect: [i64; 4],
+    /// The stretching part of a 9-slice, relative to the slice's corner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    center: Option<[i64; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pivot: Option<[i32; 2]>,
+    color: String,
+}
+
+fn rect_data(rect: Rect) -> [i64; 4] {
+    [
+        i64::from(rect.x),
+        i64::from(rect.y),
+        i64::from(rect.w),
+        i64::from(rect.h),
+    ]
+}
+
+fn data_rect([x, y, w, h]: [i64; 4]) -> Result<Rect, IoError> {
+    let bad = || IoError::Invalid("a slice has an impossible rectangle".to_owned());
+    Ok(Rect::new(
+        i32::try_from(x).map_err(|_| bad())?,
+        i32::try_from(y).map_err(|_| bad())?,
+        u32::try_from(w).map_err(|_| bad())?,
+        u32::try_from(h).map_err(|_| bad())?,
+    ))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -124,6 +188,17 @@ enum LayerData {
         /// Bottom to top.
         children: Vec<LayerData>,
     },
+    Tilemap {
+        id: u32,
+        name: String,
+        visible: bool,
+        opacity: u8,
+        blend: String,
+        locked: bool,
+        alpha_lock: bool,
+        /// The id of the tileset the layer draws from.
+        tileset: u32,
+    },
     Reference {
         id: u32,
         name: String,
@@ -146,6 +221,16 @@ impl LayerData {
     fn from_layer<'a>(layer: &'a Layer, pictures: &mut Vec<&'a Image>) -> Self {
         let (id, name, visible) = (layer.id.0, layer.name.clone(), layer.visible);
         match &layer.kind {
+            LayerKind::Tilemap(tilemap) => Self::Tilemap {
+                id,
+                name,
+                visible,
+                opacity: tilemap.image.opacity,
+                blend: tilemap.image.blend.id().to_owned(),
+                locked: tilemap.image.locked,
+                alpha_lock: tilemap.image.alpha_lock,
+                tileset: tilemap.tileset.0,
+            },
             LayerKind::Reference(reference) => {
                 pictures.push(&reference.image);
                 Self::Reference {
@@ -189,6 +274,33 @@ impl LayerData {
         picture: &mut impl FnMut(u32) -> Result<Image, IoError>,
     ) -> Result<Layer, IoError> {
         Ok(match self {
+            Self::Tilemap {
+                id,
+                name,
+                visible,
+                opacity,
+                blend,
+                locked,
+                alpha_lock,
+                tileset,
+            } => {
+                let blend = BlendMode::from_id(&blend)
+                    .ok_or_else(|| IoError::Invalid(format!("`{blend}` is not a blend mode")))?;
+                Layer {
+                    id: LayerId(id),
+                    name,
+                    visible,
+                    kind: LayerKind::Tilemap(TilemapLayer {
+                        tileset: TilesetId(tileset),
+                        image: ImageLayer {
+                            opacity,
+                            blend,
+                            locked,
+                            alpha_lock,
+                        },
+                    }),
+                }
+            }
             Self::Reference {
                 id,
                 name,
@@ -276,7 +388,11 @@ struct CelData {
 /// Writes a sprite as an `.acms` archive.
 pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoError> {
     // Layer by layer, frame by frame, so that the same sprite always gives the same file.
-    let mut cels: Vec<_> = sprite.cels().collect();
+    // The picture of a tilemap cel is made from its tiles, so it is not stored.
+    let mut cels: Vec<_> = sprite
+        .cels()
+        .filter(|(layer, _, _)| sprite.tileset_of(*layer).is_none())
+        .collect();
     let painted: Vec<LayerId> = sprite.walk().iter().map(|entry| entry.layer.id).collect();
     let layer_order = |id: LayerId| painted.iter().position(|&layer| layer == id);
     cels.sort_by_key(|&(layer, frame, _)| (layer_order(layer), frame));
@@ -371,6 +487,40 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
                 frames,
             })
             .collect(),
+        tilesets: sprite
+            .tilesets()
+            .iter()
+            .map(|set| TilesetData {
+                id: set.id.0,
+                name: set.name.clone(),
+                tile_width: set.tile_width(),
+                tile_height: set.tile_height(),
+                count: set.len(),
+                columns: set.atlas_columns(),
+            })
+            .collect(),
+        grids: sprite
+            .grids()
+            .into_iter()
+            .map(|(layer, frame, grid)| GridData {
+                layer: layer.0,
+                frame,
+                width: grid.width(),
+                height: grid.height(),
+                cells: grid.cells().to_vec(),
+            })
+            .collect(),
+        slices: sprite
+            .slices()
+            .iter()
+            .map(|slice| SliceData {
+                name: slice.name.clone(),
+                rect: rect_data(slice.rect),
+                center: slice.center.map(rect_data),
+                pivot: slice.pivot.map(|pivot| [pivot.x, pivot.y]),
+                color: slice.color.to_hex(),
+            })
+            .collect(),
     };
 
     let text = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -392,6 +542,10 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
     for (picture, id) in pictures.into_iter().zip(1..) {
         zip.start_file(reference_path(id), image)?;
         encode_png(picture, &mut zip)?;
+    }
+    for set in sprite.tilesets() {
+        zip.start_file(tileset_path(set.id.0), image)?;
+        encode_png(&set.atlas(set.atlas_columns()), &mut zip)?;
     }
 
     zip.start_file(THUMBNAIL, image)?;
@@ -424,7 +578,18 @@ fn migrate(mut manifest: serde_json::Value, version: u64) -> Result<serde_json::
     if version <= 3 {
         upgrade_3_to_4(&mut manifest);
     }
+    if version <= 4 {
+        upgrade_4_to_5(&mut manifest);
+    }
     Ok(manifest)
+}
+
+/// Version 4 had neither tilesets and tilemaps nor slices.
+fn upgrade_4_to_5(manifest: &mut serde_json::Value) {
+    manifest["tilesets"] = serde_json::json!([]);
+    manifest["grids"] = serde_json::json!([]);
+    manifest["slices"] = serde_json::json!([]);
+    manifest["format_version"] = 5.into();
 }
 
 /// Version 3 had neither tags nor linked cels.
@@ -566,10 +731,74 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
         .into_iter()
         .map(|link| (LayerId(link.layer), link.frames))
         .collect();
+    let tilesets = manifest
+        .tilesets
+        .into_iter()
+        .map(|set| {
+            let valid = 1..=MAX_TILE_SIZE;
+            if !valid.contains(&set.tile_width) || !valid.contains(&set.tile_height) {
+                return Err(IoError::Invalid(format!(
+                    "tileset `{}` has an impossible tile size",
+                    set.name
+                )));
+            }
+            let atlas = decode_png(&read_entry(&mut zip, &tileset_path(set.id))?)?;
+            // The picture has to be large enough for the tiles it is said to hold.
+            let columns = set.columns.max(1);
+            let rows = (set.count as u64).div_ceil(u64::from(columns));
+            let fits = u64::from(atlas.width())
+                >= u64::from(columns.min(set.count as u32)) * u64::from(set.tile_width)
+                && u64::from(atlas.height()) >= rows * u64::from(set.tile_height);
+            if !fits {
+                return Err(IoError::Invalid(format!(
+                    "the picture of tileset `{}` is too small for its {} tiles",
+                    set.name, set.count
+                )));
+            }
+            let empty = Tileset::new(TilesetId(set.id), set.name, set.tile_width, set.tile_height);
+            Ok(empty.from_atlas(&atlas, set.count, columns))
+        })
+        .collect::<Result<Vec<_>, IoError>>()?;
+    for entry in sprite.walk() {
+        if let Some(tilemap) = entry.layer.as_tilemap()
+            && !tilesets.iter().any(|set| set.id == tilemap.tileset)
+        {
+            return Err(IoError::Invalid(format!(
+                "layer `{}` uses a tileset that is not in the file",
+                entry.layer.name
+            )));
+        }
+    }
+    let grids = manifest
+        .grids
+        .into_iter()
+        .map(|grid| {
+            let cells =
+                TileGrid::from_cells(grid.width, grid.height, grid.cells).ok_or_else(|| {
+                    IoError::Invalid("a tilemap has the wrong number of cells".to_owned())
+                })?;
+            Ok((LayerId(grid.layer), grid.frame, cells))
+        })
+        .collect::<Result<Vec<_>, IoError>>()?;
+    let slices = manifest
+        .slices
+        .into_iter()
+        .map(|slice| {
+            Ok(Slice {
+                name: slice.name,
+                rect: data_rect(slice.rect)?,
+                center: slice.center.map(data_rect).transpose()?,
+                pivot: slice.pivot.map(|[x, y]| Point::new(x, y)),
+                color: color(&slice.color)?,
+            })
+        })
+        .collect::<Result<Vec<_>, IoError>>()?;
     Ok(sprite
         .with_symmetry(symmetry)
         .with_links(links)
-        .with_tags(tags))
+        .with_tags(tags)
+        .with_tiles(tilesets, grids)
+        .with_slices(slices))
 }
 
 /// Saves a sprite to a file. An existing file is replaced only once the new one is complete.
@@ -587,7 +816,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::test_util::{TempPath, animated_sprite, drawn_sprite, layered_sprite};
+    use crate::test_util::{TempPath, animated_sprite, drawn_sprite, layered_sprite, tiled_sprite};
 
     fn archive(sprite: &Sprite) -> Vec<u8> {
         let mut bytes = Cursor::new(Vec::new());
@@ -684,7 +913,7 @@ mod tests {
         assert_eq!(sprite.palette().entries()[1].name.as_deref(), Some("glass"));
 
         // Saving writes the current version.
-        assert_eq!(manifest_json(&sprite)["format_version"], 4);
+        assert_eq!(manifest_json(&sprite)["format_version"], 5);
     }
 
     #[test]
@@ -729,7 +958,7 @@ mod tests {
         assert_eq!(names, ["cels/1.png", "manifest.json", "thumb.png"]);
 
         let manifest = manifest_json(&sprite);
-        assert_eq!(manifest["format_version"], 4);
+        assert_eq!(manifest["format_version"], 5);
         assert_eq!(manifest["width"], 24);
         assert_eq!(manifest["layers"][0]["kind"], "image");
         assert_eq!(manifest["layers"][0]["opacity"], 255);
@@ -752,7 +981,7 @@ mod tests {
             err,
             IoError::TooNew {
                 found: 99,
-                supported: 4
+                supported: 5
             }
         ));
         assert!(err.to_string().contains("format version 99"));
@@ -1152,5 +1381,132 @@ mod tests {
         let loaded = read(&stray).unwrap();
         assert!(loaded.link_groups().is_empty());
         assert_eq!(loaded.cels().count(), 7);
+    }
+    #[test]
+    fn tilesets_tilemaps_and_slices_round_trip() {
+        let sprite = tiled_sprite();
+        let bytes = archive(&sprite);
+        let loaded = read_acms(Cursor::new(bytes.clone())).unwrap();
+        assert_eq!(loaded, sprite);
+
+        // Spot checks, in case both sides agreed on losing something.
+        assert_eq!(loaded.tilesets().len(), 2);
+        assert_eq!(loaded.tilesets()[0].len(), 3);
+        assert_eq!(
+            loaded.grid(LayerId(2), 0).unwrap().cells(),
+            [1, 2, 2, 1, 0, 0, 3, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(loaded.pixel(LayerId(2), 0, 9, 5), Rgba8::rgb(60, 160, 70));
+        assert_eq!(loaded.pixel(LayerId(2), 0, 9, 6), Rgba8::TRANSPARENT);
+        assert_eq!(
+            loaded
+                .layer(LayerId(3))
+                .unwrap()
+                .as_image()
+                .unwrap()
+                .opacity,
+            128
+        );
+        assert_eq!(loaded.slices().len(), 2);
+        assert_eq!(loaded.slices()[0].center, Some(Rect::new(2, 2, 4, 4)));
+        assert_eq!(loaded.slices()[0].pivot, Some(Point::new(4, 7)));
+        assert_eq!(loaded.slices()[1].center, None);
+
+        // The tiles are stored, not the pictures they make: one cel image, two tilesets.
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut names: Vec<String> = zip
+            .file_names()
+            .map(|name| name.unwrap().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "cels/1.png",
+                "manifest.json",
+                "thumb.png",
+                "tiles/1.png",
+                "tiles/2.png"
+            ]
+        );
+        let manifest = manifest_json(&sprite);
+        assert_eq!(manifest["layers"][1]["kind"], "tilemap");
+        assert_eq!(manifest["layers"][1]["tileset"], 1);
+        assert_eq!(manifest["grids"][0]["cells"][1], 2);
+        assert_eq!(
+            manifest["slices"][0]["rect"],
+            serde_json::json!([4, 4, 8, 8])
+        );
+        // The thumbnail shows the tiles.
+        let thumb = decode_png(&read_entry(&mut zip, THUMBNAIL).unwrap()).unwrap();
+        assert_eq!(thumb, compositor::compose(&sprite, 0));
+    }
+
+    #[test]
+    fn a_loaded_tilemap_still_edits_its_tiles() {
+        use acms_core::document::Document;
+        use acms_core::image::Image;
+
+        let loaded = read_acms(Cursor::new(archive(&tiled_sprite()))).unwrap();
+        let mut document = Document::new(loaded);
+        let dot = Image::from_pixels(1, 1, vec![Rgba8::WHITE]).unwrap();
+        document
+            .transact("Paint", |tx| {
+                tx.set_pixels(LayerId(2), 0, Rect::new(5, 1, 1, 1), &dot)
+            })
+            .unwrap();
+        // Cells 1 and 2 hold the same tile: both show the dot.
+        assert_eq!(document.sprite().pixel(LayerId(2), 0, 9, 1), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn a_file_saved_by_the_phase_5_build_still_opens() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/phase5-v4.acms");
+        assert_eq!(load_acms(&path).unwrap(), animated_sprite());
+    }
+
+    #[test]
+    fn damaged_version_5_parts_are_errors_not_panics() {
+        let sprite = tiled_sprite();
+        let good = manifest_json(&sprite);
+        let mut zip = ZipArchive::new(Cursor::new(archive(&sprite))).unwrap();
+        let parts: Vec<(String, Vec<u8>)> = ["cels/1.png", "tiles/1.png", "tiles/2.png"]
+            .iter()
+            .map(|name| ((*name).to_owned(), read_entry(&mut zip, name).unwrap()))
+            .collect();
+        let read = |manifest: &serde_json::Value, skip: &str| {
+            let manifest = manifest.to_string();
+            let mut files: Vec<(&str, &[u8])> = vec![(MANIFEST, manifest.as_bytes())];
+            let kept = parts.iter().filter(|(name, _)| name != skip);
+            files.extend(kept.map(|(name, bytes)| (name.as_str(), &bytes[..])));
+            read_acms(Cursor::new(archive_with(&files)))
+        };
+        assert_eq!(read(&good, "").unwrap(), sprite);
+        // A tileset's picture is missing.
+        assert!(matches!(
+            read(&good, "tiles/2.png"),
+            Err(IoError::Invalid(_))
+        ));
+
+        let broken = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut manifest = good.clone();
+            edit(&mut manifest);
+            read(&manifest, "")
+        };
+        let invalid = [
+            broken(&|m| m["tilesets"][0]["count"] = 400.into()),
+            broken(&|m| m["tilesets"][0]["tile_width"] = 0.into()),
+            broken(&|m| m["layers"][1]["tileset"] = 9.into()),
+            broken(&|m| m["grids"][0]["width"] = 7.into()),
+            broken(&|m| m["slices"][0]["rect"] = serde_json::json!([0, 0, -4, 4])),
+            broken(&|m| m["slices"][0]["color"] = "blue".into()),
+        ];
+        for result in invalid {
+            assert!(matches!(result, Err(IoError::Invalid(_))), "{result:?}");
+        }
+        // Tiles for a layer that is not a tilemap are left out; the rest loads.
+        let loaded = broken(&|m| m["grids"][0]["layer"] = 1.into()).unwrap();
+        assert!(loaded.grid(LayerId(2), 0).is_none());
+        assert!(loaded.cel(LayerId(1), 0).is_some());
     }
 }

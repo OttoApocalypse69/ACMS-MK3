@@ -389,7 +389,37 @@ struct Meta {
     scale: &'static str,
     frame_tags: Vec<TagMeta>,
     layers: Vec<LayerMeta>,
-    slices: Vec<()>,
+    slices: Vec<SliceMeta>,
+}
+
+#[derive(Serialize)]
+struct SliceMeta {
+    name: String,
+    color: String,
+    /// Aseprite lets a slice change from frame to frame; here it is the same in all, so
+    /// there is one key, for frame 0.
+    keys: [SliceKey; 1],
+}
+
+#[derive(Serialize)]
+struct SliceKey {
+    frame: usize,
+    bounds: Area,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    center: Option<Area>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pivot: Option<XY>,
+}
+
+#[derive(Serialize)]
+struct XY {
+    x: i32,
+    y: i32,
+}
+
+/// A colour the way Aseprite writes it: `#rrggbbaa`.
+fn aseprite_color(color: acms_core::color::Rgba8) -> String {
+    color.to_hex().to_lowercase() + if color.a == 255 { "ff" } else { "" }
 }
 
 #[derive(Serialize)]
@@ -443,7 +473,7 @@ pub fn sheet_json(
             from: tag.from,
             to: tag.to,
             direction: tag.direction.id(),
-            color: tag.color.to_hex().to_lowercase() + if tag.color.a == 255 { "ff" } else { "" },
+            color: aseprite_color(tag.color),
         })
         .collect();
     let layers = sprite
@@ -473,7 +503,23 @@ pub fn sheet_json(
             scale: "1",
             frame_tags,
             layers,
-            slices: Vec::new(),
+            slices: sprite
+                .slices()
+                .iter()
+                .map(|slice| SliceMeta {
+                    name: slice.name.clone(),
+                    color: aseprite_color(slice.color),
+                    keys: [SliceKey {
+                        frame: 0,
+                        bounds: slice.rect.into(),
+                        center: slice.center.map(Area::from),
+                        pivot: slice.pivot.map(|pivot| XY {
+                            x: pivot.x,
+                            y: pivot.y,
+                        }),
+                    }],
+                })
+                .collect(),
         },
     };
     Ok(serde_json::to_string_pretty(&meta)?)
@@ -831,6 +877,38 @@ mod tests {
         assert_eq!(json["frames"]["hero 0.acms"]["trimmed"], false);
         assert_eq!(json["frames"]["hero 1.acms"]["duration"], 120);
         assert_eq!(json["meta"]["frameTags"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn slices_are_listed_in_the_metadata() {
+        let sprite = crate::test_util::tiled_sprite();
+        let sheet = build_sheet(&sprite, &[0], &SheetOptions::default()).unwrap();
+        let text = sheet_json(&sprite, &sheet, "level", "level.png").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["meta"]["slices"],
+            serde_json::json!([
+                {
+                    "name": "Door",
+                    "color": "#3c82f0ff",
+                    "keys": [{
+                        "frame": 0,
+                        "bounds": { "x": 4, "y": 4, "w": 8, "h": 8 },
+                        "center": { "x": 2, "y": 2, "w": 4, "h": 4 },
+                        "pivot": { "x": 4, "y": 7 }
+                    }]
+                },
+                {
+                    "name": "Hitbox",
+                    "color": "#ff000080",
+                    "keys": [{ "frame": 0, "bounds": { "x": 0, "y": 0, "w": 3, "h": 2 } }]
+                }
+            ])
+        );
+        // Tilemap layers are layers like any other in the list.
+        assert_eq!(json["meta"]["layers"][1]["name"], "Ground");
+        // And the sheet shows their tiles.
+        assert_eq!(sheet.image, compositor::compose(&sprite, 0));
     }
 
     #[test]

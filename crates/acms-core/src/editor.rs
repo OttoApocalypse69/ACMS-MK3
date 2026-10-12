@@ -16,7 +16,9 @@ use crate::tool::{
     BrushTool, CursorHint, Eyedropper, OptionKind, Outline, PointerEvent, Tool, ToolContext,
     ToolOptions,
 };
-use crate::tools::{BucketTool, GradientTool, MoveTool, SelectTool, ShapeTool};
+use crate::tools::{
+    BucketTool, GradientTool, MoveTool, SelectTool, ShapeTool, SliceTool, TileStampTool,
+};
 
 /// Identifies an open document for as long as it is open. Never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -79,6 +81,8 @@ impl Editor {
                 Box::new(SelectTool::rectangle()),
                 Box::new(SelectTool::lasso()),
                 Box::new(SelectTool::wand()),
+                Box::new(TileStampTool::default()),
+                Box::new(SliceTool::default()),
             ],
             active_tool: 0,
             interacting: false,
@@ -258,10 +262,22 @@ impl Editor {
             return None;
         }
         let document = self.document()?;
-        document
+        let layer = document.active_layer();
+        if let Err(block) = document
             .sprite()
-            .check_drawable(document.active_layer(), document.active_frame())
-            .err()
+            .check_drawable(layer, document.active_frame())
+        {
+            return Some(block);
+        }
+        // Tilemaps take the tile stamp, and pixel tools only in auto mode; other layers take
+        // everything but the tile stamp.
+        let on_tilemap = document.sprite().tileset_of(layer).is_some();
+        let stamping = self.active_tool() == "tile_stamp";
+        match (on_tilemap, stamping) {
+            (false, true) => Some(SpriteError::NotATilemap(layer.0)),
+            (true, false) if !self.options.tile_auto => Some(SpriteError::StampMode),
+            _ => None,
+        }
     }
 
     /// The stroke being drawn right now, to be shown on top of the sprite.
@@ -343,7 +359,9 @@ mod tests {
                 "move",
                 "select_rectangle",
                 "lasso",
-                "magic_wand"
+                "magic_wand",
+                "tile_stamp",
+                "slice"
             ]
         );
         assert_eq!(editor.active_tool(), "pencil");

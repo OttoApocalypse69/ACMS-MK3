@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use acms_core::color::Rgba8;
 use acms_core::command::{CommandRegistry, Params};
+use acms_core::geom::{Point, Rect};
 use acms_core::palette::MAX_RAMP_STEPS;
 use acms_core::sprite::{Direction, MAX_FRAME_MS, MAX_SPRITE_SIZE};
 use acms_io::export::{SheetLayout, SheetOptions};
@@ -52,6 +53,12 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &CommandRegistr
                 color,
             } => tag(ui, state, index, name, from, to, direction, color),
             Dialog::FrameDuration { ms } => frame_duration(ui, ms),
+            Dialog::Slice {
+                name,
+                rect,
+                center,
+                pivot,
+            } => slice(ui, name, rect, center, pivot),
             Dialog::Export {
                 kind,
                 scale,
@@ -179,6 +186,11 @@ fn size(
         SizePurpose::CanvasSize => ("Canvas Size", "sprite.canvas_size", "Resize"),
         SizePurpose::SpriteSize => ("Sprite Size", "sprite.size", "Scale"),
         SizePurpose::ScaleSelection => ("Scale Selection", "selection.scale", "Scale"),
+        SizePurpose::NewTilemap => (
+            "New Tilemap Layer: Tile Size",
+            "layer.new_tilemap",
+            "Create",
+        ),
     };
     ui.heading(title);
     Grid::new("size").num_columns(2).show(ui, |ui| {
@@ -203,8 +215,15 @@ fn size(
             ui.end_row();
         }
     });
-    if purpose != SizePurpose::CanvasSize {
-        ui.label(RichText::new("Pixels are repeated or dropped, never blended.").weak());
+    match purpose {
+        SizePurpose::CanvasSize => {}
+        SizePurpose::NewTilemap => {
+            let hint = "The layer gets a tileset of its own. Draw on it to make tiles.";
+            ui.label(RichText::new(hint).weak());
+        }
+        SizePurpose::SpriteSize | SizePurpose::ScaleSelection => {
+            ui.label(RichText::new("Pixels are repeated or dropped, never blended.").weak());
+        }
     }
 
     match buttons(ui, confirm) {
@@ -444,6 +463,108 @@ fn export(
             tag,
             sheet,
             json,
+        }),
+    }
+}
+
+/// The selected slice: its name and rectangle, and the optional 9-slice centre and pivot.
+fn slice(
+    ui: &mut Ui,
+    mut name: String,
+    mut rect: Rect,
+    mut center: Option<Rect>,
+    mut pivot: Option<Point>,
+) -> Outcome {
+    ui.heading("Edit Slice");
+    let rect_fields = |ui: &mut Ui, rect: &mut Rect| {
+        ui.horizontal(|ui| {
+            ui.add(DragValue::new(&mut rect.x).prefix("x "));
+            ui.add(DragValue::new(&mut rect.y).prefix("y "));
+            ui.add(
+                DragValue::new(&mut rect.w)
+                    .range(1..=MAX_SPRITE_SIZE)
+                    .prefix("w "),
+            );
+            ui.add(
+                DragValue::new(&mut rect.h)
+                    .range(1..=MAX_SPRITE_SIZE)
+                    .prefix("h "),
+            );
+        });
+    };
+    Grid::new("slice").num_columns(2).show(ui, |ui| {
+        ui.label("Name");
+        ui.text_edit_singleline(&mut name);
+        ui.end_row();
+
+        ui.label("Area");
+        rect_fields(ui, &mut rect);
+        ui.end_row();
+
+        let mut nine = center.is_some();
+        ui.checkbox(&mut nine, "9-slice centre")
+            .on_hover_text("The part that stretches, measured from the slice's corner");
+        match (nine, &mut center) {
+            (true, Some(center)) => rect_fields(ui, center),
+            // Switched on: start with the middle third.
+            (true, None) => {
+                center = Some(Rect::new(
+                    (rect.w / 3) as i32,
+                    (rect.h / 3) as i32,
+                    (rect.w / 3).max(1),
+                    (rect.h / 3).max(1),
+                ));
+            }
+            (false, _) => center = None,
+        }
+        ui.end_row();
+
+        let mut has_pivot = pivot.is_some();
+        ui.checkbox(&mut has_pivot, "Pivot")
+            .on_hover_text("A point to hold the slice by, measured from its corner");
+        match (has_pivot, &mut pivot) {
+            (true, Some(pivot)) => {
+                ui.horizontal(|ui| {
+                    ui.add(DragValue::new(&mut pivot.x).prefix("x "));
+                    ui.add(DragValue::new(&mut pivot.y).prefix("y "));
+                });
+            }
+            (true, None) => pivot = Some(Point::new((rect.w / 2) as i32, (rect.h / 2) as i32)),
+            (false, _) => pivot = None,
+        }
+        ui.end_row();
+    });
+
+    match buttons(ui, "Change") {
+        (true, _) => {
+            let mut params = Params::new()
+                .with("name", name.as_str())
+                .with("x", i64::from(rect.x))
+                .with("y", i64::from(rect.y))
+                .with("width", rect.w)
+                .with("height", rect.h)
+                .with("nine", center.is_some())
+                .with("pivot", pivot.is_some());
+            if let Some(center) = center {
+                params = params
+                    .with("center_x", i64::from(center.x))
+                    .with("center_y", i64::from(center.y))
+                    .with("center_width", center.w)
+                    .with("center_height", center.h);
+            }
+            if let Some(pivot) = pivot {
+                params = params
+                    .with("pivot_x", i64::from(pivot.x))
+                    .with("pivot_y", i64::from(pivot.y));
+            }
+            Outcome::Run("slice.edit".to_owned(), params)
+        }
+        (_, true) => Outcome::Dismissed,
+        _ => Outcome::Open(Dialog::Slice {
+            name,
+            rect,
+            center,
+            pivot,
         }),
     }
 }

@@ -5,7 +5,27 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 ## Current state
 
 **Phases 0 to 5 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
-features, animation). Next is Phase 6 (not started).
+features, animation). **Phase 6 is in progress.**
+
+## Phase 6 task list
+
+Core:
+
+- [ ] Tilesets and tilemap layers: a grid of tile numbers per cel, drawn from the tileset
+- [ ] Auto mode: pixel tools on a tilemap edit the tile (every instance updates), make new tiles when needed and merge duplicates
+- [ ] Stamp mode: the tile stamp tool places existing tiles; pixel tools leave tilemaps alone
+- [ ] Slices: name, rectangle, optional 9-slice centre and pivot; a slice tool; all undoable
+
+IO:
+
+- [ ] `.acms` format version 5 (tilesets, tilemap layers, slices) with a migration from version 4
+- [ ] Export: tileset PNG, tilemap as Tiled `.tmj` and CSV; slices in the spritesheet JSON
+
+App:
+
+- [ ] Commands, shortcuts and menus for tilemaps, tiles, slices and the exports
+- [ ] Tileset panel (tile picker), tile grid and slices on the canvas, slice dialog
+- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directories 6, serde 1,
@@ -424,8 +444,8 @@ App (`acms-app`):
 - **Spritesheet JSON is Aseprite's "hash" form**, with the frames written in order and named
   `<file name> <number>.acms`. Padding is put around every frame and along the sheet's edge.
 - **`.acms` format version 4.** Versions 1 to 3 are upgraded when loaded.
-- **New dependency: `gif`** (0.14, with `color_quant` and `weezl`), for the GIF export. Added
-  without asking first, as a small, standard crate; it also decodes, which the tests use.
+- **New dependency: `gif`** (0.14, with `color_quant` and `weezl`), for the GIF export; kept
+  (agreed 2026-10-12). It also decodes, which the tests use.
 - **Adding, removing and dragging palette colours** are part of Phase 4 (agreed 2026-10-12).
   Dragging a swatch onto another moves it there; the selection is cleared, since it is made of
   positions.

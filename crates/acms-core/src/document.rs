@@ -15,6 +15,7 @@ use crate::sprite::{
     LayerProps, MAX_FRAME_MS, MAX_SPRITE_SIZE, Palette, PlacedCel, Slot, Sprite, SpriteError,
     Symmetry, Tag,
 };
+use crate::tiles::{MAX_TILE_SIZE, Slice, Tileset, TilesetId};
 
 /// Default cap on the memory the undo history may hold.
 pub const DEFAULT_HISTORY_BYTES: usize = 256 * 1024 * 1024;
@@ -82,10 +83,14 @@ enum Op {
         before: Box<Palette>,
         after: Box<Palette>,
     },
-    /// Frames, the cels in them, links between cels or tags changed.
+    /// Frames, the cels in them, links between cels, tags, tilesets or tiles changed.
     Frames {
         before: Box<FrameState>,
         after: Box<FrameState>,
+    },
+    Slices {
+        before: Vec<Slice>,
+        after: Vec<Slice>,
     },
 }
 
@@ -107,6 +112,7 @@ impl Op {
             Self::Canvas { after, .. } => sprite.set_canvas_state((**after).clone()),
             Self::Palette { after, .. } => sprite.set_palette((**after).clone()),
             Self::Frames { after, .. } => sprite.set_frame_state((**after).clone()),
+            Self::Slices { after, .. } => sprite.set_slices(after.clone()),
         }
     }
 
@@ -127,6 +133,7 @@ impl Op {
             Self::Canvas { before, .. } => sprite.set_canvas_state((**before).clone()),
             Self::Palette { before, .. } => sprite.set_palette((**before).clone()),
             Self::Frames { before, .. } => sprite.set_frame_state((**before).clone()),
+            Self::Slices { before, .. } => sprite.set_slices(before.clone()),
         }
     }
 
@@ -138,7 +145,7 @@ impl Op {
             Self::Insert(placement) | Self::Remove(placement) => placement.bounds(),
             Self::Move { id, .. } | Self::Props { id, .. } => sprite.layer_bounds(*id),
             // The outline is drawn by the view, not composed into the picture.
-            Self::Selection { .. } | Self::Palette { .. } => Rect::EMPTY,
+            Self::Selection { .. } | Self::Palette { .. } | Self::Slices { .. } => Rect::EMPTY,
             Self::Canvas { .. } | Self::Frames { .. } => {
                 Rect::from_size(MAX_SPRITE_SIZE, MAX_SPRITE_SIZE)
             }
@@ -153,7 +160,7 @@ impl Op {
                 .iter()
                 .map(|(_, _, cel)| cel.image().byte_size())
                 .sum(),
-            Self::Move { .. } | Self::Props { .. } => 0,
+            Self::Move { .. } | Self::Props { .. } | Self::Slices { .. } => 0,
             // The pictures are shared with the sprite; only the bookkeeping is extra.
             Self::Frames { before, after } => {
                 (before.cels.len() + after.cels.len()) * std::mem::size_of::<Cel>()
@@ -238,6 +245,12 @@ impl Transaction<'_> {
                 got_h: pixels.height(),
             });
         }
+        // A tilemap has no pixels of its own: the write goes to its tiles.
+        if self.sprite.tileset_of(layer).is_some() {
+            let context = self.sprite.tile_context();
+            self.edit_frames(|state| state.edit_tile_pixels(&context, layer, frame, rect, pixels));
+            return Ok(());
+        }
 
         let target = rect.intersect(self.sprite.bounds());
         let before = self.sprite.read_region(layer, frame, target);
@@ -288,6 +301,107 @@ impl Transaction<'_> {
             self.push(Op::Selection { before, after });
         }
         Ok(())
+    }
+
+    /// Adds an empty tileset. Returns its id.
+    pub fn add_tileset(&mut self, name: &str, tile_width: u32, tile_height: u32) -> TilesetId {
+        let highest = self.sprite.tilesets().iter().map(|set| set.id.0).max();
+        let id = TilesetId(highest.map_or(1, |id| id + 1));
+        let size = |side: u32| side.clamp(1, MAX_TILE_SIZE);
+        let tileset = Tileset::new(id, name, size(tile_width), size(tile_height));
+        self.edit_frames(|state| state.tilesets.push(tileset));
+        id
+    }
+
+    /// Adds an empty tilemap layer that draws from `tileset`. Returns its id.
+    pub fn add_tilemap_layer(
+        &mut self,
+        slot: Slot,
+        name: &str,
+        tileset: TilesetId,
+    ) -> Result<LayerId, SpriteError> {
+        self.check_slot(slot, false)?;
+        if self.sprite.tileset(tileset).is_none() {
+            return Err(SpriteError::UnknownTileset(tileset.0));
+        }
+        let id = self.new_layer_id();
+        self.push(Op::Insert(Box::new(Placement {
+            slot,
+            layer: Layer::tilemap(id, name, tileset),
+            cels: Vec::new(),
+        })));
+        Ok(id)
+    }
+
+    /// Puts tiles into cells of a tilemap cel: `(column, row, tile number)` each, 0 for none.
+    /// Cells outside the map and tile numbers the set does not have are ignored or emptied.
+    pub fn set_tiles(
+        &mut self,
+        layer: LayerId,
+        frame: usize,
+        cells: &[(u32, u32, u32)],
+    ) -> Result<(), SpriteError> {
+        if self.sprite.check_cel(layer, frame)?.locked {
+            return Err(SpriteError::LayerLocked(layer.0));
+        }
+        if self.sprite.tileset_of(layer).is_none() {
+            return Err(SpriteError::NotATilemap(layer.0));
+        }
+        let context = self.sprite.tile_context();
+        self.edit_frames(|state| state.set_tiles(&context, layer, frame, cells));
+        Ok(())
+    }
+
+    fn check_slice(slice: &Slice) -> Result<(), SpriteError> {
+        if slice.name.trim().is_empty() || slice.rect.is_empty() {
+            return Err(SpriteError::InvalidSlice);
+        }
+        Ok(())
+    }
+
+    fn edit_slices(&mut self, edit: impl FnOnce(&mut Vec<Slice>)) {
+        let before = self.sprite.slices().to_vec();
+        let mut after = before.clone();
+        edit(&mut after);
+        if after != before {
+            self.push(Op::Slices { before, after });
+        }
+    }
+
+    /// Adds a slice. Returns its position among the slices.
+    pub fn add_slice(&mut self, slice: Slice) -> Result<usize, SpriteError> {
+        Self::check_slice(&slice)?;
+        self.edit_slices(|slices| slices.push(slice));
+        Ok(self.sprite.slices().len() - 1)
+    }
+
+    /// Replaces the slice at `index`.
+    pub fn set_slice(&mut self, index: usize, slice: Slice) -> Result<(), SpriteError> {
+        if index >= self.sprite.slices().len() {
+            return Err(SpriteError::UnknownSlice(index));
+        }
+        Self::check_slice(&slice)?;
+        self.edit_slices(|slices| slices[index] = slice);
+        Ok(())
+    }
+
+    pub fn remove_slice(&mut self, index: usize) -> Result<(), SpriteError> {
+        if index >= self.sprite.slices().len() {
+            return Err(SpriteError::UnknownSlice(index));
+        }
+        self.edit_slices(|slices| {
+            slices.remove(index);
+        });
+        Ok(())
+    }
+
+    /// Tilemaps are laid out on the canvas as it is; resizing would have to re-cut them.
+    fn check_no_tilemaps(&self) -> Result<(), SpriteError> {
+        if self.sprite.tile_context().layers.is_empty() {
+            Ok(())
+        } else {
+            Err(SpriteError::HasTilemaps)
+        }
     }
 
     /// Changes what is laid out along the time axis, as one reversible step.
@@ -417,6 +531,9 @@ impl Transaction<'_> {
     ) -> Result<(), SpriteError> {
         self.sprite.check_cel(from.0, from.1)?;
         self.sprite.check_cel(to.0, to.1)?;
+        if self.sprite.tileset_of(from.0).is_some() || self.sprite.tileset_of(to.0).is_some() {
+            return Err(SpriteError::TilemapCel);
+        }
         if from == to {
             return Ok(());
         }
@@ -443,6 +560,9 @@ impl Transaction<'_> {
     ) -> Result<(), SpriteError> {
         if self.sprite.check_cel(layer, source)?.locked {
             return Err(SpriteError::LayerLocked(layer.0));
+        }
+        if self.sprite.tileset_of(layer).is_some() {
+            return Err(SpriteError::TilemapCel);
         }
         for frame in frames {
             self.check_frame(*frame)?;
@@ -552,6 +672,7 @@ impl Transaction<'_> {
         dx: i32,
         dy: i32,
     ) -> Result<(), SpriteError> {
+        self.check_no_tilemaps()?;
         let mut cels = self.sprite.cel_sources();
         for cel in &mut cels {
             cel.origin = Point::new(cel.origin.x + dx, cel.origin.y + dy);
@@ -561,6 +682,7 @@ impl Transaction<'_> {
 
     /// Scales the whole sprite to a new size with nearest-neighbour sampling.
     pub fn scale_sprite(&mut self, width: u32, height: u32) -> Result<(), SpriteError> {
+        self.check_no_tilemaps()?;
         let bounds = self.sprite.bounds();
         let cels = self
             .sprite
@@ -680,6 +802,17 @@ impl Transaction<'_> {
             layer: copy,
             cels,
         })));
+        // A copied tilemap needs its tiles as well as the picture they make.
+        self.edit_frames(|state| {
+            let copies: Vec<_> = state
+                .grids
+                .iter()
+                .filter_map(|((layer, frame), grid)| {
+                    Some(((*renamed.get(layer)?, *frame), grid.clone()))
+                })
+                .collect();
+            state.grids.extend(copies);
+        });
         Ok(copy_id)
     }
 
@@ -754,7 +887,7 @@ impl Transaction<'_> {
             .index
             .checked_sub(1)
             .and_then(|index| self.sprite.siblings(slot.parent).ok()?.get(index))
-            .filter(|layer| layer.as_image().is_some())
+            .filter(|layer| layer.as_image().is_some() && !layer.is_tilemap())
             .ok_or(SpriteError::NothingBelow)?
             .id;
 
@@ -863,6 +996,8 @@ pub struct Document {
     damage: Rect,
     active_layer: LayerId,
     active_frame: usize,
+    /// The slice that is selected, if any. Not part of undo.
+    active_slice: Option<usize>,
 }
 
 impl Document {
@@ -879,6 +1014,7 @@ impl Document {
             damage: Rect::EMPTY,
             active_layer: LayerId(0),
             active_frame: 0,
+            active_slice: None,
         };
         document.repair_active_layer();
         document
@@ -918,6 +1054,9 @@ impl Document {
     /// Makes sure the active layer exists, falling back to the topmost image layer.
     fn repair_active_layer(&mut self) {
         self.active_frame = self.active_frame.min(self.sprite.frames().len() - 1);
+        self.active_slice = self
+            .active_slice
+            .filter(|slice| *slice < self.sprite.slices().len());
         if self.sprite.layer(self.active_layer).is_some() {
             return;
         }
@@ -929,6 +1068,16 @@ impl Document {
         if let Some(entry) = fallback {
             self.active_layer = entry.layer.id;
         }
+    }
+
+    /// The selected slice, if any.
+    pub fn active_slice(&self) -> Option<usize> {
+        self.active_slice
+    }
+
+    /// Selects a slice, or none. Not an undo step.
+    pub fn set_active_slice(&mut self, slice: Option<usize>) {
+        self.active_slice = slice.filter(|slice| *slice < self.sprite.slices().len());
     }
 
     /// The frame being shown and edited.

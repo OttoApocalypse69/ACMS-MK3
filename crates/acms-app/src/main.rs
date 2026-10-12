@@ -23,6 +23,7 @@ mod preview;
 mod state;
 mod status;
 mod theme;
+mod tile_commands;
 mod timeline;
 
 fn main() -> anyhow::Result<()> {

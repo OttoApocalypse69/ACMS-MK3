@@ -91,6 +91,11 @@ pub struct ToolOptions {
     pub pixel_perfect: bool,
     /// Strokes that leave the canvas on one side come back in on the other.
     pub tiled: bool,
+    /// The tile the tile stamp places; 0 is none.
+    pub tile: u32,
+    /// Tilemaps are in auto mode: pixel tools draw on them and change their tiles. Off is
+    /// stamp mode, where only the tile stamp touches a tilemap.
+    pub tile_auto: bool,
     /// Rectangle and ellipse are filled rather than outlined.
     pub shape_filled: bool,
     /// Bucket and magic wand only take pixels connected to the one clicked.
@@ -109,6 +114,8 @@ impl Default for ToolOptions {
             dither_density: 50,
             pixel_perfect: false,
             tiled: false,
+            tile: 1,
+            tile_auto: true,
             shape_filled: false,
             fill_contiguous: true,
             tolerance: 0,
@@ -126,6 +133,10 @@ pub enum OptionKind {
     PixelPerfect,
     /// Symmetry and wrap-around drawing.
     Symmetry,
+    /// The tile to stamp and the tilemap mode.
+    Tiles,
+    /// The selected slice.
+    Slices,
     ShapeFill,
     Similarity,
     Gradient,
@@ -238,6 +249,14 @@ pub(crate) fn begin_stroke(
     buffer: StrokeBuffer,
 ) -> Option<Stroke> {
     let document = &*ctx.document;
+    // In stamp mode the tiles of a tilemap are not to be drawn on.
+    let on_tilemap = document
+        .sprite()
+        .tileset_of(document.active_layer())
+        .is_some();
+    if on_tilemap && !ctx.options.tile_auto {
+        return None;
+    }
     let settings = StrokeSettings {
         brush: ctx.brush.clone(),
         ink,

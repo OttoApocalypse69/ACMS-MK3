@@ -724,3 +724,36 @@ fn symmetry_pixel_perfect_and_dither_in_one_stroke() {
     assert_eq!(document.history().collect::<Vec<_>>(), ["Pencil"]);
     check("symmetry_pixel_perfect_dither", &editor);
 }
+
+// Phase 6: tilemaps.
+
+#[test]
+fn tile_stamp_and_auto_mode() {
+    let mut editor = editor();
+    let document = editor.document_mut().expect("a document is open");
+    let map = document
+        .transact("Tilemap", |tx| {
+            let tileset = tx.add_tileset("Tiles", 8, 8);
+            tx.add_tilemap_layer(Slot::new(None, 1), "Map", tileset)
+        })
+        .unwrap();
+    document.set_active_layer(map);
+
+    // Auto mode: a cross drawn in the first cell becomes tile 1.
+    editor.brush = Brush::new(BrushShape::Round, 2);
+    primary(&mut editor, &[(1, 1), (6, 6)]);
+    drag(&mut editor, PointerButton::Secondary, &[(1, 6), (6, 1)]);
+    // The stamp places it along two drags.
+    editor.set_active_tool("tile_stamp");
+    editor.options.tile = 1;
+    primary(&mut editor, &[(12, 4), (28, 4)]);
+    primary(&mut editor, &[(4, 20), (28, 28)]);
+    // A dot drawn on one of them shows on all of them.
+    editor.set_active_tool("pencil");
+    editor.primary = YELLOW;
+    primary(&mut editor, &[(19, 27)]);
+    // The other button of the stamp takes a tile away.
+    editor.set_active_tool("tile_stamp");
+    drag(&mut editor, PointerButton::Secondary, &[(12, 4)]);
+    check("tiles", &editor);
+}

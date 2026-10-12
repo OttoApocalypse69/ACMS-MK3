@@ -16,5 +16,9 @@ pub mod playback;
 pub mod selection;
 pub mod sprite;
 pub mod stroke;
+pub mod tiles;
 pub mod tool;
 pub mod tools;
+
+#[cfg(test)]
+mod tile_tests;

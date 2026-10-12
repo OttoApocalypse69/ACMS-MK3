@@ -121,6 +121,7 @@ pub struct PanelsUi {
     pub layers: LayersUi,
     pub timeline: TimelineUi,
     pub preview: PreviewUi,
+    tileset: TilesetUi,
     colour: ColourUi,
 }
 
@@ -164,6 +165,7 @@ impl TabViewer for PanelViewer<'_> {
             Panel::Log => log(ui, state),
             Panel::Timeline => timeline::show(ui, state, registry, keymap, &mut ui_state.timeline),
             Panel::Preview => preview::show(ui, state, registry, &mut ui_state.preview),
+            Panel::Tileset => tileset(ui, state, registry, &mut ui_state.tileset),
             other => {
                 ui.label(RichText::new(format!("{} — placeholder", other.title())).weak());
             }
@@ -353,6 +355,46 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                 let on = options.gradient_dither;
                 toggle(ui, state, on, "Dithered", "tool.set_dither", "dither");
                 ui.label(RichText::new("From the primary to the secondary colour.").weak());
+            }
+            OptionKind::Tiles => {
+                let on = options.tile_auto;
+                toggle(ui, state, on, "Auto mode", "tile.toggle_mode", "auto");
+                let hint = if options.tile == 0 {
+                    "Placing no tile: the stamp clears cells.".to_owned()
+                } else {
+                    format!(
+                        "Placing tile {}. Pick another in the Tileset panel.",
+                        options.tile
+                    )
+                };
+                ui.label(RichText::new(hint).weak());
+                ui.label(RichText::new("The right button clears a cell.").weak());
+            }
+            OptionKind::Slices => {
+                let selected = state.editor.document().and_then(|document| {
+                    let slice = document.sprite().slices().get(document.active_slice()?)?;
+                    Some(format!(
+                        "{} ({} \u{d7} {})",
+                        slice.name, slice.rect.w, slice.rect.h
+                    ))
+                });
+                match selected {
+                    Some(name) => {
+                        ui.label(name);
+                        ui.horizontal(|ui| {
+                            if ui.button("Edit\u{2026}").clicked() {
+                                commands::run(registry, state, "slice.edit", &Params::new());
+                            }
+                            if ui.button("Delete").clicked() {
+                                commands::run(registry, state, "slice.delete", &Params::new());
+                            }
+                        });
+                    }
+                    None => {
+                        ui.label(RichText::new("No slice selected.").weak());
+                    }
+                }
+                ui.label(RichText::new("Drag to make a slice. Click one to select it.").weak());
             }
             OptionKind::SelectionMode => {
                 ui.label(RichText::new("Shift adds, Alt subtracts, both intersect.").weak());
@@ -718,6 +760,112 @@ fn palette(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
             }
         });
     }
+}
+
+/// Side of one tile in the Tileset panel, in points.
+const TILE_SWATCH: f32 = 36.0;
+
+/// The Tileset panel's picture of the tiles, and the generation, revision and tileset it was
+/// made for.
+#[derive(Default)]
+pub struct TilesetUi {
+    texture: Option<((u64, u64, u32), egui::TextureHandle)>,
+}
+
+/// The tile picker: the tiles of the tileset in use, to pick the one the Tile Stamp places.
+fn tileset(ui: &mut Ui, state: &mut AppState, registry: &Registry, me: &mut TilesetUi) {
+    let Some(document) = state.editor.document() else {
+        no_sprite(ui);
+        return;
+    };
+    let Some(set) = crate::tile_commands::active_tileset(state) else {
+        ui.label(
+            RichText::new("No tileset yet. Layer \u{2192} New Tilemap Layer\u{2026} makes one.")
+                .weak(),
+        );
+        return;
+    };
+    let (count, columns) = (set.len() as u32, set.atlas_columns());
+    let (tile_w, tile_h) = (set.tile_width() as f32, set.tile_height() as f32);
+    let key = (state.editor.generation(), document.revision(), set.id.0);
+    if me
+        .texture
+        .as_ref()
+        .is_none_or(|(made_for, _)| *made_for != key)
+    {
+        let atlas = set.atlas(columns);
+        let size = [atlas.width() as usize, atlas.height() as usize];
+        let image = egui::ColorImage::from_rgba_unmultiplied(size, &atlas.to_rgba_bytes());
+        let texture = ui
+            .ctx()
+            .load_texture("tileset", image, egui::TextureOptions::NEAREST);
+        me.texture = Some((key, texture));
+    }
+    let name = format!("{}: {count} tiles of {tile_w} \u{d7} {tile_h}", set.name);
+    let picked = state.editor.options.tile;
+    let auto = state.editor.options.tile_auto;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(name);
+        let mut mode = auto;
+        if ui
+            .checkbox(&mut mode, "Auto mode")
+            .on_hover_text(
+                "On: pixel tools draw on tilemaps and change their tiles. Off (stamp mode): \
+                 only the Tile Stamp touches a tilemap.",
+            )
+            .changed()
+        {
+            let params = Params::new().with("auto", mode);
+            commands::run(registry, state, "tile.toggle_mode", &params);
+        }
+    });
+    if count == 0 {
+        ui.label(RichText::new("No tiles yet: draw on the tilemap layer to make some.").weak());
+        return;
+    }
+    let Some((_, texture)) = &me.texture else {
+        return;
+    };
+    let texture = texture.id();
+    let rows = count.div_ceil(columns) as f32;
+    // Tiles keep their shape; the longer side is one swatch long.
+    let scale = TILE_SWATCH / tile_w.max(tile_h);
+    let swatch = Vec2::new(tile_w, tile_h) * scale;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+        // Tile 0 is "no tile": the eraser of the stamp.
+        for tile in 0..=count {
+            let (rect, response) = ui.allocate_exact_size(swatch, Sense::click());
+            let painter = ui.painter_at(rect);
+            color_picker::show_color_at(&painter, Color32::TRANSPARENT, rect);
+            if tile > 0 {
+                let index = tile - 1;
+                let (column, row) = ((index % columns) as f32, (index / columns) as f32);
+                let uv = egui::Rect::from_min_max(
+                    egui::pos2(column / columns as f32, row / rows),
+                    egui::pos2((column + 1.0) / columns as f32, (row + 1.0) / rows),
+                );
+                painter.image(texture, rect, uv, Color32::WHITE);
+            }
+            let visuals = ui.visuals();
+            let stroke = if tile == picked {
+                Stroke::new(2.0, visuals.selection.stroke.color)
+            } else {
+                Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color)
+            };
+            painter.rect_stroke(rect, 2.0, stroke, StrokeKind::Inside);
+            let tip = if tile == 0 {
+                "No tile".to_owned()
+            } else {
+                format!("Tile {tile}")
+            };
+            if response.on_hover_text(tip).clicked() {
+                let params = Params::new().with("tile", tile);
+                commands::run(registry, state, "tile.select", &params);
+            }
+        }
+    });
 }
 
 fn history(ui: &mut Ui, state: &mut AppState, registry: &Registry) {

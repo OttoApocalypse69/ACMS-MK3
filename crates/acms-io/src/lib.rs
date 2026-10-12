@@ -4,6 +4,7 @@ pub mod acms;
 pub mod export;
 pub mod palette;
 pub mod png;
+pub mod tiled;
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -233,6 +234,78 @@ pub(crate) mod test_util {
                     to: 3,
                     direction: Direction::PingPong,
                     color: Rgba8::new(200, 90, 90, 128),
+                })?;
+                Ok::<_, SpriteError>(())
+            })
+            .unwrap();
+        document.sprite().clone()
+    }
+
+    /// A sprite with tilemaps and a slice: 16×12, tiles of 4×4, so maps of 4 × 3 tiles.
+    ///
+    /// ```text
+    /// Props      tilemap, half transparent, tileset "Props": one tile, in cell (1, 1)
+    /// Ground     tilemap, tileset "Ground": tiles 1 2 2 1 / . . 3 . / . . . .
+    /// Backdrop   an ordinary layer with a block on it
+    /// slice      "Door": a rectangle with a 9-slice centre and a pivot
+    /// ```
+    pub fn tiled_sprite() -> Sprite {
+        use acms_core::geom::Rect;
+        use acms_core::image::Image;
+        use acms_core::sprite::{Slot, SpriteError};
+        use acms_core::tiles::Slice;
+
+        let block = |w: u32, h: u32, color: Rgba8| {
+            Image::from_pixels(w, h, vec![color; (w * h) as usize]).unwrap()
+        };
+        let mut document = Document::new(Sprite::new(16, 12).unwrap());
+        let (grass, earth) = (Rgba8::rgb(60, 160, 70), Rgba8::rgb(120, 80, 50));
+        document
+            .transact("Build", |tx| {
+                let backdrop = LayerId(1);
+                tx.update_layer(backdrop, |props| props.name = "Backdrop".to_owned())?;
+                tx.set_pixels(
+                    backdrop,
+                    0,
+                    Rect::new(2, 9, 5, 3),
+                    &block(5, 3, Rgba8::rgb(40, 60, 120)),
+                )?;
+
+                let ground_set = tx.add_tileset("Ground", 4, 4);
+                let ground = tx.add_tilemap_layer(Slot::new(None, 1), "Ground", ground_set)?;
+                // Drawn cell by cell, so the tiles are numbered in this order.
+                for (cell, color) in [(0, grass), (1, earth), (2, earth), (3, grass)] {
+                    tx.set_pixels(ground, 0, Rect::new(cell * 4, 0, 4, 4), &block(4, 4, color))?;
+                }
+                tx.set_pixels(ground, 0, Rect::new(8, 4, 4, 2), &block(4, 2, grass))?;
+
+                let props_set = tx.add_tileset("Props", 4, 4);
+                let props = tx.add_tilemap_layer(Slot::new(None, 2), "Props", props_set)?;
+                tx.set_pixels(
+                    props,
+                    0,
+                    Rect::new(5, 5, 2, 3),
+                    &block(2, 3, Rgba8::rgb(230, 200, 60)),
+                )?;
+                tx.update_layer(props, |layer| {
+                    if let Some(image) = &mut layer.image {
+                        image.opacity = 128;
+                    }
+                })?;
+
+                tx.add_slice(Slice {
+                    name: "Door".to_owned(),
+                    rect: Rect::new(4, 4, 8, 8),
+                    center: Some(Rect::new(2, 2, 4, 4)),
+                    pivot: Some(Point::new(4, 7)),
+                    color: Rgba8::rgb(60, 130, 240),
+                })?;
+                tx.add_slice(Slice {
+                    name: "Hitbox".to_owned(),
+                    rect: Rect::new(0, 0, 3, 2),
+                    center: None,
+                    pivot: None,
+                    color: Rgba8::new(255, 0, 0, 128),
                 })?;
                 Ok::<_, SpriteError>(())
             })

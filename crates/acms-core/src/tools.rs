@@ -650,6 +650,205 @@ impl Tool for MoveTool {
     }
 }
 
+/// Places tiles on a tilemap layer: the selected tile with the primary button, none with the
+/// secondary one. A drag is one undo step.
+#[derive(Default)]
+pub struct TileStampTool {
+    /// Shows the tiles of the drag before they are placed.
+    stroke: Option<Stroke>,
+    /// The cells of the drag: column, row and tile number.
+    cells: Vec<(u32, u32, u32)>,
+    /// Where the pointer was last, to fill in the cells a fast drag jumps over.
+    last: Option<Point>,
+    spare: StrokeBuffer,
+}
+
+impl TileStampTool {
+    /// Places tiles in every cell between the last pointer position and this one.
+    fn place(&mut self, ctx: &mut ToolContext<'_>, event: PointerEvent) {
+        let from = self.last.replace(event.position).unwrap_or(event.position);
+        for position in crate::stroke::line(from, event.position) {
+            self.place_at(ctx, position, event.button);
+        }
+    }
+
+    fn place_at(&mut self, ctx: &mut ToolContext<'_>, position: Point, button: PointerButton) {
+        let Some(stroke) = &mut self.stroke else {
+            return;
+        };
+        let sprite = ctx.document.sprite();
+        let Some(tileset) = sprite.tileset_of(stroke.layer()) else {
+            return;
+        };
+        let (tw, th) = (tileset.tile_width() as i32, tileset.tile_height() as i32);
+        let (cx, cy) = (position.x.div_euclid(tw), position.y.div_euclid(th));
+        let (width, height) = sprite.grid_size(tileset);
+        if cx < 0 || cy < 0 || cx as u32 >= width || cy as u32 >= height {
+            return;
+        }
+        let tile = match button {
+            PointerButton::Primary => ctx.options.tile,
+            PointerButton::Secondary => 0,
+        };
+        if self
+            .cells
+            .iter()
+            .any(|&(x, y, _)| (x, y) == (cx as u32, cy as u32))
+        {
+            return;
+        }
+        self.cells.push((cx as u32, cy as u32, tile));
+
+        let picture = tileset.tile(tile);
+        for y in 0..th {
+            for x in 0..tw {
+                let color = picture.map_or(Rgba8::TRANSPARENT, |picture| picture.get(x, y));
+                stroke.plot_unmasked(cx * tw + x, cy * th + y, color);
+            }
+        }
+        let cell = crate::geom::Rect::new(cx * tw, cy * th, tw as u32, th as u32);
+        ctx.document.add_damage(cell);
+    }
+}
+
+impl Tool for TileStampTool {
+    fn id(&self) -> &'static str {
+        "tile_stamp"
+    }
+
+    fn name(&self) -> &'static str {
+        "Tile Stamp"
+    }
+
+    fn pointer_down(&mut self, ctx: &mut ToolContext<'_>, event: PointerEvent) {
+        self.cancel(ctx);
+        let document = &*ctx.document;
+        let (layer, frame) = (document.active_layer(), document.active_frame());
+        if document.sprite().tileset_of(layer).is_none() {
+            return;
+        }
+        let buffer = std::mem::take(&mut self.spare);
+        let brush = crate::stroke::Brush::default();
+        self.stroke =
+            Stroke::begin(document.sprite(), layer, frame, brush, Ink::Erase, buffer).ok();
+        self.last = None;
+        self.place(ctx, event);
+    }
+
+    fn pointer_move(&mut self, ctx: &mut ToolContext<'_>, event: PointerEvent) {
+        self.place(ctx, event);
+    }
+
+    fn pointer_up(&mut self, ctx: &mut ToolContext<'_>, event: PointerEvent) {
+        self.place(ctx, event);
+        let Some(stroke) = self.stroke.take() else {
+            return;
+        };
+        let (layer, frame) = (stroke.layer(), stroke.frame());
+        let (buffer, covered) = stroke.cancel();
+        self.spare = buffer;
+        let cells = std::mem::take(&mut self.cells);
+        // The layer was a tilemap that could be drawn on when the drag began.
+        let _ = ctx
+            .document
+            .transact(self.name(), |tx| tx.set_tiles(layer, frame, &cells));
+        ctx.document.add_damage(covered);
+    }
+
+    fn cancel(&mut self, ctx: &mut ToolContext<'_>) {
+        self.cells.clear();
+        if let Some(stroke) = self.stroke.take() {
+            let (buffer, covered) = stroke.cancel();
+            self.spare = buffer;
+            ctx.document.add_damage(covered);
+        }
+    }
+
+    fn overlay(&self) -> Option<Overlay<'_>> {
+        overlay_of(self.stroke.as_ref())
+    }
+
+    fn options(&self) -> &'static [OptionKind] {
+        &[OptionKind::Tiles]
+    }
+}
+
+/// Colour new slices get.
+const SLICE_COLOR: Rgba8 = Rgba8::rgb(60, 130, 240);
+
+/// Drag to make a slice; click a slice to select it.
+#[derive(Default)]
+pub struct SliceTool {
+    /// Where the drag began and where it is now.
+    drag: Option<(Point, Point)>,
+}
+
+impl Tool for SliceTool {
+    fn id(&self) -> &'static str {
+        "slice"
+    }
+
+    fn name(&self) -> &'static str {
+        "Slice"
+    }
+
+    fn pointer_down(&mut self, _ctx: &mut ToolContext<'_>, event: PointerEvent) {
+        self.drag = Some((event.position, event.position));
+    }
+
+    fn pointer_move(&mut self, _ctx: &mut ToolContext<'_>, event: PointerEvent) {
+        if let Some((_, end)) = &mut self.drag {
+            *end = event.position;
+        }
+    }
+
+    fn pointer_up(&mut self, ctx: &mut ToolContext<'_>, event: PointerEvent) {
+        self.pointer_move(ctx, event);
+        let Some((start, end)) = self.drag.take() else {
+            return;
+        };
+        let sprite = ctx.document.sprite();
+        if start == end {
+            // The slice made last is drawn on top, so it is the one a click picks.
+            let hit = sprite
+                .slices()
+                .iter()
+                .rposition(|slice| slice.rect.contains(start));
+            ctx.document.set_active_slice(hit);
+            return;
+        }
+        let rect = rect_between(start, end).intersect(sprite.bounds());
+        let slice = crate::tiles::Slice {
+            name: format!("Slice {}", sprite.slices().len() + 1),
+            rect,
+            center: None,
+            pivot: None,
+            color: SLICE_COLOR,
+        };
+        // A drag that lies wholly outside the canvas makes nothing.
+        if let Ok(index) = ctx.document.transact("New Slice", |tx| tx.add_slice(slice)) {
+            ctx.document.set_active_slice(Some(index));
+        }
+    }
+
+    fn cancel(&mut self, _ctx: &mut ToolContext<'_>) {
+        self.drag = None;
+    }
+
+    fn options(&self) -> &'static [OptionKind] {
+        &[OptionKind::Slices]
+    }
+
+    fn outline(&self) -> Option<Outline> {
+        let (start, end) = self.drag?;
+        (start != end).then(|| Outline::Rect(rect_between(start, end)))
+    }
+
+    fn paints(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

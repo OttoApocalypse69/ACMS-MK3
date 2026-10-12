@@ -240,6 +240,79 @@ impl CanvasView {
             StrokeKind::Outside,
         );
 
+        // The grid of a tilemap layer, when that is the layer being worked on.
+        let tile_size = state.editor.document().and_then(|document| {
+            let set = document.sprite().tileset_of(document.active_layer())?;
+            Some((set.tile_width() as i32, set.tile_height() as i32))
+        });
+        if let Some((tile_w, tile_h)) = tile_size {
+            let clipped = painter.with_clip_rect(sprite_rect.intersect(viewport));
+            let stroke = Stroke::new(1.0, tokens.accent.gamma_multiply(0.45));
+            let mut x = tile_w;
+            while x < sprite_bounds.right() {
+                clipped.vline(
+                    geometry.corner(Point::new(x, 0)).x,
+                    sprite_rect.y_range(),
+                    stroke,
+                );
+                x += tile_w;
+            }
+            let mut y = tile_h;
+            while y < sprite_bounds.bottom() {
+                clipped.hline(
+                    sprite_rect.x_range(),
+                    geometry.corner(Point::new(0, y)).y,
+                    stroke,
+                );
+                y += tile_h;
+            }
+        }
+
+        // Slices: each an outlined rectangle with its name; the selected one stronger, with
+        // its 9-slice centre and pivot.
+        if let Some(document) = state.editor.document() {
+            let active = document.active_slice();
+            for (index, slice) in document.sprite().slices().iter().enumerate() {
+                let c = slice.color;
+                let color = Color32::from_rgb(c.r, c.g, c.b);
+                let area = geometry.screen_rect(slice.rect);
+                let selected = active == Some(index);
+                let width = if selected { 2.0 } else { 1.0 };
+                painter.rect_stroke(area, 0.0, Stroke::new(width, color), StrokeKind::Inside);
+                painter.text(
+                    area.left_top() + Vec2::new(2.0, -1.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    &slice.name,
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    color,
+                );
+                if !selected {
+                    continue;
+                }
+                if let Some(center) = slice.center {
+                    let inner = center.translated(slice.rect.x, slice.rect.y);
+                    let inner = geometry.screen_rect(inner);
+                    let thin = Stroke::new(1.0, color.gamma_multiply(0.7));
+                    painter.vline(inner.left(), area.y_range(), thin);
+                    painter.vline(inner.right(), area.y_range(), thin);
+                    painter.hline(area.x_range(), inner.top(), thin);
+                    painter.hline(area.x_range(), inner.bottom(), thin);
+                }
+                if let Some(pivot) = slice.pivot {
+                    let at = Point::new(slice.rect.x + pivot.x, slice.rect.y + pivot.y);
+                    let at = geometry
+                        .screen_rect(PixelRect::new(at.x, at.y, 1, 1))
+                        .center();
+                    let arm = 5.0;
+                    let stroke = Stroke::new(2.0, color);
+                    painter
+                        .line_segment([at - Vec2::new(arm, 0.0), at + Vec2::new(arm, 0.0)], stroke);
+                    painter
+                        .line_segment([at - Vec2::new(0.0, arm), at + Vec2::new(0.0, arm)], stroke);
+                }
+            }
+        }
+
         // The mirror lines, or the spokes between the copies of a radial symmetry.
         let symmetry = state
             .editor

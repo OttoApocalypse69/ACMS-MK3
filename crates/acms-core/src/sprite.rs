@@ -13,6 +13,7 @@ use crate::color::Rgba8;
 use crate::geom::{Point, Rect};
 use crate::image::Image;
 use crate::selection::Mask;
+use crate::tiles::{Slice, TileGrid, Tileset, TilesetId};
 
 /// Largest width or height of a sprite. The canvas is shown as a single texture, and this is
 /// a size every GPU the app targets can hold.
@@ -45,6 +46,20 @@ pub enum SpriteError {
     TooLargeForBrush,
     #[error("the palette has no colours")]
     EmptyPalette,
+    #[error("layer {0} is not a tilemap layer")]
+    NotATilemap(u32),
+    #[error("there is no tileset {0}")]
+    UnknownTileset(u32),
+    #[error("tilemaps are in stamp mode: switch to auto mode to draw on tiles")]
+    StampMode,
+    #[error("the canvas cannot change size while the sprite has tilemap layers")]
+    HasTilemaps,
+    #[error("the cels of a tilemap layer cannot be moved, copied or linked")]
+    TilemapCel,
+    #[error("there is no slice {0}")]
+    UnknownSlice(usize),
+    #[error("a slice needs a name and a size")]
+    InvalidSlice,
     #[error("the last frame cannot be deleted")]
     LastFrame,
     #[error("there is no tag {0}")]
@@ -168,11 +183,20 @@ pub struct ReferenceLayer {
     pub rect: Rect,
 }
 
+/// A layer whose cels are grids of tiles from a tileset. It is shown, blended and locked
+/// like an image layer, and what it shows can be read as pixels; only writing differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TilemapLayer {
+    pub tileset: TilesetId,
+    pub image: ImageLayer,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayerKind {
     Image(ImageLayer),
     Group(GroupLayer),
     Reference(ReferenceLayer),
+    Tilemap(TilemapLayer),
 }
 
 /// How strokes are mirrored. The mirror lines and the centre of rotation are in the middle of
@@ -279,11 +303,38 @@ impl Layer {
         }
     }
 
+    /// A visible tilemap layer with default properties.
+    pub fn tilemap(id: LayerId, name: impl Into<String>, tileset: TilesetId) -> Self {
+        let tilemap = TilemapLayer {
+            tileset,
+            image: ImageLayer::default(),
+        };
+        Self {
+            id,
+            name: name.into(),
+            visible: true,
+            kind: LayerKind::Tilemap(tilemap),
+        }
+    }
+
+    /// The properties of a layer that has pixels to show: an image layer or a tilemap.
     pub fn as_image(&self) -> Option<&ImageLayer> {
         match &self.kind {
             LayerKind::Image(image) => Some(image),
+            LayerKind::Tilemap(tilemap) => Some(&tilemap.image),
             _ => None,
         }
+    }
+
+    pub fn as_tilemap(&self) -> Option<&TilemapLayer> {
+        match &self.kind {
+            LayerKind::Tilemap(tilemap) => Some(tilemap),
+            _ => None,
+        }
+    }
+
+    pub fn is_tilemap(&self) -> bool {
+        self.as_tilemap().is_some()
     }
 
     pub fn as_group(&self) -> Option<&GroupLayer> {
@@ -441,6 +492,23 @@ pub(crate) struct FrameState {
     pub cels: HashMap<(LayerId, usize), Cel>,
     pub links: HashMap<(LayerId, usize), u32>,
     pub tags: Vec<Tag>,
+    pub tilesets: Vec<Tileset>,
+    /// The tiles of each tilemap cel. The cel itself is the picture they make.
+    pub grids: HashMap<(LayerId, usize), Arc<TileGrid>>,
+}
+
+/// What a tile edit needs to know about the sprite around it.
+pub(crate) struct TileContext {
+    pub canvas: Rect,
+    /// Every tilemap layer and the tileset it uses.
+    pub layers: Vec<(LayerId, TilesetId)>,
+}
+
+impl TileContext {
+    fn tileset_of(&self, layer: LayerId) -> Option<TilesetId> {
+        let found = self.layers.iter().find(|(id, _)| *id == layer);
+        found.map(|(_, tileset)| *tileset)
+    }
 }
 
 impl FrameState {
@@ -457,7 +525,148 @@ impl FrameState {
             .into_iter()
             .filter_map(|((layer, frame), link)| Some(((layer, place(frame)?), link)))
             .collect();
+        let grids = std::mem::take(&mut self.grids);
+        self.grids = grids
+            .into_iter()
+            .filter_map(|((layer, frame), grid)| Some(((layer, place(frame)?), grid)))
+            .collect();
         self.drop_single_links();
+    }
+
+    /// How many tiles of this set cover the canvas, across and down.
+    fn grid_size(canvas: Rect, tileset: &Tileset) -> (u32, u32) {
+        (
+            canvas.w.div_ceil(tileset.tile_width()),
+            canvas.h.div_ceil(tileset.tile_height()),
+        )
+    }
+
+    /// Redraws the cels of every tilemap layer that uses `tileset` from their grids.
+    fn redraw(&mut self, context: &TileContext, tileset: TilesetId) {
+        let Some(set) = self.tilesets.iter().find(|set| set.id == tileset) else {
+            return;
+        };
+        // A cel without tiles is no cel.
+        self.grids.retain(|_, grid| !grid.is_empty());
+        let grids = &self.grids;
+        self.cels
+            .retain(|key, _| context.tileset_of(key.0) != Some(tileset) || grids.contains_key(key));
+        for ((layer, frame), grid) in &self.grids {
+            if context.tileset_of(*layer) != Some(tileset) {
+                continue;
+            }
+            let picture = grid.render(set).crop(context.canvas);
+            match Cel::cropped(&picture, Point::new(0, 0)) {
+                Some(cel) => self.cels.insert((*layer, *frame), cel),
+                None => self.cels.remove(&(*layer, *frame)),
+            };
+        }
+    }
+
+    /// Puts tiles into cells of one tilemap cel: `(column, row, tile number)` each.
+    pub fn set_tiles(
+        &mut self,
+        context: &TileContext,
+        layer: LayerId,
+        frame: usize,
+        cells: &[(u32, u32, u32)],
+    ) {
+        let Some(id) = context.tileset_of(layer) else {
+            return;
+        };
+        let Some(set) = self.tilesets.iter().find(|set| set.id == id) else {
+            return;
+        };
+        let (width, height) = Self::grid_size(context.canvas, set);
+        let count = set.len() as u32;
+        let grid = self
+            .grids
+            .entry((layer, frame))
+            .or_insert_with(|| Arc::new(TileGrid::new(width, height)));
+        let grid = Arc::make_mut(grid);
+        for &(x, y, tile) in cells {
+            grid.set(x, y, if tile <= count { tile } else { 0 });
+        }
+        self.redraw(context, id);
+    }
+
+    /// Writes pixels onto a tilemap cel by changing its tiles: a cell that holds a tile
+    /// changes that tile, and with it every other cell holding it; an empty cell gets a new
+    /// tile, or an existing one that looks the same. Afterwards tiles that have become
+    /// alike are merged and tiles with nothing left in them are dropped.
+    pub fn edit_tile_pixels(
+        &mut self,
+        context: &TileContext,
+        layer: LayerId,
+        frame: usize,
+        rect: Rect,
+        pixels: &Image,
+    ) {
+        let Some(id) = context.tileset_of(layer) else {
+            return;
+        };
+        let Some(at) = self.tilesets.iter().position(|set| set.id == id) else {
+            return;
+        };
+        // What the tiles looked like before this write: the incoming pixels were worked out
+        // against that, however many cells share a tile.
+        let before = self.tilesets[at].clone();
+        let set = &mut self.tilesets[at];
+        let (tw, th) = (set.tile_width() as i32, set.tile_height() as i32);
+        let (width, height) = Self::grid_size(context.canvas, set);
+        let mut grid = match self.grids.get(&(layer, frame)) {
+            Some(grid) if (grid.width(), grid.height()) == (width, height) => (**grid).clone(),
+            _ => TileGrid::new(width, height),
+        };
+
+        let target = rect.intersect(context.canvas);
+        if target.is_empty() {
+            return;
+        }
+        for cy in target.y / th..=(target.bottom() - 1) / th {
+            for cx in target.x / tw..=(target.right() - 1) / tw {
+                let number = grid.get(cx as u32, cy as u32);
+                let cell = Rect::new(cx * tw, cy * th, tw as u32, th as u32).intersect(target);
+                // The pixels this write changes in the cell, as places in the tile.
+                let mut changes = Vec::new();
+                for y in cell.y..cell.bottom() {
+                    for x in cell.x..cell.right() {
+                        let new = pixels.get(x - rect.x, y - rect.y).normalized();
+                        let (lx, ly) = (x - cx * tw, y - cy * th);
+                        let old = before
+                            .tile(number)
+                            .map_or(Rgba8::TRANSPARENT, |t| t.get(lx, ly));
+                        if new != old {
+                            changes.push((lx, ly, new));
+                        }
+                    }
+                }
+                if changes.is_empty() {
+                    continue;
+                }
+                if let Some(tile) = set.tile_mut(number) {
+                    for (x, y, color) in changes {
+                        tile.set(x, y, color);
+                    }
+                } else {
+                    let mut picture = Image::new(tw as u32, th as u32);
+                    for (x, y, color) in changes {
+                        picture.set(x, y, color);
+                    }
+                    let tile = set.find(&picture).unwrap_or_else(|| set.push(picture));
+                    grid.set(cx as u32, cy as u32, tile);
+                }
+            }
+        }
+        self.grids.insert((layer, frame), Arc::new(grid));
+
+        let renumber = self.tilesets[at].tidy();
+        for ((other, _), grid) in &mut self.grids {
+            if context.tileset_of(*other) == Some(id) {
+                Arc::make_mut(grid).renumber(&renumber);
+            }
+        }
+        self.redraw(context, id);
     }
 
     /// A link that only one cel is left in is no link.
@@ -686,6 +895,10 @@ pub struct Sprite {
     /// Which cels are one and the same: cels of a layer with the same number here always
     /// hold the same pixels. Kept apart from the cels, so that an empty cel can be linked.
     links: HashMap<(LayerId, usize), u32>,
+    tilesets: Vec<Tileset>,
+    /// The tiles of each tilemap cel; `cels` holds the picture they make.
+    grids: HashMap<(LayerId, usize), Arc<TileGrid>>,
+    slices: Vec<Slice>,
 }
 
 /// The size of the canvas and everything whose coordinates depend on it.
@@ -747,6 +960,9 @@ impl Sprite {
             symmetry: Symmetry::Off,
             tags: Vec::new(),
             links: HashMap::new(),
+            tilesets: Vec::new(),
+            grids: HashMap::new(),
+            slices: Vec::new(),
         };
         let mut ids: Vec<LayerId> = sprite.walk().iter().map(|entry| entry.layer.id).collect();
         ids.sort();
@@ -1113,7 +1329,95 @@ impl Sprite {
             cels: self.cels.clone(),
             links: self.links.clone(),
             tags: self.tags.clone(),
+            tilesets: self.tilesets.clone(),
+            grids: self.grids.clone(),
         }
+    }
+
+    pub fn tilesets(&self) -> &[Tileset] {
+        &self.tilesets
+    }
+
+    pub fn tileset(&self, id: TilesetId) -> Option<&Tileset> {
+        self.tilesets.iter().find(|set| set.id == id)
+    }
+
+    /// The tileset a layer draws from, if it is a tilemap layer.
+    pub fn tileset_of(&self, layer: LayerId) -> Option<&Tileset> {
+        self.tileset(self.layer(layer)?.as_tilemap()?.tileset)
+    }
+
+    /// The tiles of a tilemap cel; `None` if it has none.
+    pub fn grid(&self, layer: LayerId, frame: usize) -> Option<&TileGrid> {
+        self.grids.get(&(layer, frame)).map(|grid| &**grid)
+    }
+
+    /// How many tiles of a set cover the canvas, across and down.
+    pub fn grid_size(&self, tileset: &Tileset) -> (u32, u32) {
+        FrameState::grid_size(self.bounds(), tileset)
+    }
+
+    /// Every tilemap cel that has tiles, in a fixed order.
+    pub fn grids(&self) -> Vec<(LayerId, usize, &TileGrid)> {
+        let mut grids: Vec<(LayerId, usize, &TileGrid)> = self
+            .grids
+            .iter()
+            .map(|((layer, frame), grid)| (*layer, *frame, &**grid))
+            .collect();
+        grids.sort_by_key(|(layer, frame, _)| (*layer, *frame));
+        grids
+    }
+
+    pub(crate) fn tile_context(&self) -> TileContext {
+        TileContext {
+            canvas: self.bounds(),
+            layers: self
+                .walk()
+                .iter()
+                .filter_map(|entry| Some((entry.layer.id, entry.layer.as_tilemap()?.tileset)))
+                .collect(),
+        }
+    }
+
+    /// The same sprite with tilesets and the tiles of its tilemap cels, for building one from
+    /// a file. Grids for layers that are not tilemaps, or of the wrong size, are dropped.
+    pub fn with_tiles(
+        mut self,
+        tilesets: Vec<Tileset>,
+        grids: Vec<(LayerId, usize, TileGrid)>,
+    ) -> Self {
+        let mut state = self.frame_state();
+        state.tilesets = tilesets;
+        self.set_frame_state(state);
+        let context = self.tile_context();
+        let mut state = self.frame_state();
+        for (layer, frame, grid) in grids {
+            let fits = self.tileset_of(layer).is_some_and(|set| {
+                self.grid_size(set) == (grid.width(), grid.height()) && frame < self.frames.len()
+            });
+            if fits && !grid.is_empty() {
+                state.grids.insert((layer, frame), Arc::new(grid));
+            }
+        }
+        for set in state.tilesets.clone() {
+            state.redraw(&context, set.id);
+        }
+        self.set_frame_state(state);
+        self
+    }
+
+    pub fn slices(&self) -> &[Slice] {
+        &self.slices
+    }
+
+    /// The same sprite with these slices, for building one from a file.
+    pub fn with_slices(mut self, slices: Vec<Slice>) -> Self {
+        self.slices = slices;
+        self
+    }
+
+    pub(crate) fn set_slices(&mut self, slices: Vec<Slice>) {
+        self.slices = slices;
     }
 
     pub(crate) fn set_frame_state(&mut self, state: FrameState) {
@@ -1121,6 +1425,8 @@ impl Sprite {
         self.cels = state.cels;
         self.links = state.links;
         self.tags = state.tags;
+        self.tilesets = state.tilesets;
+        self.grids = state.grids;
     }
 
     /// Replaces the pixels of `rect` with `pixels` (which must be `rect`-sized), then re-crops
@@ -1266,6 +1572,7 @@ impl Sprite {
         layer.visible = props.visible;
         match (&mut layer.kind, props.image, props.reference) {
             (LayerKind::Image(image), Some(new), _) => *image = new,
+            (LayerKind::Tilemap(tilemap), Some(new), _) => tilemap.image = new,
             (LayerKind::Reference(reference), _, Some(new)) => {
                 reference.opacity = new.opacity;
                 reference.rect = new.rect;

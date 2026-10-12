@@ -217,6 +217,14 @@ pub enum Dialog {
     FrameDuration {
         ms: u32,
     },
+    /// The selected slice being changed.
+    Slice {
+        name: String,
+        rect: acms_core::geom::Rect,
+        /// The stretching part of a 9-slice, relative to the slice's corner.
+        center: Option<acms_core::geom::Rect>,
+        pivot: Option<acms_core::geom::Point>,
+    },
     /// The settings of an export; only those the kind uses are shown.
     Export {
         kind: ExportKind,
@@ -234,6 +242,8 @@ pub enum SizePurpose {
     CanvasSize,
     SpriteSize,
     ScaleSelection,
+    /// The size of the tiles of a new tilemap layer.
+    NewTilemap,
 }
 
 /// Where the existing picture sits when the canvas changes size.

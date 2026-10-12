@@ -13,6 +13,10 @@ pub fn draw_block_message(block: &SpriteError) -> &'static str {
     match block {
         SpriteError::LayerLocked(_) => "The selected layer is locked",
         SpriteError::LayerHidden(_) => "The selected layer is hidden",
+        SpriteError::StampMode => {
+            "Tilemaps are in stamp mode: use the Tile Stamp, or switch to auto mode"
+        }
+        SpriteError::NotATilemap(_) => "The Tile Stamp works on tilemap layers: select one",
         SpriteError::NotAnImageLayer(_) => {
             "A group or reference layer is selected: select a layer to draw on"
         }

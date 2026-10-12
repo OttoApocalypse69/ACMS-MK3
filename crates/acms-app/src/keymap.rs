@@ -51,6 +51,8 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("End", "frame.last"),
     ("Enter", "playback.toggle"),
     ("F3", "onion.toggle"),
+    ("T", "tool.tile_stamp"),
+    ("C", "tool.slice"),
     ("F2", "layer.rename"),
     ("Ctrl+Plus", "view.zoom_in"),
     ("Ctrl+Equals", "view.zoom_in"),

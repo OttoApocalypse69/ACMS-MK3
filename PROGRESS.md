@@ -4,35 +4,89 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phases 0 to 3 are done** (skeleton, drawing, layers, selections and shape tools). **Phase 4 is in progress.**
+**Phases 0 to 4 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
+features). Next is Phase 5 (not started).
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, directories 6, serde 1,
-serde_json 1, thiserror 2, anyhow 1.
+serde_json 1, thiserror 2, anyhow 1, arboard 3.6. Phase 4 added no dependency.
 
-## Phase 4 task list
+## Phase 4 task list (done)
 
 Core:
 
-- [ ] Stroke pipeline stages: pixel-perfect filter, symmetry (horizontal, vertical, both, radial N-way), tiled (wrap-around) plotting
-- [ ] Custom brushes (an image as the brush; made from the selection)
-- [ ] Dither ink (Bayer 2×2 / 4×4 / 8×8, checker, custom pattern) and shade ink (one step along a palette ramp)
-- [ ] Palette: undoable changes, ramps, sort, generate a ramp between two colours, replace a colour across the sprite, reduce the sprite to the palette
-- [ ] Reference image layer (shown at screen resolution, never composited or exported)
+- [x] Stroke pipeline stages: pixel-perfect filter, symmetry (horizontal, vertical, both, radial N-way), tiled (wrap-around) plotting
+- [x] Custom brushes (an image as the brush; made from the selection)
+- [x] Dither ink (Bayer 2×2 / 4×4 / 8×8, checker, custom pattern) and shade ink (one step along a palette ramp)
+- [x] Palette: undoable changes, ramps, sort, generate a ramp between two colours, replace a colour across the sprite, reduce the sprite to the palette
+- [x] Reference image layer (shown at screen resolution, never composited or exported)
 
 IO:
 
-- [ ] Palette import / export: `.gpl`, `.hex`, `.pal`; palette from an image
-- [ ] `.acms` format version 3 (ramps, symmetry, reference layers) with a migration from version 2
-- [ ] Golden images: pixel-perfect, each symmetry mode, custom brush, dither ink, shade ink, tiled, and all of symmetry + pixel-perfect + dither in one stroke
+- [x] Palette import / export: `.gpl`, `.hex`, `.pal`; palette from an image
+- [x] `.acms` format version 3 (ramps, symmetry, reference layers) with a migration from version 2; a Phase 3 file kept in `tests/samples/`
+- [x] Golden images: pixel-perfect, each symmetry mode, custom brush, dither ink, shade ink, tiled, and all of symmetry + pixel-perfect + dither in one stroke
 
 App:
 
-- [ ] Commands, shortcuts and menus for all of the above
-- [ ] Tool Options: ink, pattern picker, density, pixel-perfect; symmetry and tiled mode
-- [ ] Canvas: symmetry axes, 3 × 3 tiled preview, reference layers
-- [ ] Palette panel: selecting colours, ramps, palette commands
-- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
+- [x] Commands, shortcuts and menus for all of the above
+- [x] Tool Options: ink, pattern picker, density, pixel-perfect; symmetry and tiled mode
+- [x] Canvas: symmetry axes, 3 × 3 tiled preview, reference layers
+- [x] Palette panel: selecting colours, ramps, palette commands
+- [x] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass (355 tests); commits along the way
+
+### How Phase 4 was checked
+
+- **Symmetry + pixel-perfect + dither in one stroke** (the "done when"): one test draws a
+  stepped freehand line with the pencil with all three on. It checks that every pixel has its
+  mirror images, that the line is unbroken but no pixel is the corner of an L, that each pixel
+  has the colour the pattern gives its own position, that the stroke is exactly one undo step,
+  and that undo and redo restore the sprite exactly. The same is checked again through the
+  commands, and there is a golden image of it.
+- **Each stage on its own**: the pixel-perfect filter (stairs become a diagonal, the newest pixel
+  is shown until it turns out to be a corner, straight lines are untouched); every symmetry mode
+  on even and odd canvases; radial symmetry at 3, 5, 6 and 7 copies leaves no gaps; tiled strokes
+  wrap; custom brushes; every dither pattern and density; shade ink forwards, back, at the ends
+  of a ramp and once per stroke.
+- **Palette**: every change undoes exactly; sorting, ramps, generated ramps, replacing a colour
+  on several layers (locked ones are left alone), reducing to the palette.
+- **Reference layers**: fitted, never part of the flattened picture or an exported PNG, cannot
+  be drawn on or merged, follow canvas resize and sprite scale, survive flatten, undo exactly.
+- **Format**: version 3 round-trips; a hand-built version 2 manifest and a real file saved by
+  the Phase 3 build both load; damaged version 3 parts are errors, not panics.
+- **Palette files**: all three formats round-trip, match what other programs write, read files
+  written by other programs (as text in the tests), and report broken lines by number.
+- **Golden images** (11 new), looked at enlarged before being committed. The ones from earlier
+  phases are unchanged, so nothing that existed draws differently.
+- **Headless UI tests**: drawing on the canvas with symmetry, tiled mode and reference layers
+  shown; Tool Options drawn for every tool and ink; Ctrl+B.
+- **In the real window**: captures of symmetry "both" and radial 6 with their axes, a dithered
+  pixel-perfect stroke, a reference picture under the drawing, the tiled preview with a stroke
+  wrapping around, the top of Tool Options, the Palette panel with selected
+  swatches, and a reference row in the Layers panel.
+- **Not checked by me**: drawing with a real mouse; the file dialogs for palettes and reference
+  pictures; Ctrl / Shift clicking swatches; the pattern picker and the ramps list being clicked
+  (they are below the fold of their panels in the captures); palette files actually exported by
+  GIMP, Lospec or Paint Shop Pro.
+
+### Known limits of Phase 4
+
+- **Symmetry is always about the middle of the canvas.** The mirror lines cannot be moved.
+- **Radial symmetry with a count other than 2 or 4 has to round.** Lines are joined up so they
+  have no gaps, but filled shapes and thick brushes can show single-pixel holes in the copies.
+- **Pixel-perfect only applies to freehand lines** (pencil and eraser), and it cuts the corner
+  of a sharp turn, as the filter does in other editors.
+- **A custom brush or pattern is at most 64 × 64**, lives for the session, and is not saved.
+  Picking Round or Square drops the custom brush (Ctrl+B makes it again).
+- **Tiled mode wraps what is drawn**, not what is filled or moved: the bucket's area and the
+  move tool stop at the canvas edge. The selection outline is only drawn on the middle tile.
+- **Reference layers**: PNG only, at most 4096 pixels on a side; placed as large as fits, in the
+  middle, and cannot be moved or scaled yet. A reference below every image layer is drawn under
+  the sprite, any other one over it — it is never mixed in between two layers.
+- **Palette files hold neither transparency nor ramps.** Importing replaces the palette.
+- **Reduce to Palette** goes by red, green and blue distance and keeps each pixel's alpha.
+- **Shade ink needs an exact match**: a pixel whose colour is in no ramp is left alone.
+- At the default window size, Tool Options scrolls to reach the pattern picker and symmetry.
 
 ## Phase 3 task list (done)
 
@@ -259,12 +313,42 @@ App (`acms-app`):
   table. Copy puts the image on both the app's own clipboard and the system one.
 - **Dev builds optimise `acms-core`** (`[profile.dev.package.acms-core]`), so `cargo run` stays
   responsive on large sprites.
+- **Symmetry is saved with the sprite but is not an undo step** and does not mark the sprite as
+  changed, like folding a group: it is how the sprite is worked on, not what is in it.
+  Pixel-perfect, tiled mode, the ink and the pattern belong to the editor, not to a sprite.
+- **Which strokes are mirrored**: freehand lines and shapes. Bucket, gradient and move are not.
+- **Tiled mode is one switch** for both wrap-around strokes and the 3 × 3 preview.
+- **A custom brush stamps its own colours** with the Simple ink; the eraser, the dither ink and
+  the shade ink only use its shape.
+- **Dither**: the primary button puts the primary colour where the pattern says "first", the
+  secondary button swaps the two. A transparent colour in the pattern erases.
+- **Shade**: the primary button moves a pixel one step towards the end of the first ramp that
+  contains its colour, the secondary button one step back. Ramps hold colours, not palette
+  positions, so sorting the palette does not disturb them.
+- **A reference picture is not pixels of the sprite.** It keeps its own resolution, is stretched
+  over a rectangle of the canvas and is drawn by the view, so a photo stays readable on a 32 × 32
+  sprite. In the model it is a layer kind holding the picture and that rectangle (`PLAN.md` 4.1
+  lists only `visible` and `opacity`). A new one goes at the bottom of the layer list.
+- **Palette changes are undo steps**; replacing a colour and reducing to the palette skip locked
+  layers rather than fail.
+- **`.acms` format version 3.** Version 1 and 2 files are upgraded when loaded.
+- **Added without being in the plan's list** (2026-10-12, to be confirmed): "Add Primary Colour
+  to Palette" and "Remove Selected Colours" — without them ramps could only be made from
+  imported or generated colours.
 
 ## Open questions
 
-None. The four section 5 items without a phase were placed on 2026-10-11 and written into
+The four section 5 items without a phase were placed on 2026-10-11 and written into
 `PLAN.md`: menu bar and status bar → Phase 2, tabs for several sprites → Phase 3, Preview
 panel → Phase 5.
+
+Open since Phase 4:
+
+- **Palette grid with drag-reorder** (section 5) is in no phase. The palette can be sorted, and
+  colours added and removed, but not dragged into an order.
+- **Should `PLAN.md` 4.1 describe the reference layer as built** (picture and rectangle in the
+  layer, drawn by the view)? Not changed yet; see "Decisions".
+- **Keep "Add / Remove colour"?** They are not in the Phase 4 list of palette tools.
 
 ## The keymap file
 
@@ -305,6 +389,7 @@ editor in Phase 8. The Log panel says at startup which file was used and what wa
 | Ctrl+X / C / V, Delete | Cut / Copy / Paste, delete the selected pixels |
 | Ctrl+A / Ctrl+D / Ctrl+Shift+I | Select all / Deselect / Invert selection |
 | Ctrl+W, Ctrl+Tab / Ctrl+Shift+Tab | Close sprite, next / previous sprite |
+| Ctrl+B | Brush from the selection |
 | Ctrl+Shift+N | New layer |
 | F2 | Rename the selected layer |
 | X | Swap primary and secondary colour |
@@ -321,6 +406,12 @@ Layers panel: click a name to select, double-click (or F2) to rename, drag a row
 or drop it on a group to move it inside. The icons on each row toggle visibility, lock and alpha
 lock. The other layer commands (merge down, flatten, move up / down, …) are in the Layer menu
 and the command palette.
+
+Palette panel: click a swatch for the primary colour, right click for the secondary one. Ctrl
+click adds a swatch to the selection, Shift click selects a run; "Ramp" makes a ramp from the
+selected swatches in the order they were picked. Everything else about the palette is in the
+Palette menu. Inks, patterns, pixel-perfect, symmetry and tiled mode are in Tool Options and,
+like everything, in the command palette (try "ink", "symmetry", "tiled").
 
 ## Phase 0 task list (done)
 
@@ -341,7 +432,6 @@ Described in `PLAN.md` but not part of the "Done when" of a finished phase:
 - **`log` crate wiring** (2). The Log panel shows lines written by commands; the `log` facade is
   not hooked up to it yet.
 - **Saved layouts** (5). The layout resets on restart.
-- **Custom brush images** (4.4). Square and round only; custom brushes are Phase 4.
 - `scripts/` and `assets/` folders are created when they first have content.
 
 ## Notes for later phases
@@ -369,6 +459,16 @@ Described in `PLAN.md` but not part of the "Done when" of a finished phase:
   cramped was found.
 - Phase 3 will need: selections as a mask stage in `stroke.rs` (next to `lock_alpha`), more ops
   in `document.rs` for canvas resize, and `AppState` holding several documents for sprite tabs.
+- A stroke's settings are fixed when it begins (`StrokeSettings`); tools ask for a
+  `StrokeKind` (freehand, shape, plain) and the pipeline decides what applies. A new ink is a
+  variant of `Ink` plus a case in `tool::ink_for`.
+- The preview buffer can take pixels back (`StrokeBuffer::take_back`), which is how the
+  pixel-perfect filter removes a corner it has already shown. Its `bounds` may therefore be
+  larger than what is touched; `get` is what counts.
+- Phase 5 will meet reference layers again: they have no cels, so they are the same in every
+  frame, and the compositor already skips them.
+- PowerShell 5.1 reads scripts without a BOM as ANSI: keep non-ASCII text out of helper scripts
+  (it silently broke a search-and-replace on "…").
 - If full-canvas recomposition becomes a problem, the place to optimise is the per-pixel loop in
   `compositor::compose_rect` (row slices instead of `get` / `set`, a fast path for opaque Normal).
 
@@ -387,3 +487,8 @@ None known.
 - Opacity and blend mode for groups.
 - A "solo" click on the eye (hide every other layer).
 - Show the file name and unsaved mark in the window title, not only on the canvas tab.
+- Movable symmetry axes (drag the mirror lines, or centre them on the selection).
+- Move and scale a reference picture with the move tool; reference pictures from JPEG files.
+- Tiled mode for the bucket and the move tool (fill and move across the edge).
+- Keep custom brushes and patterns in a list, and save them.
+- A two-column or icon Tools panel, so Tool Options gets more room.

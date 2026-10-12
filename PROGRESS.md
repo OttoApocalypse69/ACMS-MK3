@@ -4,36 +4,89 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phases 0 to 4 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
-features). **Phase 5 is in progress.**
+**Phases 0 to 5 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
+features, animation). Next is Phase 6 (not started).
 
-## Phase 5 task list
+Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
+egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directories 6, serde 1,
+serde_json 1, thiserror 2, anyhow 1, arboard 3.6.
+
+## Phase 5 task list (done)
 
 Core:
 
-- [ ] Frames: add, duplicate, delete, move, per-frame duration; the active frame; all undoable
-- [ ] Cels: move and copy between frames and layers, clear; linked cels (drawing on one changes all of them)
-- [ ] Tags: name, range, direction (forward / reverse / ping-pong), colour; they follow frame changes
-- [ ] Playback: which frame is shown after a given time, for the whole sprite or one tag
-- [ ] Onion skin: previous / next frames as a tinted, faded picture
+- [x] Frames: add, duplicate, delete, move, per-frame duration; the active frame; all undoable
+- [x] Cels: move and copy between frames and layers; linked cels (drawing on one changes all of them)
+- [x] Tags: name, range, direction (forward / reverse / ping-pong), colour; they follow frame changes
+- [x] Playback: which frame is shown after a given time, for the whole sprite or one tag
+- [x] Onion skin: previous / next frames as a tinted, faded picture
 
 IO:
 
-- [ ] `.acms` format version 4 (tags, linked cels) with a migration from version 3
-- [ ] Export: GIF; spritesheet (rows / columns / packed, padding, trim) with Aseprite-style JSON; PNG sequence
-- [ ] Round-trip tests: export → decode for GIF and spritesheets
+- [x] `.acms` format version 4 (tags, linked cels) with a migration from version 3; a Phase 4 file kept in `tests/samples/`
+- [x] Export: GIF; spritesheet (rows / columns / packed, padding, trim) with Aseprite-style JSON; PNG sequence
+- [x] Round-trip tests: export → decode for GIF and spritesheets
 
 App:
 
-- [ ] Commands, shortcuts and menus for frames, cels, tags, playback, onion skin and the exports
-- [ ] Timeline panel: layers × frames grid, select several cels, drag to move / copy cels and frames, tags, playback controls
-- [ ] Preview panel: the sprite at a chosen scale, playing, with an optional 3 × 3 tiled mode
-- [ ] Canvas shows the active frame, with onion skin
-- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
+- [x] Commands, shortcuts and menus for frames, cels, tags, playback, onion skin and the exports
+- [x] Timeline panel: layers × frames grid, select several cels, drag to move / copy cels and frames, tags, playback controls
+- [x] Preview panel: the sprite at a chosen scale, playing, with an optional 3 × 3 tiled mode
+- [x] Canvas shows the active frame, with onion skin
+- [x] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass (403 tests); commits along the way
 
-Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
-egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, directories 6, serde 1,
-serde_json 1, thiserror 2, anyhow 1, arboard 3.6. Phase 4 added no dependency.
+### How Phase 5 was checked
+
+- **The "done when"**: a test sprite with two layers, four frames of different durations, three
+  linked cels and two tags (one ping-pong) is saved and loaded and compared exactly; exported as a
+  GIF, which is decoded again and compared frame by frame, with its delays; and exported as a
+  spritesheet with JSON, where every rectangle named in the JSON is cut out of the sheet and
+  compared with the frame it stands for. The JSON's fields are checked against the layout Aseprite
+  writes.
+- **Frames, cels, links and tags**: every operation is run through a helper that checks it is
+  exactly one undo step and that undo and redo restore the sprite exactly. Linked cels are checked
+  to change together, to empty together, to come back together on undo, and to follow their
+  frames when frames are added, moved or removed. Layer operations (merge down, flatten, delete,
+  duplicate) are checked on every frame.
+- **Playback**: forward, reverse and ping-pong, per-frame durations, a tag of one frame, starting
+  outside the tag, one long step, and a pause of a week (it must not loop a billion times).
+- **Format**: version 4 round-trips; a hand-built version 3 manifest and a real file saved by the
+  Phase 4 build both load; a file is still linked after loading; damaged tags are errors and stray
+  links are ignored.
+- **Exports**: sheets in rows, columns, with padding, trimmed and packed are checked for overlap,
+  for stray pixels and for each frame's content; a GIF of a ping-pong tag at 3×; translucent
+  pixels and very short frames in a GIF; PNG sequence names and content; every refusal.
+- **Commands**: every one, including the dialog → file dialog → file chain of the exports and an
+  animation surviving Save and Open.
+- **Headless UI tests**: clicking a cel in the Timeline selects it, dragging one moves it, dragging
+  a frame number moves the frame; comma / period / Home step; Enter plays and the frames follow
+  the clock; the canvas shows each frame's own pixels, with the onion skin on.
+- **In the real window**: captures of the Timeline with tags, linked cels and the selection, the
+  onion skin (earlier frame red, later frame blue), the tag and spritesheet dialogs, and the app
+  playing by itself. A GIF, a strip sheet and a packed sheet written by the real app were opened
+  and their sizes, frame rectangles, durations and tags read back.
+- **Not checked by me**: dragging in the Timeline with a real mouse, Shift+click and Ctrl+drag
+  there, the Preview panel on screen (it is a tab behind Tool Options), the exported files opened
+  in a browser, Aseprite or a game engine's importer, and how smooth playback looks.
+
+### Known limits of Phase 5
+
+- **A GIF has no half-transparent pixels**: they come out solid. Frame times are rounded to
+  hundredths of a second, and a frame with more than 256 colours is reduced to 256.
+- **Tags name places on the time axis.** Adding or deleting frames shifts and resizes them, but
+  moving a frame does not carry a tag along.
+- **Linked cels**: duplicating a layer or a frame makes plain copies, not links. Links are per
+  layer; cels of different layers cannot be linked.
+- **Moving or copying a cel replaces what the target cel held.**
+- **The timeline selection is one run of frames on one layer.** Frames are moved one at a time.
+- **Two tags over the same frames** are drawn on top of each other in the Timeline; the one made
+  last is the one a click opens.
+- **The onion skin does not wrap around** from the first frame to the last, and is hidden while
+  playing.
+- **The spritesheet JSON only lists tags when the sheet holds every frame once, in order**;
+  exporting a single tag gives a sheet without `frameTags`.
+- **Reference layers are the same in every frame**, and the selection is not per frame.
+- The Timeline's controls take two lines at the default window size.
 
 ## Phase 4 task list (done)
 
@@ -356,6 +409,23 @@ App (`acms-app`):
 - **Palette changes are undo steps**; replacing a colour and reducing to the palette skip locked
   layers rather than fail.
 - **`.acms` format version 3.** Version 1 and 2 files are upgraded when loaded.
+- **Linked cels are a fact about the sprite, kept apart from the cels**: a table says which
+  cels of a layer are one and the same, and every write to one is copied to the others. That is
+  what lets an empty cel be linked, and undo bring all of them back.
+- **Frame changes are recorded as one snapshot** of frames, cels, links and tags. The pictures
+  are shared, so a snapshot is cheap.
+- **Playing shows the frames on the canvas** (it moves the active frame, which is not an undo
+  step). Stopping returns to the frame playing began on; picking a frame by hand stops there.
+  A stroke in progress holds the frame. The Preview panel plays on its own clock, always.
+- **One "play tag" setting** decides what Play, the Preview panel and the export dialogs start
+  with: every frame, or one tag.
+- **Exports write one pass through the frames**: a ping-pong tag goes there and back without
+  repeating its end frames, so the GIF loops cleanly.
+- **Spritesheet JSON is Aseprite's "hash" form**, with the frames written in order and named
+  `<file name> <number>.acms`. Padding is put around every frame and along the sheet's edge.
+- **`.acms` format version 4.** Versions 1 to 3 are upgraded when loaded.
+- **New dependency: `gif`** (0.14, with `color_quant` and `weezl`), for the GIF export. Added
+  without asking first, as a small, standard crate; it also decodes, which the tests use.
 - **Adding, removing and dragging palette colours** are part of Phase 4 (agreed 2026-10-12).
   Dragging a swatch onto another moves it there; the selection is cleared, since it is made of
   positions.
@@ -413,6 +483,10 @@ editor in Phase 8. The Log panel says at startup which file was used and what wa
 | Ctrl+A / Ctrl+D / Ctrl+Shift+I | Select all / Deselect / Invert selection |
 | Ctrl+W, Ctrl+Tab / Ctrl+Shift+Tab | Close sprite, next / previous sprite |
 | Ctrl+B | Brush from the selection |
+| Alt+N / Alt+D | New frame / Duplicate frame |
+| . / , and Home / End | Next / previous frame, first / last frame |
+| Enter | Play / Stop |
+| F3 | Toggle onion skin |
 | Ctrl+Shift+N | New layer |
 | F2 | Rename the selected layer |
 | X | Swap primary and secondary colour |
@@ -429,6 +503,11 @@ Layers panel: click a name to select, double-click (or F2) to rename, drag a row
 or drop it on a group to move it inside. The icons on each row toggle visibility, lock and alpha
 lock. The other layer commands (merge down, flatten, move up / down, …) are in the Layer menu
 and the command palette.
+
+Timeline: click a cel to select it and show its frame; Shift+click another cel of the same
+layer to select the run between them. Drag a cel to move it, with Ctrl held to copy it. Drag a
+frame's number to move the frame. Click a tag's bar to change or delete it. The exports are in
+the File menu.
 
 Palette panel: click a swatch for the primary colour, right click for the secondary one. Ctrl
 click adds a swatch to the selection, Shift click selects a run; "Ramp" makes a ramp from the
@@ -492,6 +571,10 @@ Described in `PLAN.md` but not part of the "Done when" of a finished phase:
   frame, and the compositor already skips them.
 - PowerShell 5.1 reads scripts without a BOM as ANSI: keep non-ASCII text out of helper scripts
   (it silently broke a search-and-replace on "…").
+- Time in tests: `RawInput.time` drives playback in the headless harness. Use times that are
+  exact in binary (multiples of 1/8 s): `10.1 - 10.05` is a hair under 50 ms.
+- Phase 6 will add tilemap layers: `Sprite::check_cel` is the gate for "has pixels", and the
+  Timeline shows cels only for layers that pass `as_image()`.
 - If full-canvas recomposition becomes a problem, the place to optimise is the per-pixel loop in
   `compositor::compose_rect` (row slices instead of `get` / `set`, a fast path for opaque Normal).
 
@@ -510,6 +593,11 @@ None known.
 - Opacity and blend mode for groups.
 - A "solo" click on the eye (hide every other layer).
 - Show the file name and unsaved mark in the window title, not only on the canvas tab.
+- Linked duplicate of a frame; link cels across a whole frame at once.
+- Tags that move with their frames, and tag rows that do not overlap.
+- Timeline: select several whole frames and drag them together; a right-click menu.
+- Onion skin that wraps around inside the playing tag.
+- APNG or WebP export for animations with half-transparent pixels.
 - Movable symmetry axes (drag the mirror lines, or centre them on the selection).
 - Move and scale a reference picture with the move tool; reference pictures from JPEG files.
 - Tiled mode for the bucket and the move tool (fill and move across the edge).

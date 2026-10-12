@@ -3,6 +3,7 @@
 // No console window next to the app in release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anim_commands;
 mod app;
 mod canvas;
 mod clipboard;
@@ -18,9 +19,11 @@ mod menu;
 mod palette;
 mod panels;
 mod pixel_commands;
+mod preview;
 mod state;
 mod status;
 mod theme;
+mod timeline;
 
 fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {

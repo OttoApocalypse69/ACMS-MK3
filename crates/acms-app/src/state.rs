@@ -5,10 +5,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use acms_core::color::Rgba8;
 use acms_core::command::Params;
+use acms_core::compositor::OnionSkin;
 use acms_core::document::Document;
 use acms_core::editor::{DocId, Editor};
-use acms_core::sprite::LayerId;
+use acms_core::playback::Playback;
+use acms_core::sprite::{Direction, LayerId};
+use acms_io::export::SheetOptions;
 use egui::Vec2;
 use egui_dock::DockState;
 
@@ -99,6 +103,70 @@ impl ViewState {
     }
 }
 
+/// The cels selected in the timeline: a run of frames on one layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CelRange {
+    pub layer: LayerId,
+    /// The frame the selection was started on.
+    pub anchor: usize,
+    /// The frame it was extended to; before or after the anchor.
+    pub extent: usize,
+}
+
+impl CelRange {
+    pub fn first(&self) -> usize {
+        self.anchor.min(self.extent)
+    }
+
+    pub fn last(&self) -> usize {
+        self.anchor.max(self.extent)
+    }
+
+    pub fn contains(&self, frame: usize) -> bool {
+        (self.first()..=self.last()).contains(&frame)
+    }
+}
+
+/// What an export dialog is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportKind {
+    Gif,
+    Sheet,
+    Sequence,
+}
+
+/// How the Preview panel shows the sprite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviewSettings {
+    /// Screen pixels per sprite pixel.
+    pub scale: u32,
+    /// The sprite is repeated 3 × 3, to see how it tiles.
+    pub tiled: bool,
+}
+
+/// Largest scale of the Preview panel.
+pub const MAX_PREVIEW_SCALE: u32 = 16;
+
+impl Default for PreviewSettings {
+    fn default() -> Self {
+        Self {
+            scale: 2,
+            tiled: false,
+        }
+    }
+}
+
+/// An animation being played on the canvas.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Playing {
+    pub playback: Playback,
+    /// The frame that was shown when playing began, and is shown again when it stops.
+    pub return_to: usize,
+    /// The time up to which the animation has been advanced, in seconds; `None` until the
+    /// first frame after playing began.
+    clock: Option<f64>,
+}
+
 /// A command to run later, once the user has confirmed or supplied something.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingCommand {
@@ -135,6 +203,28 @@ pub enum Dialog {
     /// Asks how many colours a ramp from the primary to the secondary colour should have.
     Ramp {
         steps: u32,
+    },
+    /// A new tag, or with `index` the tag being changed. Frames count from 0 here.
+    Tag {
+        index: Option<usize>,
+        name: String,
+        from: usize,
+        to: usize,
+        direction: Direction,
+        color: Rgba8,
+    },
+    /// How long the selected frames are shown.
+    FrameDuration {
+        ms: u32,
+    },
+    /// The settings of an export; only those the kind uses are shown.
+    Export {
+        kind: ExportKind,
+        scale: u32,
+        /// The tag to export, or every frame.
+        tag: Option<usize>,
+        sheet: SheetOptions,
+        json: bool,
     },
 }
 
@@ -203,14 +293,23 @@ impl Anchor {
 
 /// A command needs a file path from the user. The UI shows a native file dialog and then runs
 /// the command again with the path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FileRequest {
     Open,
     SaveAs,
-    ExportPng { scale: u32 },
+    ExportPng {
+        scale: u32,
+    },
     ImportPalette,
     ExportPalette,
     ReferenceImage,
+    /// Asks where to save, then runs `command` with `params` and the path.
+    Export {
+        command: &'static str,
+        params: Params,
+        /// What the file type is called, and its extension.
+        file_type: (&'static str, &'static str),
+    },
 }
 
 /// What the app knows about an open sprite besides the sprite itself.
@@ -236,6 +335,15 @@ pub struct AppState {
     parked: HashMap<DocId, DocState>,
     /// The palette positions selected in the Palette panel, in the order they were picked.
     pub swatch_selection: Vec<usize>,
+    /// The animation playing on the canvas, if one is.
+    pub playing: Option<Playing>,
+    /// The tag that is played, here and in the Preview panel; `None` plays every frame.
+    pub play_tag: Option<usize>,
+    pub onion_enabled: bool,
+    pub onion: OnionSkin,
+    /// The cels selected in the timeline.
+    pub cel_range: Option<CelRange>,
+    pub preview: PreviewSettings,
     /// How many copies a radial symmetry makes when it is switched on.
     pub radial_count: u8,
     /// Copy and paste also go through the system clipboard. Off in tests.
@@ -265,6 +373,12 @@ impl Default for AppState {
             shown: None,
             parked: HashMap::new(),
             swatch_selection: Vec::new(),
+            playing: None,
+            play_tag: None,
+            onion_enabled: false,
+            onion: OnionSkin::default(),
+            cel_range: None,
+            preview: PreviewSettings::default(),
             radial_count: 6,
             system_clipboard: false,
             dock: panels::default_layout(),
@@ -289,8 +403,12 @@ impl AppState {
         if active == self.shown {
             return;
         }
-        // The selected swatches were positions in the other sprite's palette.
+        // The selected swatches were positions in the other sprite's palette; the same goes
+        // for everything about its frames.
         self.swatch_selection.clear();
+        self.playing = None;
+        self.play_tag = None;
+        self.cel_range = None;
         let previous = DocState {
             path: self.file_path.take(),
             saved_revision: self.saved_revision,
@@ -310,6 +428,58 @@ impl AppState {
         self.shown = active;
         self.parked
             .retain(|id, _| self.editor.document_by_id(*id).is_some());
+    }
+
+    /// Starts playing from the frame being shown, or stops and goes back to it.
+    pub fn toggle_playback(&mut self) {
+        match self.playing.take() {
+            Some(playing) => {
+                if let Some(document) = self.editor.document_mut() {
+                    document.set_active_frame(playing.return_to);
+                }
+            }
+            None => {
+                if let Some(document) = self.editor.document() {
+                    let frame = document.active_frame();
+                    self.playing = Some(Playing {
+                        playback: Playback::starting_at(frame),
+                        return_to: frame,
+                        clock: None,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Stops playing without going anywhere, e.g. because the user picked a frame.
+    pub fn stop_playback(&mut self) {
+        self.playing = None;
+    }
+
+    /// Moves a playing animation on to the time `now` (in seconds) and shows the frame it is
+    /// at. Returns how many milliseconds the frame stays, or `None` if nothing is playing.
+    pub fn tick_playback(&mut self, now: f64) -> Option<u32> {
+        let mut playing = self.playing?;
+        let Some(document) = self.editor.document() else {
+            self.playing = None;
+            return None;
+        };
+        let last = playing.clock.unwrap_or(now);
+        let elapsed_ms = ((now - last) * 1000.0).floor().clamp(0.0, 1e9);
+        // Whole milliseconds are used up; what is left of one stays for the next tick.
+        playing.clock = Some(last + elapsed_ms / 1000.0);
+
+        // A stroke in progress stays on its frame: time stands still while it is drawn.
+        let changed = !self.editor.is_interacting()
+            && playing
+                .playback
+                .advance(document.sprite(), self.play_tag, elapsed_ms as u32);
+        let wait = playing.playback.until_next(document.sprite());
+        if changed && let Some(document) = self.editor.document_mut() {
+            document.set_active_frame(playing.playback.frame);
+        }
+        self.playing = Some(playing);
+        Some(wait)
     }
 
     /// Opens `document` in a new tab and switches to it. `path` is the file it came from.

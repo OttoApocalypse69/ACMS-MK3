@@ -3,7 +3,7 @@
 
 use acms_core::color::Rgba8;
 use acms_core::command::{CommandRegistry, Params};
-use acms_core::compositor::FrameCache;
+use acms_core::compositor::{self, FrameCache, OnionSkin};
 use acms_core::editor::Editor;
 use acms_core::geom::{Point, Rect as PixelRect};
 use acms_core::image::Image;
@@ -91,6 +91,8 @@ struct ReferenceView {
 /// What the canvas keeps between frames. None of it is part of the document.
 #[derive(Default)]
 pub struct CanvasView {
+    /// The onion skin, and the generation, revision, frame and settings it was made for.
+    onion_texture: Option<((u64, u64, usize, OnionSkin), TextureHandle)>,
     /// One texture per reference picture in use.
     references: Vec<(std::sync::Arc<Image>, TextureHandle)>,
     /// The flattened frame; only what changed is recomposed.
@@ -186,6 +188,9 @@ impl CanvasView {
             }
         };
         draw_references(true);
+        if let Some(onion) = self.onion(ui.ctx(), state) {
+            painter.image(onion, sprite_rect, whole, Color32::WHITE);
+        }
 
         let sprite_texture = self.sprite(ui.ctx(), &mut state.editor);
         if let Some(texture) = sprite_texture {
@@ -562,6 +567,29 @@ impl CanvasView {
             .as_ref()
             .map(|(_, texture)| texture.id())
     }
+    /// The onion skin for the frame being shown, redone only when the sprite, the frame or
+    /// the settings change. `None` when it is off, when playing, or with a single frame.
+    fn onion(&mut self, ctx: &egui::Context, state: &AppState) -> Option<egui::TextureId> {
+        let document = state.editor.document()?;
+        let sprite = document.sprite();
+        if !state.onion_enabled || state.playing.is_some() || sprite.frames().len() < 2 {
+            self.onion_texture = None;
+            return None;
+        }
+        let key = (
+            state.editor.generation(),
+            document.revision(),
+            document.active_frame(),
+            state.onion,
+        );
+        if !matches!(&self.onion_texture, Some((made_for, _)) if *made_for == key) {
+            let skin = compositor::onion_skin(sprite, key.2, &state.onion);
+            let texture = ctx.load_texture("onion", color_image(&skin), SPRITE_TEXTURE);
+            self.onion_texture = Some((key, texture));
+        }
+        self.onion_texture.as_ref().map(|(_, texture)| texture.id())
+    }
+
     /// The visible reference layers, with a texture for each picture. A reference below
     /// every image layer is drawn under the sprite; any other one over it.
     fn reference_views(&mut self, ctx: &egui::Context, editor: &Editor) -> Vec<ReferenceView> {

@@ -4,14 +4,16 @@
 
 use std::path::PathBuf;
 
+use acms_core::color::Rgba8;
 use acms_core::command::{CommandRegistry, Params};
 use acms_core::palette::MAX_RAMP_STEPS;
-use acms_core::sprite::MAX_SPRITE_SIZE;
+use acms_core::sprite::{Direction, MAX_FRAME_MS, MAX_SPRITE_SIZE};
+use acms_io::export::{SheetLayout, SheetOptions};
 use acms_io::png::MAX_EXPORT_SCALE;
 use egui::{DragValue, Grid, Id, Modal, RichText, Ui};
 
 use crate::commands;
-use crate::state::{Anchor, AppState, Dialog, FileRequest, SizePurpose};
+use crate::state::{Anchor, AppState, Dialog, ExportKind, FileRequest, SizePurpose};
 
 /// What the user did with a dialog this frame.
 enum Outcome {
@@ -41,6 +43,22 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &CommandRegistr
                 anchor,
             } => size(ui, purpose, width, height, anchor),
             Dialog::Ramp { steps } => ramp(ui, state, steps),
+            Dialog::Tag {
+                index,
+                name,
+                from,
+                to,
+                direction,
+                color,
+            } => tag(ui, state, index, name, from, to, direction, color),
+            Dialog::FrameDuration { ms } => frame_duration(ui, ms),
+            Dialog::Export {
+                kind,
+                scale,
+                tag,
+                sheet,
+                json,
+            } => export(ui, state, kind, scale, tag, sheet, json),
         }
     });
 
@@ -207,6 +225,229 @@ fn size(
     }
 }
 
+/// A new tag, or an existing one being changed. Frames are shown counting from 1.
+#[allow(clippy::too_many_arguments)]
+fn tag(
+    ui: &mut Ui,
+    state: &AppState,
+    index: Option<usize>,
+    mut name: String,
+    mut from: usize,
+    mut to: usize,
+    mut direction: Direction,
+    mut color: Rgba8,
+) -> Outcome {
+    let frames = state
+        .editor
+        .document()
+        .map_or(1, |document| document.sprite().frames().len());
+    ui.heading(if index.is_some() {
+        "Edit Tag"
+    } else {
+        "New Tag"
+    });
+    let mut delete = false;
+    Grid::new("tag").num_columns(2).show(ui, |ui| {
+        ui.label("Name");
+        ui.text_edit_singleline(&mut name);
+        ui.end_row();
+
+        ui.label("Frames");
+        ui.horizontal(|ui| {
+            let (mut first, mut last) = (from + 1, to + 1);
+            ui.add(DragValue::new(&mut first).range(1..=frames));
+            ui.label("to");
+            ui.add(DragValue::new(&mut last).range(1..=frames));
+            from = first - 1;
+            to = (last - 1).max(from);
+        });
+        ui.end_row();
+
+        ui.label("Direction");
+        egui::ComboBox::from_id_salt("tag_direction")
+            .selected_text(direction.name())
+            .show_ui(ui, |ui| {
+                for choice in Direction::ALL {
+                    ui.selectable_value(&mut direction, choice, choice.name());
+                }
+            });
+        ui.end_row();
+
+        ui.label("Colour");
+        let mut rgba = color.to_array();
+        if ui.color_edit_button_srgba_unmultiplied(&mut rgba).changed() {
+            color = Rgba8::from_array(rgba);
+        }
+        ui.end_row();
+    });
+    if index.is_some() {
+        delete = ui.button("Delete Tag").clicked();
+    }
+
+    let confirm = if index.is_some() { "Change" } else { "Create" };
+    match (buttons(ui, confirm), index) {
+        _ if delete => Outcome::Run(
+            "tag.delete".to_owned(),
+            Params::new().with("tag", index.unwrap_or(0) as i64),
+        ),
+        ((true, _), index) => {
+            let params = Params::new()
+                .with("name", name.as_str())
+                .with("from", from as i64)
+                .with("to", to as i64)
+                .with("direction", direction.id())
+                .with("color", color);
+            match index {
+                Some(at) => Outcome::Run("tag.edit".to_owned(), params.with("tag", at as i64)),
+                None => Outcome::Run("tag.new".to_owned(), params),
+            }
+        }
+        ((_, true), _) => Outcome::Dismissed,
+        _ => Outcome::Open(Dialog::Tag {
+            index,
+            name,
+            from,
+            to,
+            direction,
+            color,
+        }),
+    }
+}
+
+fn frame_duration(ui: &mut Ui, mut ms: u32) -> Outcome {
+    ui.heading("Frame Duration");
+    Grid::new("frame_duration").num_columns(2).show(ui, |ui| {
+        ui.label("Shown for");
+        ui.add(
+            DragValue::new(&mut ms)
+                .range(1..=MAX_FRAME_MS)
+                .suffix(" ms"),
+        );
+        ui.end_row();
+    });
+    ui.label(RichText::new("Applies to the frames selected in the timeline.").weak());
+    match buttons(ui, "Set") {
+        (true, _) => Outcome::Run(
+            "frame.set_duration".to_owned(),
+            Params::new().with("ms", ms),
+        ),
+        (_, true) => Outcome::Dismissed,
+        _ => Outcome::Open(Dialog::FrameDuration { ms }),
+    }
+}
+
+/// The settings of a GIF, spritesheet or PNG sequence export.
+fn export(
+    ui: &mut Ui,
+    state: &AppState,
+    kind: ExportKind,
+    mut scale: u32,
+    mut tag: Option<usize>,
+    mut sheet: SheetOptions,
+    mut json: bool,
+) -> Outcome {
+    let (title, command) = match kind {
+        ExportKind::Gif => ("Export GIF", "file.export_gif"),
+        ExportKind::Sheet => ("Export Spritesheet", "file.export_sheet"),
+        ExportKind::Sequence => ("Export PNG Sequence", "file.export_sequence"),
+    };
+    let tags: Vec<String> = state.editor.document().map_or_else(Vec::new, |document| {
+        let tags = document.sprite().tags().iter();
+        tags.map(|tag| tag.name.clone()).collect()
+    });
+    // The tag may have been deleted since the dialog was filled in.
+    tag = tag.filter(|at| *at < tags.len());
+
+    ui.heading(title);
+    Grid::new("export").num_columns(2).show(ui, |ui| {
+        ui.label("Frames");
+        let shown = tag.map_or("All frames", |at| tags[at].as_str());
+        egui::ComboBox::from_id_salt("export_tag")
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut tag, None, "All frames");
+                for (at, name) in tags.iter().enumerate() {
+                    ui.selectable_value(&mut tag, Some(at), name);
+                }
+            });
+        ui.end_row();
+
+        if kind == ExportKind::Sheet {
+            ui.label("Layout");
+            egui::ComboBox::from_id_salt("export_layout")
+                .selected_text(sheet.layout.name())
+                .show_ui(ui, |ui| {
+                    for choice in SheetLayout::ALL {
+                        ui.selectable_value(&mut sheet.layout, choice, choice.name());
+                    }
+                });
+            ui.end_row();
+
+            if sheet.layout != SheetLayout::Packed {
+                ui.label(if sheet.layout == SheetLayout::Rows {
+                    "Frames per row"
+                } else {
+                    "Frames per column"
+                });
+                ui.add(DragValue::new(&mut sheet.per_line).range(0..=1024))
+                    .on_hover_text("0 puts every frame in one line");
+                ui.end_row();
+            }
+
+            ui.label("Padding");
+            ui.add(
+                DragValue::new(&mut sheet.padding)
+                    .range(0..=64)
+                    .suffix(" px"),
+            );
+            ui.end_row();
+
+            ui.label("");
+            ui.checkbox(&mut sheet.trim, "Trim frames to what is drawn");
+            ui.end_row();
+            ui.label("");
+            ui.checkbox(&mut json, "Write metadata (.json)");
+            ui.end_row();
+        } else {
+            ui.label("Scale");
+            ui.add(
+                DragValue::new(&mut scale)
+                    .range(1..=MAX_EXPORT_SCALE)
+                    .suffix("×"),
+            );
+            ui.end_row();
+        }
+    });
+    if kind == ExportKind::Gif {
+        ui.label(RichText::new("A GIF has no half-transparent pixels: they become solid.").weak());
+    }
+
+    match buttons(ui, "Export…") {
+        (true, _) => {
+            let mut params = Params::new().with("tag", tag.map_or(-1, |at| at as i64));
+            params = if kind == ExportKind::Sheet {
+                params
+                    .with("layout", sheet.layout.id())
+                    .with("per_line", sheet.per_line)
+                    .with("padding", sheet.padding)
+                    .with("trim", sheet.trim)
+                    .with("json", json)
+            } else {
+                params.with("scale", scale)
+            };
+            Outcome::Run(command.to_owned(), params)
+        }
+        (_, true) => Outcome::Dismissed,
+        _ => Outcome::Open(Dialog::Export {
+            kind,
+            scale,
+            tag,
+            sheet,
+            json,
+        }),
+    }
+}
+
 /// How many colours the ramp from the primary to the secondary colour gets.
 fn ramp(ui: &mut Ui, state: &AppState, mut steps: u32) -> Outcome {
     ui.heading("Generate Ramp");
@@ -303,6 +544,19 @@ pub fn resolve_file_request(
             let Some(path) = picked else { return };
             let path = with_extension(path, "gpl");
             ("palette.export", Params::new().with("path", text(path)))
+        }
+        FileRequest::Export {
+            command,
+            params,
+            file_type: (label, extension),
+        } => {
+            let picked = dialog
+                .add_filter(label, &[extension])
+                .set_file_name(format!("{stem}.{extension}"))
+                .save_file();
+            let Some(path) = picked else { return };
+            let path = with_extension(path, extension);
+            (command, params.with("path", text(path)))
         }
         FileRequest::ReferenceImage => {
             let picked = dialog.add_filter("PNG image", &["png"]).pick_file();

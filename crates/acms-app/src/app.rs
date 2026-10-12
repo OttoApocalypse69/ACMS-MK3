@@ -132,6 +132,13 @@ impl AcmsApp {
             self.run_command("app.quit", &Params::new());
         }
 
+        // A playing animation moves on with the clock, and asks to be drawn again when its
+        // next frame is due.
+        let now = ctx.input(|input| input.time);
+        if let Some(wait) = self.state.tick_playback(now) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(u64::from(wait)));
+        }
+
         // A dialog is modal: shortcuts wait until it is closed.
         if self.state.dialog.is_none() {
             if !ctx.text_edit_focused() {
@@ -1033,5 +1040,152 @@ mod tests {
         h.app.run_command("tool.eraser", &Params::new());
         h.press(Modifiers::NONE, Key::B);
         assert_eq!(h.app.state.editor.active_tool(), "pencil");
+    }
+    /// A sprite with three frames, the pencil having drawn a dot at x = 1, 2, 3 in turn.
+    fn three_frames() -> Harness {
+        let mut h = Harness::with_sprite();
+        for x in 1..=3 {
+            if x > 1 {
+                h.app.run_command("frame.new", &Params::new());
+                h.frame(vec![]);
+            }
+            h.drag_pixels(PointerButton::Primary, &[(x, 0)]);
+        }
+        h.app.run_command("frame.first", &Params::new());
+        h.frame(vec![]);
+        h
+    }
+
+    fn dots(h: &Harness) -> Vec<Option<i32>> {
+        let sprite = h.app.state.editor.document().unwrap().sprite();
+        (0..sprite.frames().len())
+            .map(|frame| sprite.cel(LayerId(1), frame).map(|cel| cel.origin().x))
+            .collect()
+    }
+
+    fn shown_frame(h: &Harness) -> usize {
+        h.app.state.editor.document().unwrap().active_frame()
+    }
+
+    #[test]
+    fn the_timeline_selects_and_moves_cels_and_frames() {
+        let mut h = three_frames();
+        assert_eq!(dots(&h), [Some(1), Some(2), Some(3)]);
+
+        // A click on a cel shows its frame and selects it.
+        let cel = |h: &Harness, frame| h.app.panels.timeline.cel_pos(0, frame);
+        let at = cel(&h, 2);
+        h.pointer_move(at);
+        h.pointer_button(at, PointerButton::Primary, true);
+        h.pointer_button(at, PointerButton::Primary, false);
+        h.frame(vec![]);
+        assert_eq!(shown_frame(&h), 2);
+        let range = h.app.state.cel_range.unwrap();
+        assert_eq!((range.first(), range.last()), (2, 2));
+
+        // Dragging a cel onto another moves its pixels there.
+        let (from, to) = (cel(&h, 0), cel(&h, 1));
+        h.pointer_move(from);
+        h.pointer_button(from, PointerButton::Primary, true);
+        h.pointer_move(from + egui::vec2(8.0, 0.0));
+        h.pointer_move(to);
+        h.pointer_button(to, PointerButton::Primary, false);
+        h.frame(vec![]);
+        assert_eq!(dots(&h), [None, Some(1), Some(3)]);
+        assert_eq!(h.history().last().map(String::as_str), Some("Move Cel"));
+
+        // Dragging a frame's number moves the whole frame.
+        let number = |h: &Harness, frame| h.app.panels.timeline.frame_pos(frame);
+        let (from, to) = (number(&h, 2), number(&h, 0));
+        h.pointer_move(from);
+        h.pointer_button(from, PointerButton::Primary, true);
+        h.pointer_move(from - egui::vec2(8.0, 0.0));
+        h.pointer_move(to);
+        h.pointer_button(to, PointerButton::Primary, false);
+        h.frame(vec![]);
+        assert_eq!(dots(&h), [Some(3), None, Some(1)]);
+        assert_eq!(shown_frame(&h), 0);
+
+        // A click on a number shows that frame.
+        let at = number(&h, 1);
+        h.pointer_move(at);
+        h.pointer_button(at, PointerButton::Primary, true);
+        h.pointer_button(at, PointerButton::Primary, false);
+        h.frame(vec![]);
+        assert_eq!(shown_frame(&h), 1);
+    }
+
+    #[test]
+    fn frame_keys_step_and_enter_plays_with_the_clock() {
+        let mut h = three_frames();
+        h.press(Modifiers::NONE, Key::Period);
+        assert_eq!(shown_frame(&h), 1);
+        h.press(Modifiers::NONE, Key::Comma);
+        h.press(Modifiers::NONE, Key::Comma);
+        assert_eq!(shown_frame(&h), 2);
+        h.press(Modifiers::NONE, Key::Home);
+        assert_eq!(shown_frame(&h), 0);
+
+        let at = |h: &mut Harness, seconds: f64| {
+            let input = RawInput {
+                time: Some(seconds),
+                ..h.input()
+            };
+            h.frame_with(input)
+        };
+        at(&mut h, 5.0);
+        h.app.run_command("playback.toggle", &Params::new());
+        assert!(h.app.state.playing.is_some());
+        at(&mut h, 5.0);
+        // The app asks to be drawn again when the next frame is due.
+        let output = at(&mut h, 5.03125);
+        let wait = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(wait <= std::time::Duration::from_millis(100));
+        assert_eq!(shown_frame(&h), 0);
+        at(&mut h, 5.125);
+        assert_eq!(shown_frame(&h), 1);
+        at(&mut h, 5.25);
+        assert_eq!(shown_frame(&h), 2);
+        at(&mut h, 5.375);
+        assert_eq!(shown_frame(&h), 0);
+
+        // Enter stops it, back on the frame it started from.
+        at(&mut h, 5.5);
+        assert_eq!(shown_frame(&h), 2);
+        h.press(Modifiers::NONE, Key::Enter);
+        assert!(h.app.state.playing.is_none());
+        assert_eq!(shown_frame(&h), 0);
+        h.press(Modifiers::NONE, Key::Enter);
+        assert!(h.app.state.playing.is_some());
+    }
+
+    #[test]
+    fn the_canvas_shows_the_frame_with_its_onion_skin() {
+        let mut h = three_frames();
+        // Each frame shows only its own dot.
+        h.app.run_command("frame.next", &Params::new());
+        h.frame(vec![]);
+        h.pointer_move(h.app.panels.canvas.screen_pos(2, 0));
+        h.frame(vec![]);
+        assert_eq!(
+            h.app.panels.canvas.hover().map(|(_, color)| color.a),
+            Some(255)
+        );
+        h.pointer_move(h.app.panels.canvas.screen_pos(1, 0));
+        h.frame(vec![]);
+        assert_eq!(
+            h.app.panels.canvas.hover().map(|(_, color)| color.a),
+            Some(0)
+        );
+
+        // With the onion skin on, the neighbours are painted without disturbing the frame.
+        h.press(Modifiers::NONE, Key::F3);
+        assert!(h.app.state.onion_enabled);
+        h.frame(vec![]);
+        h.drag_pixels(PointerButton::Primary, &[(5, 5), (8, 5)]);
+        let sprite = h.app.state.editor.document().unwrap().sprite();
+        assert_ne!(sprite.pixel(LayerId(1), 1, 6, 5), Rgba8::TRANSPARENT);
+        assert_eq!(sprite.pixel(LayerId(1), 0, 6, 5), Rgba8::TRANSPARENT);
+        assert_eq!(dots(&h), [Some(1), Some(2), Some(3)]);
     }
 }

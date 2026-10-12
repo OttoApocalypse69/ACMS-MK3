@@ -20,7 +20,9 @@ use crate::canvas::CanvasView;
 use crate::commands;
 use crate::keymap::Keymap;
 use crate::layers_panel::{self, LayersUi};
+use crate::preview::{self, PreviewUi};
 use crate::state::AppState;
+use crate::timeline::{self, TimelineUi};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Panel {
@@ -117,6 +119,8 @@ struct ColourUi {
 pub struct PanelsUi {
     pub canvas: CanvasView,
     pub layers: LayersUi,
+    pub timeline: TimelineUi,
+    pub preview: PreviewUi,
     colour: ColourUi,
 }
 
@@ -158,6 +162,8 @@ impl TabViewer for PanelViewer<'_> {
             Panel::Layers => layers_panel::show(ui, state, registry, keymap, &mut ui_state.layers),
             Panel::History => history(ui, state, registry),
             Panel::Log => log(ui, state),
+            Panel::Timeline => timeline::show(ui, state, registry, keymap, &mut ui_state.timeline),
+            Panel::Preview => preview::show(ui, state, registry, &mut ui_state.preview),
             other => {
                 ui.label(RichText::new(format!("{} — placeholder", other.title())).weak());
             }

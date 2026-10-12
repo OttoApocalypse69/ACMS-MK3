@@ -19,3 +19,6 @@ serde_json = "1.0.152"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+gif = "0.14.2"

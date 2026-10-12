@@ -119,7 +119,9 @@ impl Editor {
             .find_map(|(doc_id, document)| (*doc_id == id).then_some(document))
     }
 
-    /// Any open document, for changing it while another one may be the active one.
+    /// Any open document, for changing it while another one may be the active one. Unlike
+    /// [`Editor::document_mut`] this leaves a stroke in progress alone: a tool that draws
+    /// through transactions of its own, as script tools do, changes the document mid-stroke.
     pub fn document_mut_by_id(&mut self, id: DocId) -> Option<&mut Document> {
         self.documents
             .iter_mut()

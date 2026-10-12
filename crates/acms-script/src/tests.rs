@@ -214,6 +214,44 @@ fn a_script_that_never_ends_is_stopped() {
 }
 
 #[test]
+fn a_script_that_takes_too_much_memory_is_stopped() {
+    let (mut engine, mut host) = setup();
+    engine.set_memory_limit(16 * 1024 * 1024).unwrap();
+    let code = "local hoard = {} for i = 1, 1000 do hoard[i] = ('x'):rep(1024 * 1024) .. i end";
+    let message = eval_error(&mut engine, &mut host, code);
+    assert!(message.contains("memory"), "{message}");
+    // What it held is let go, and the engine is fine afterwards.
+    assert_eq!(eval(&mut engine, &mut host, "1"), ["1"]);
+}
+
+#[test]
+fn a_command_ends_a_stroke_that_is_going_on() {
+    let (mut engine, mut host) = setup();
+    let code = "
+        register_tool{ id = 'dots', on_down = function(event)
+            app.active_cel:set_pixel(event.x, event.y, '#ff0000')
+        end }
+        register_command{ id = 'my.dot', run = function()
+            app.transaction('Dot', function() app.active_cel:set_pixel(0, 0, '#0000ff') end)
+        end }";
+    engine.load(&mut host, "both.lua", code).unwrap();
+    engine
+        .tool_event(&mut host, "dots", ToolPhase::Down, at(4, 4))
+        .unwrap();
+    assert_eq!(pixel(&host, 4, 4), RED);
+    // A command run in the middle of the stroke: the stroke is taken back, the command
+    // stands on its own.
+    assert_eq!(engine.run_command(&mut host, "my.dot"), Ok(Outcome::Done));
+    engine
+        .tool_event(&mut host, "dots", ToolPhase::Up, at(4, 4))
+        .unwrap();
+    assert_eq!(pixel(&host, 4, 4), Rgba8::TRANSPARENT);
+    assert_eq!(pixel(&host, 0, 0), BLUE);
+    assert_eq!(steps(&host), ["Dot"]);
+    assert!(!doc(&host).in_group());
+}
+
+#[test]
 fn colours_are_made_compared_and_set() {
     let (mut engine, mut host) = setup();
     assert_eq!(

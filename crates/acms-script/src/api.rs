@@ -303,9 +303,13 @@ fn layer_table(lua: &Lua, layer: &Layer) -> mlua::Result<Table> {
     Ok(table)
 }
 
+/// The sprite being edited. A stroke in progress is left alone: it may be the stroke of the
+/// script tool that is asking.
 fn document(host: &mut dyn Host) -> Result<&mut Document, Fail> {
-    host.editor()
-        .document_mut()
+    let editor = host.editor();
+    editor
+        .active_document()
+        .and_then(|id| editor.document_mut_by_id(id))
         .ok_or(Fail::from("no sprite is open"))
 }
 
@@ -589,7 +593,9 @@ fn answer(
             let doc = editor
                 .active_document()
                 .ok_or(Fail::from("no sprite is open"))?;
-            let begun = editor.document_mut().is_some_and(Document::begin_group);
+            let begun = editor
+                .document_mut_by_id(doc)
+                .is_some_and(Document::begin_group);
             if !begun {
                 return Err(Fail::from("an undo step is being recorded already"));
             }

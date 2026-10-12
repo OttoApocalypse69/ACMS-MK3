@@ -1148,9 +1148,12 @@ impl Document {
         self.entries.truncate(self.cursor);
         self.last_revision += 1;
 
+        // A step made before an open group is not part of it, and takes nothing in.
+        let in_reach = self.group.is_none_or(|start| self.entries.len() > start);
         if let Some(last) = self.entries.back_mut()
             && merge.is_some()
             && last.merge == merge
+            && in_reach
         {
             match last.absorb(ops) {
                 Ok(()) => {
@@ -1412,6 +1415,41 @@ mod tests {
         assert!(doc.redo());
         assert_eq!(*doc.sprite(), after);
         assert_eq!(doc.revision(), 4);
+    }
+
+    #[test]
+    fn a_group_does_not_merge_into_the_step_before_it() {
+        let mut doc = document();
+        let set = |doc: &mut Document, opacity: u8| {
+            doc.transact_merging("Layer Opacity", Some(7), |tx| {
+                tx.update_layer(L1, |props| {
+                    if let Some(image) = &mut props.image {
+                        image.opacity = opacity;
+                    }
+                })
+            })
+            .unwrap();
+        };
+        let opacity = |doc: &Document| doc.sprite().layer(L1).unwrap().as_image().unwrap().opacity;
+        set(&mut doc, 200);
+
+        // The same kind of change, with the same token, made inside a group.
+        doc.begin_group();
+        set(&mut doc, 100);
+        set(&mut doc, 50);
+        doc.abort_group();
+        assert_eq!(opacity(&doc), 200);
+        assert_eq!(doc.history().len(), 1);
+
+        doc.begin_group();
+        set(&mut doc, 100);
+        doc.end_group("Script");
+        assert_eq!(
+            doc.history().collect::<Vec<_>>(),
+            ["Layer Opacity", "Script"]
+        );
+        doc.undo();
+        assert_eq!(opacity(&doc), 200);
     }
 
     #[test]

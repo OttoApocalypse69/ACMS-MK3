@@ -220,6 +220,12 @@ impl Engine {
         self.time_limit = limit;
     }
 
+    /// Changes how much memory, in bytes, the Lua state may use.
+    pub fn set_memory_limit(&mut self, bytes: usize) -> Result<(), ScriptError> {
+        self.lua.set_memory_limit(bytes)?;
+        Ok(())
+    }
+
     /// The lines scripts printed since the last call.
     pub fn take_output(&mut self) -> Vec<String> {
         std::mem::take(&mut self.session.output)
@@ -294,9 +300,11 @@ impl Engine {
         }
     }
 
-    /// Starts something new from the top: an earlier script still waiting for a dialog is
-    /// dropped, and so are the folders it was allowed to use.
-    fn begin_run(&mut self) {
+    /// Starts something new from the top: a stroke in progress is abandoned, an earlier script
+    /// still waiting for a dialog is dropped, and so are the folders it was allowed to use.
+    fn begin_run(&mut self, host: &mut dyn Host) {
+        host.editor().cancel_interaction();
+        self.tool_cancel(host);
         self.pending = None;
         self.session.granted.clear();
     }
@@ -331,7 +339,7 @@ impl Engine {
     /// Loads one script file: runs it, so that it registers what it has. `name` is the file
     /// name shown in errors. A script that fails leaves nothing registered.
     pub fn load(&mut self, host: &mut dyn Host, name: &str, code: &str) -> Result<(), ScriptError> {
-        self.begin_run();
+        self.begin_run(host);
         let count = |list: &str| {
             self.internal
                 .get::<Table>(list)
@@ -359,7 +367,7 @@ impl Engine {
 
     /// Runs a command a script registered.
     pub fn run_command(&mut self, host: &mut dyn Host, id: &str) -> Result<Outcome, ScriptError> {
-        self.begin_run();
+        self.begin_run(host);
         let run: Function = self.internal.get("run_command")?;
         let thread = self.lua.create_thread(run)?;
         self.drive(host, thread, id)
@@ -367,7 +375,7 @@ impl Engine {
 
     /// Runs a line typed into the console. If it is an expression, its value is printed.
     pub fn eval(&mut self, host: &mut dyn Host, code: &str) -> Result<Outcome, ScriptError> {
-        self.begin_run();
+        self.begin_run(host);
         let compile = |code: &str| {
             self.lua
                 .load(code)
@@ -395,6 +403,8 @@ impl Engine {
         let Some(thread) = self.pending.take() else {
             return Ok(Outcome::Done);
         };
+        host.editor().cancel_interaction();
+        self.tool_cancel(host);
         let values = match answer {
             Some(spec) => Value::Table(api::dialog_values(&self.lua, spec)?),
             None => Value::Nil,
@@ -418,7 +428,10 @@ impl Engine {
             let Some(doc) = editor.active_document() else {
                 return Ok(());
             };
-            if !editor.document_mut().is_some_and(|d| d.begin_group()) {
+            let begun = editor
+                .document_mut_by_id(doc)
+                .is_some_and(|document| document.begin_group());
+            if !begun {
                 return Ok(());
             }
             self.session.group = Some(Group {

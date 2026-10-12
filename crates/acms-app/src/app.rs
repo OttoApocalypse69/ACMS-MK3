@@ -1208,4 +1208,171 @@ mod tests {
         assert_eq!(sprite.pixel(LayerId(1), 0, 6, 5), Rgba8::TRANSPARENT);
         assert_eq!(dots(&h), [Some(1), Some(2), Some(3)]);
     }
+
+    #[test]
+    fn the_palette_finds_and_runs_a_script_command() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(1, 3), (4, 3)]);
+        assert_ne!(h.pixel(1, 3), Rgba8::TRANSPARENT);
+
+        h.press(CTRL.plus(Modifiers::SHIFT), Key::P);
+        h.type_text("mirror sprite");
+        h.press(Modifiers::NONE, Key::Enter);
+        assert!(!h.app.state.palette.is_open());
+        // The line from x = 1 to 4 of 16 now runs from 11 to 14.
+        assert_eq!(h.pixel(1, 3), Rgba8::TRANSPARENT);
+        assert_ne!(h.pixel(11, 3), Rgba8::TRANSPARENT);
+        assert_ne!(h.pixel(14, 3), Rgba8::TRANSPARENT);
+        assert_eq!(h.history(), ["Pencil", "Mirror Sprite"]);
+
+        // One undo takes the whole script back.
+        h.press(CTRL, Key::Z);
+        assert_ne!(h.pixel(1, 3), Rgba8::TRANSPARENT);
+        assert_eq!(h.pixel(11, 3), Rgba8::TRANSPARENT);
+    }
+
+    #[test]
+    fn a_key_can_be_bound_to_a_script_command() {
+        let file = config::TempFile::new(
+            "app-script-key.json",
+            r#"{ "bindings": [ { "keys": "Ctrl+J", "command": "example.mirror_sprite" } ] }"#,
+        );
+        let mut h = Harness::with_keymap_file(Some(file.path()));
+        assert!(
+            !h.app
+                .state
+                .log
+                .iter()
+                .any(|line| line.contains("no command")),
+            "{:?}",
+            h.app.state.log
+        );
+        let size = Params::new().with("width", 16_u32).with("height", 16_u32);
+        h.app.run_command("file.new", &size);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        h.drag_pixels(PointerButton::Primary, &[(1, 3), (4, 3)]);
+        h.press(CTRL, Key::J);
+        assert_ne!(h.pixel(14, 3), Rgba8::TRANSPARENT);
+        assert_eq!(h.history(), ["Pencil", "Mirror Sprite"]);
+    }
+
+    #[test]
+    fn a_script_tool_draws_on_the_canvas_as_one_undo_step() {
+        let mut h = Harness::with_sprite();
+        h.app.run_command("tool.spray", &Params::new());
+        h.frame(vec![]);
+        h.drag_pixels(PointerButton::Primary, &[(8, 8), (9, 8), (10, 8), (10, 9)]);
+
+        let painted = (0..16)
+            .flat_map(|y| (0..16).map(move |x| (x, y)))
+            .filter(|&(x, y)| h.pixel(x, y) != Rgba8::TRANSPARENT)
+            .count();
+        assert!(painted > 0);
+        assert_eq!(h.history(), ["Spray"]);
+        assert!(!h.app.state.editor.document().unwrap().in_group());
+        h.press(CTRL, Key::Z);
+        assert!(h.history().len() == 1 && !h.app.state.editor.document().unwrap().can_undo());
+        assert_eq!(h.app.state.dialog, None);
+
+        // Escape in the middle of a stroke takes it back.
+        let at = h.app.panels.canvas.screen_pos(4, 4);
+        h.pointer_move(at);
+        h.pointer_button(at, PointerButton::Primary, true);
+        h.frame(vec![]);
+        h.press(Modifiers::NONE, Key::Escape);
+        h.pointer_button(at, PointerButton::Primary, false);
+        h.frame(vec![]);
+        let document = h.app.state.editor.document().unwrap();
+        assert!(!document.in_group());
+        assert!(!document.can_undo());
+    }
+
+    #[test]
+    fn a_script_dialog_is_shown_and_escape_cancels_it() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(1, 3), (4, 3)]);
+        h.app.run_command("example.palette_swap", &Params::new());
+        assert!(matches!(h.app.state.dialog, Some(Dialog::Script(_))));
+        // The dialog stays up from frame to frame, and keeps shortcuts away.
+        h.frame(vec![]);
+        h.press(Modifiers::NONE, Key::E);
+        assert!(matches!(h.app.state.dialog, Some(Dialog::Script(_))));
+        assert_eq!(h.app.state.editor.active_tool(), "pencil");
+
+        h.press(Modifiers::NONE, Key::Escape);
+        assert_eq!(h.app.state.dialog, None);
+        assert_eq!(h.history(), ["Pencil"]);
+        // The script was told, and is not left waiting: the next one runs.
+        h.app.run_command("example.mirror_sprite", &Params::new());
+        assert_eq!(h.history(), ["Pencil", "Mirror Sprite"]);
+    }
+
+    #[test]
+    fn the_scripts_menu_and_console_are_drawn() {
+        let mut h = Harness::with_sprite();
+        let console = h
+            .app
+            .state
+            .dock
+            .find_tab(&crate::panels::Panel::ScriptConsole)
+            .unwrap();
+        let _ = h.app.state.dock.set_active_tab(console);
+        h.app
+            .run_command("script.run", &Params::new().with("code", "1 + 1"));
+        h.app
+            .run_command("script.run", &Params::new().with("code", "oops("));
+        // Drawing the console with output and an error in it must not fail.
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let lines = &h.app.state.scripts.console;
+        assert!(lines.iter().any(|line| line.text == "2"));
+        assert_eq!(h.app.state.dialog, None);
+
+        // Reload Scripts is carried out at the start of the next frame.
+        h.app.state.scripts.console.clear();
+        h.app.run_command("script.reload", &Params::new());
+        assert!(h.app.state.scripts.console.is_empty());
+        h.frame(vec![]);
+        assert!(
+            h.app.state.scripts.console[0]
+                .text
+                .starts_with("Loaded 5 of 5 scripts.")
+        );
+        assert!(h.app.registry.get("example.outline").is_some());
+    }
+
+    #[test]
+    fn the_scripts_menu_lists_and_runs_script_commands() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(1, 3), (4, 3)]);
+        h.app.state.scripts.console.clear();
+
+        // Where the items are is egui's business: open the menu and try every row under its
+        // title until each of the two things looked for has happened.
+        let title = Pos2::new(396.0, 16.0);
+        let (mut mirrored, mut reloaded, mut opened) = (false, false, false);
+        for row in 0..40 {
+            h.pointer_move(title);
+            h.pointer_button(title, PointerButton::Primary, true);
+            h.pointer_button(title, PointerButton::Primary, false);
+            h.frame(vec![]);
+            opened |= egui::Popup::is_any_open(&h.ctx);
+            let item = Pos2::new(title.x + 20.0, 34.0 + 6.0 * row as f32);
+            h.pointer_move(item);
+            h.pointer_button(item, PointerButton::Primary, true);
+            h.pointer_button(item, PointerButton::Primary, false);
+            h.frame(vec![]);
+            h.frame(vec![]);
+            // Whatever was hit, leave no dialog or open menu behind for the next try.
+            h.app.state.dialog = None;
+            h.press(Modifiers::NONE, Key::Escape);
+            mirrored |= h.history().iter().any(|step| step == "Mirror Sprite");
+            let console = &h.app.state.scripts.console;
+            reloaded |= console.iter().any(|line| line.text.starts_with("Loaded"));
+        }
+        assert!(opened, "the Scripts menu did not open");
+        assert!(mirrored, "Mirror Sprite was not found in the Scripts menu");
+        assert!(reloaded, "Reload Scripts was not found in the Scripts menu");
+    }
 }

@@ -4,32 +4,76 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phases 0 to 5 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
-features, animation). **Phase 6 is in progress.**
-
-## Phase 6 task list
-
-Core:
-
-- [ ] Tilesets and tilemap layers: a grid of tile numbers per cel, drawn from the tileset
-- [ ] Auto mode: pixel tools on a tilemap edit the tile (every instance updates), make new tiles when needed and merge duplicates
-- [ ] Stamp mode: the tile stamp tool places existing tiles; pixel tools leave tilemaps alone
-- [ ] Slices: name, rectangle, optional 9-slice centre and pivot; a slice tool; all undoable
-
-IO:
-
-- [ ] `.acms` format version 5 (tilesets, tilemap layers, slices) with a migration from version 4
-- [ ] Export: tileset PNG, tilemap as Tiled `.tmj` and CSV; slices in the spritesheet JSON
-
-App:
-
-- [ ] Commands, shortcuts and menus for tilemaps, tiles, slices and the exports
-- [ ] Tileset panel (tile picker), tile grid and slices on the canvas, slice dialog
-- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
+**Phases 0 to 6 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
+features, animation, game-dev features). Next is Phase 7 (not started).
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directories 6, serde 1,
 serde_json 1, thiserror 2, anyhow 1, arboard 3.6.
+
+## Phase 6 task list (done)
+
+Core:
+
+- [x] Tilesets and tilemap layers: a grid of tile numbers per cel, drawn from the tileset
+- [x] Auto mode: pixel tools on a tilemap edit the tile (every instance updates), make new tiles when needed and merge duplicates
+- [x] Stamp mode: the tile stamp tool places existing tiles; pixel tools leave tilemaps alone
+- [x] Slices: name, rectangle, optional 9-slice centre and pivot; a slice tool; all undoable
+
+IO:
+
+- [x] `.acms` format version 5 (tilesets, tilemap layers, slices) with a migration from version 4; a Phase 5 file kept in `tests/samples/`
+- [x] Export: tileset PNG, tilemap as Tiled `.tmj` and CSV; slices in the spritesheet JSON
+
+App:
+
+- [x] Commands, shortcuts and menus for tilemaps, tiles, slices and the exports
+- [x] Tileset panel (tile picker), tile grid and slices on the canvas, slice dialog
+- [x] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass (431 tests); commits along the way
+
+### How Phase 6 was checked
+
+- **Editing one tile updates all its instances** (the first half of the "done when"): a test
+  places one tile in three cells, draws one pixel in one of them, and checks that all three show
+  it, that it is still one tile, that the flattened picture shows it, and that one undo takes it
+  out of all three. The same is checked across two layers and two frames sharing a tileset,
+  after saving and loading, through the app's tools, and in a golden image.
+- **Auto mode**: a new tile for an empty cell, an existing tile reused when the picture is the
+  same, a stroke crossing two instances of a tile adding up, tiles merged when they become
+  alike, tiles dropped when erased; every case undoes exactly.
+- **Stamp mode and the Tile Stamp**: placing and clearing, a fast drag filling every cell on the
+  way, the preview before release, one undo step per drag, pixel tools refused in stamp mode.
+- **Slices**: add, change, remove, each undone exactly; the Slice tool making and selecting.
+- **Format**: version 5 round-trips; a real file saved by the Phase 5 build loads; damaged
+  tilesets, grids and slices are errors, not panics.
+- **Exports**: the `.tmj` is checked field by field against what Tiled's JSON map format
+  requires (map, layer and tileset fields, global tile numbers across two tilesets), the tileset
+  pictures against the tilesets, the CSV against Tiled's own CSV convention, the slices in the
+  spritesheet JSON against Aseprite's layout.
+- **In the real window**: a tilemap with stamped tiles and one edit showing on every instance,
+  the tile grid, a slice with its 9-slice lines and pivot, the Tileset panel and the Tile Stamp's
+  options. A `.tmj`, a CSV and a sheet JSON written by the real app were read back.
+- **Not checked by me**: **the exported `.tmj` has not been opened in Tiled** (the second half of
+  the "done when") — Tiled is not installed here, so that needs doing by hand. Also not checked:
+  the Tileset panel and the slice dialog being clicked, and stamping with a real mouse.
+
+### Known limits of Phase 6
+
+- **The canvas cannot be resized, cropped or scaled while the sprite has tilemap layers.**
+- **A tileset's tile size is fixed** when it is made, and the canvas is not forced to be a whole
+  number of tiles: tiles on the right and bottom edge can be cut off.
+- **Every pixel write on a tilemap edits tiles** in auto mode — paste, flip, replace colour and
+  so on as well as drawing. There is no mode that gives an edited cell a tile of its own.
+- **Tiles are only removed when they become empty or equal to another**; a tile no cell uses
+  stays in the set. Tiles cannot be reordered, and renumber when one is removed.
+- **Cels of tilemap layers cannot be moved, copied or linked** in the Timeline, and nothing can
+  be merged down onto a tilemap.
+- **A Tiled map has one tile size**: the export refuses tilemap layers with different ones. It
+  writes the frame being shown, tilemap layers only, with the tilesets as separate pictures.
+- **Slices are the same in every frame**, are edited by numbers in a dialog (no handles on the
+  canvas), and there is no list of them: click one with the Slice tool to select it.
+- A new tilemap layer always gets a new tileset from the dialog; sharing one is possible through
+  the command (`tileset` argument) but has no button.
 
 ## Phase 5 task list (done)
 
@@ -446,6 +490,15 @@ App (`acms-app`):
 - **`.acms` format version 4.** Versions 1 to 3 are upgraded when loaded.
 - **New dependency: `gif`** (0.14, with `color_quant` and `weezl`), for the GIF export; kept
   (agreed 2026-10-12). It also decodes, which the tests use.
+- **A tilemap layer is an image layer whose pixels are derived.** Its cels are kept as ordinary
+  pictures, redrawn from the tile grids whenever tiles change, so compositing, exports, the onion
+  skin and reading pixels need no special case. Only writing differs: a pixel write on a
+  tilemap is turned into tile edits, recorded with the same snapshot as frame changes.
+- **"Auto" is one mode** as the plan describes it: drawing changes the tile under the pointer
+  (and so every copy of it), makes a tile for an empty cell, and merges tiles that end up alike.
+- **Tile 0 is "no tile"**, tiles count from 1, and Tiled's global tile numbers follow directly.
+- **Slices are not per frame** and are stored in the sprite, undoable, saved in the file.
+- **`.acms` format version 5.** Versions 1 to 4 are upgraded when loaded.
 - **Adding, removing and dragging palette colours** are part of Phase 4 (agreed 2026-10-12).
   Dragging a swatch onto another moves it there; the selection is cleared, since it is made of
   positions.
@@ -507,6 +560,7 @@ editor in Phase 8. The Log panel says at startup which file was used and what wa
 | . / , and Home / End | Next / previous frame, first / last frame |
 | Enter | Play / Stop |
 | F3 | Toggle onion skin |
+| T / C | Tile Stamp / Slice tool |
 | Ctrl+Shift+N | New layer |
 | F2 | Rename the selected layer |
 | X | Swap primary and secondary colour |
@@ -595,6 +649,10 @@ Described in `PLAN.md` but not part of the "Done when" of a finished phase:
   exact in binary (multiples of 1/8 s): `10.1 - 10.05` is a hair under 50 ms.
 - Phase 6 will add tilemap layers: `Sprite::check_cel` is the gate for "has pixels", and the
   Timeline shows cels only for layers that pass `as_image()`.
+- Phase 7 (scripting): everything a script may do is already a command or a transaction
+  method; `Transaction` is the natural thing to hand to `app.transaction`.
+- Python is on this machine and edits source files more safely than PowerShell 5.1 (UTF-8, exact
+  one-match replaces); `\\u{...}` in a Python string must be written with a doubled backslash.
 - If full-canvas recomposition becomes a problem, the place to optimise is the per-pixel loop in
   `compositor::compose_rect` (row slices instead of `get` / `set`, a fast path for opaque Normal).
 
@@ -618,6 +676,11 @@ None known.
 - Timeline: select several whole frames and drag them together; a right-click menu.
 - Onion skin that wraps around inside the playing tag.
 - APNG or WebP export for animations with half-transparent pixels.
+- Resize the canvas with tilemaps (re-cut or keep the grid); change a tileset's tile size.
+- A "manual" tile mode where an edited cell gets its own new tile; remove unused tiles.
+- Convert an image layer to a tilemap; share a tileset from the dialog; reorder tiles.
+- Slice handles on the canvas, a slice list, per-frame slices.
+- Import a tileset picture or a Tiled map.
 - Movable symmetry axes (drag the mirror lines, or centre them on the selection).
 - Move and scale a reference picture with the move tool; reference pictures from JPEG files.
 - Tiled mode for the bucket and the move tool (fill and move across the edge).

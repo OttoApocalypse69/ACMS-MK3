@@ -88,7 +88,7 @@ pub fn default_layout() -> DockState<Panel> {
 
     let [main, _bottom] = tree.split_below(main, 0.7, vec![Timeline, Tileset, ScriptConsole, Log]);
     let [_canvas, tools] = tree.split_left(main, 0.17, vec![Tools]);
-    tree.split_below(tools, 0.66, vec![ToolOptions, Preview]);
+    tree.split_below(tools, 0.72, vec![ToolOptions, Preview]);
 
     dock
 }

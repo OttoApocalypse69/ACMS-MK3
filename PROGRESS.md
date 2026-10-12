@@ -4,39 +4,111 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phases 0 to 6 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
-features, animation, game-dev features). **Phase 7 (scripting) is in progress.**
+**Phases 0 to 7 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
+features, animation, game-dev features, scripting). Next is Phase 8 (not started).
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directories 6, serde 1,
 serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4).
 
-## Phase 7 task list
+## Phase 7 task list (done)
 
 Core:
 
-- [ ] Undo groups: several transactions (and commands) folded into one undo step, or rolled back together
-- [ ] Commands and tools can be added and removed while the app runs (for scripts and reload)
+- [x] Undo groups: several transactions (and commands) folded into one undo step, or rolled back together
+- [x] Commands and tools can be added and removed while the app runs (for scripts and reload)
 
 Script host (`acms-script`):
 
-- [ ] Sandboxed Lua 5.4: no `os`, `io`, `debug`, `package`, no file loading, a time limit and a memory limit
-- [ ] API: `app.command`, `app.active_sprite`, `app.fg_color` / `bg_color`, `app.transaction`; sprite, layers, frames, palette, selection, tags; cels and images with `get_pixel` / `set_pixel`
-- [ ] `register_command`, `register_filter`, `register_tool`
-- [ ] Dialog builder (number, colour, text, checkbox, dropdown)
-- [ ] File access only inside a folder the user picked
-- [ ] Errors carry file and line; nothing a script does can panic the host
+- [x] Sandboxed Lua 5.4: no `os`, `io`, `debug`, `package`, no file loading, a time limit and a memory limit
+- [x] API: `app.command`, `app.active_sprite`, `app.fg_color` / `bg_color`, `app.transaction`; sprite, layers, frames, palette, selection, tags; cels and images with `get_pixel` / `set_pixel`
+- [x] `register_command`, `register_filter`, `register_tool`
+- [x] Dialog builder (number, colour, text, checkbox, dropdown)
+- [x] File access only inside a folder the user picked
+- [x] Errors carry file and line; nothing a script does can panic the host
 
 App:
 
-- [ ] Scripts folder in the config directory, bundled examples, Reload Scripts
-- [ ] Script commands in the registry (palette, shortcuts, menu), script tools in the Tools panel
-- [ ] Script Console panel: output and a line to run Lua
-- [ ] Script dialogs
-- [ ] Bundled examples: outline filter, palette swap, mirror sprite, export every tag as a GIF, spray tool
-- [ ] The scripting API written down in `scripts/API.md`
-- [ ] Tests: every bundled script run headless; each is one undo step
-- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
+- [x] Scripts folder in the config directory, bundled examples, Reload Scripts
+- [x] Script commands in the registry (palette, shortcuts, menu), script tools in the Tools panel
+- [x] Script Console panel: output and a line to run Lua
+- [x] Script dialogs
+- [x] Bundled examples: outline filter, palette swap, mirror sprite, export every tag as a GIF, spray tool
+- [x] The scripting API written down in `scripts/API.md`
+- [x] Tests: every bundled script run headless; each is one undo step
+- [x] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass (493 tests); commits along the way
+
+### How Phase 7 was checked
+
+- **The "done when"**, for each of the five examples, through the app's real command registry:
+  - *It is in the command palette*: each is a command in the registry that runs without
+    arguments, which is what the palette lists; a headless test opens the palette, types
+    "mirror sprite", presses Enter and sees the sprite mirrored.
+  - *It works*: Outline draws exactly the one-pixel line around a stroke and stays inside a
+    selection; Palette Swap shows its dialog, then recolours every layer and frame (also
+    linked cels, and "this frame only"); Mirror Sprite flips every layer and frame and leaves a
+    locked layer alone; Export Every Tag writes one GIF per tag into the chosen folder, and
+    the files are decoded again and their frames counted; Spray paints dots only near the
+    pointer, in the colour of the button used.
+  - *It undoes as a single step*: after each, the history is one step longer, one undo
+    restores the sprite exactly and redo brings the result back. Export changes nothing.
+- **Undo groups** (core): several steps fold into one, an aborted group leaves no trace and
+  the same revision number, undo waits while a group is open, the history limit waits too, a
+  group never merges into the step before it.
+- **Sandbox**: `os`, `io`, `debug`, `package`, `require`, `load`, `loadfile`, `dofile` are
+  absent; bytecode is refused; an endless loop is stopped (also inside a coroutine the script
+  made); a script hoarding memory is stopped; the engine works afterwards in each case.
+- **Files**: no file can be named before a folder is picked, none outside the picked folder
+  (also not with `..`), and the permission ends with the run. Checked with a fake command and
+  with the app's real `file.save_as` and `file.export_gif`.
+- **Errors**: a syntax error, a runtime error, a request the app refuses and a wrong argument
+  to an image all name the script file and line. A failing command shows its message in a
+  dialog and the console; a failing tool takes its stroke back; a failing transaction changes
+  nothing. A transaction left open by a script is rolled back.
+- **Dialogs**: every kind of field arrives with its values, the answer comes back with the
+  right types, Cancel and Escape give the script `nil`; a dialog is refused while loading,
+  inside a transaction and from a tool.
+- **Reload**: a changed file takes effect, a removed file takes its command and tool away, a
+  broken file is reported and the others still load, a file named like an example replaces
+  it, ids of built-in commands and tools cannot be taken, reloading in the middle of a script
+  tool's stroke takes the stroke back.
+- **The API description**: every Lua example in `scripts/API.md` is run by a test, so the
+  document cannot drift from the code unnoticed.
+- **Headless UI tests**: the Scripts menu opens and its items run; a key bound to a script
+  command in the keymap file runs it and is not reported as unknown; the Spray tool draws
+  from real pointer events on the canvas and Escape takes a stroke back; a script dialog is
+  shown, keeps shortcuts away and closes on Escape; the console is drawn with output in it.
+- **In the real window**: captures of the Script Console with output and errors, the Palette
+  Swap dialog, the result of Outline, and Spray in the Tools panel with what it painted.
+- **Not checked by me**: typing into the console with a real keyboard, clicking OK in a script
+  dialog with a real mouse, the Scripts menu opened by hand, the native folder dialog of
+  "Export Every Tag as a GIF…", how the spray feels under a real pointer, and scripts placed
+  in the real scripts folder (the tests use temporary folders).
+
+### Known limits of Phase 7
+
+- **Outside `app.transaction` every change is its own undo step.** The examples all use a
+  transaction; a script that forgets leaves one step per pixel.
+- **Scripts work on the active sprite.** There is no way to reach another open sprite except
+  by switching to it with a command.
+- **What a script reads is a copy** (layers, frames, palette, tags, selection). They are
+  changed with commands, not by assigning to the copy.
+- **Filters take no parameters of their own.** A filter that needs to ask something is
+  written as a command with a dialog and a transaction (Palette Swap is the example).
+- **Script commands take no arguments**, so a key binding cannot pass any to them.
+- **Script tools have no options and no preview**: what they draw is drawn at once, inside an
+  undo group, and shown on the next frame.
+- **The time limit only watches Lua code.** One very long call into a library function
+  (a huge `string.rep`, a pathological pattern) is not interrupted; the memory limit catches
+  the first kind. A script can catch the "took too long" error with `pcall`, but it is raised
+  again as soon as it goes on.
+- **File access is checked on the `path` argument of commands.** `file.save` has no path: a
+  script can save the sprite to the file it already has.
+- **A command that opens a dialog or a file dialog does so after the script has finished**;
+  the script does not get the answer.
+- Linked cels share a picture, and writing to a tilemap edits tiles: a script that walks over
+  all cels has to read first and write afterwards. The API description says so.
+- The scripts folder is only named in the console; there is no button that opens it.
 
 ## Phase 6 task list (done)
 
@@ -526,6 +598,28 @@ App (`acms-app`):
 - **Tile 0 is "no tile"**, tiles count from 1, and Tiled's global tile numbers follow directly.
 - **Slices are not per frame** and are stored in the sprite, undoable, saved in the file.
 - **`.acms` format version 5.** Versions 1 to 4 are upgraded when loaded.
+- **Scripts reach the app through one trait** (`acms_script::Host`): the editor, "run this
+  command", "ask for a folder". The script crate never sees app types; the app wraps each
+  script command as an ordinary registry command that asks for the script to be run.
+- **`app.transaction` is an undo group in the document**, not one `Transaction`: steps made
+  while it is open (pixel writes, whole commands) are folded into one step when it closes, or
+  undone if it fails. That is what lets a script mix its own drawing with commands.
+- **Half of the API is written in Lua** (`prelude.lua`): the objects scripts see. The Rust half
+  answers plain requests. The host function is swapped in for the duration of each call, so
+  nothing in Lua can hold on to the app.
+- **A dialog pauses the script as a coroutine.** `Dialog:show` yields; the app shows the dialog
+  and resumes the script with the answer. No frame is ever blocked.
+- **Scripts draw the way tools do**: inside the selection only, and never on a locked layer.
+  Alpha lock is not applied, since filters must be able to change transparency.
+- **Frames, layers and palette entries count from 1 in scripts** (they are Lua lists); pixel
+  positions count from 0. Command arguments are passed on unchanged and count from 0.
+- **Additions to the plan's API list**, each needed by one of the plan's own examples:
+  `cel:set_image`, `app.active_layer` / `active_frame` / `active_cel`, `sprite.tags`,
+  `app.choose_folder` / `app.join_path`.
+- **A user script with the file name of a bundled example replaces it**, so an example can be
+  changed without two commands of the same id fighting.
+- **Limits: 10 seconds, 256 MB** per Lua state. Not in the plan; added so that "a script can
+  never crash the app" also covers freezing it.
 - **Adding, removing and dragging palette colours** are part of Phase 4 (agreed 2026-10-12).
   Dragging a swatch onto another moves it there; the selection is cleared, since it is made of
   positions.
@@ -541,7 +635,16 @@ written into `PLAN.md`: adding and removing palette colours stays; dragging a sw
 the palette was added to Phase 4 and built (`palette.move_color`); section 4.1 now describes the
 reference layer as built.
 
-None open.
+Open after Phase 7:
+
+1. The scripting API has five things the plan's list does not name, each needed by one of the
+   plan's own example scripts: `cel:set_image`, `app.active_layer` / `active_frame` /
+   `active_cel`, `sprite.tags`, `app.choose_folder` and `app.join_path`. Should the Phase 7
+   list in `PLAN.md` name them?
+2. A script may run for 10 seconds and use 256 MB before it is stopped. The plan asks only
+   that a script cannot crash the app. Keep the limits, change the numbers, or drop them?
+3. A file in the user's scripts folder with the name of a bundled example replaces the
+   example. Keep that, or load both and report the clash of ids?
 
 ## The keymap file
 
@@ -610,6 +713,11 @@ layer to select the run between them. Drag a cel to move it, with Ctrl held to c
 frame's number to move the frame. Click a tag's bar to change or delete it. The exports are in
 the File menu.
 
+Scripts: the Scripts menu lists the commands scripts added, and Reload Scripts. Script tools
+are in the Tools panel. The Script Console (a tab at the bottom) shows what scripts print and
+runs a line of Lua on Enter. Your own scripts go in the folder the console names when the app
+starts; `scripts/API.md` describes what a script can do.
+
 Palette panel: click a swatch for the primary colour, right click for the secondary one. Ctrl
 click adds a swatch to the selection, Shift click selects a run; "Ramp" makes a ramp from the
 selected swatches in the order they were picked. Everything else about the palette is in the
@@ -635,7 +743,7 @@ Described in `PLAN.md` but not part of the "Done when" of a finished phase:
 - **`log` crate wiring** (2). The Log panel shows lines written by commands; the `log` facade is
   not hooked up to it yet.
 - **Saved layouts** (5). The layout resets on restart.
-- `scripts/` and `assets/` folders are created when they first have content.
+- The `assets/` folder is created when it first has content.
 
 ## Notes for later phases
 
@@ -676,8 +784,15 @@ Described in `PLAN.md` but not part of the "Done when" of a finished phase:
   exact in binary (multiples of 1/8 s): `10.1 - 10.05` is a hair under 50 ms.
 - Phase 6 will add tilemap layers: `Sprite::check_cel` is the gate for "has pixels", and the
   Timeline shows cels only for layers that pass `as_image()`.
-- Phase 7 (scripting): everything a script may do is already a command or a transaction
-  method; `Transaction` is the natural thing to hand to `app.transaction`.
+- Phase 8 (keymap editor): script commands are in the registry like any other and can be
+  listed and bound the same way; they disappear and come back on Reload Scripts.
+- Phase 8 (timelapse): `Document::begin_group` / `end_group` fold steps; replaying history
+  sees a script's work as one step.
+- Phase 8 (user docs for scripting): `scripts/API.md` is the reference, and its examples are
+  run by a test (`the_examples_in_the_api_description_run`).
+- `Editor::document_mut` abandons the stroke in progress; `document_mut_by_id` does not. Code
+  that changes the document from inside a tool's own stroke must use the second.
+- Bash heredocs in this environment break on apostrophes; write scripts to files instead.
 - Python is on this machine and edits source files more safely than PowerShell 5.1 (UTF-8, exact
   one-match replaces); `\\u{...}` in a Python string must be written with a doubled backslash.
 - If full-canvas recomposition becomes a problem, the place to optimise is the per-pixel loop in
@@ -708,6 +823,11 @@ None known.
 - Convert an image layer to a tilemap; share a tileset from the dialog; reorder tiles.
 - Slice handles on the canvas, a slice list, per-frame slices.
 - Import a tileset picture or a Tiled map.
+- Scripts: a button that opens the scripts folder; a history for the console line; filters
+  with a parameter dialog and a live preview; script commands with arguments; tool options
+  and a brush preview for script tools; `sprite` objects for sprites other than the active
+  one; reading files (a palette, an image) from a picked folder; a faster way to read many
+  pixels than one call per pixel.
 - Movable symmetry axes (drag the mirror lines, or centre them on the selection).
 - Move and scale a reference picture with the move tool; reference pictures from JPEG files.
 - Tiled mode for the bucket and the move tool (fill and move across the edge).

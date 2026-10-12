@@ -14,6 +14,12 @@ pub fn keymap_path() -> Option<PathBuf> {
     Some(dirs.config_dir().join("keymap.json"))
 }
 
+/// Where the user's own scripts live: a `scripts` folder next to the keymap file.
+pub fn scripts_dir() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "acms-mk3")?;
+    Some(dirs.config_dir().join("scripts"))
+}
+
 /// Builds the keymap: the built-in defaults with the file at `path` applied on top.
 ///
 /// A missing or broken file is never fatal: the defaults are used instead. The returned lines

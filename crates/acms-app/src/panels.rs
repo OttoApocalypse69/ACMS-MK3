@@ -123,6 +123,7 @@ pub struct PanelsUi {
     pub preview: PreviewUi,
     tileset: TilesetUi,
     colour: ColourUi,
+    console: crate::scripting::ConsoleUi,
 }
 
 /// Draws panel contents for egui_dock.
@@ -166,8 +167,8 @@ impl TabViewer for PanelViewer<'_> {
             Panel::Timeline => timeline::show(ui, state, registry, keymap, &mut ui_state.timeline),
             Panel::Preview => preview::show(ui, state, registry, &mut ui_state.preview),
             Panel::Tileset => tileset(ui, state, registry, &mut ui_state.tileset),
-            other => {
-                ui.label(RichText::new(format!("{} — placeholder", other.title())).weak());
+            Panel::ScriptConsole => {
+                crate::scripting::show_console(ui, state, registry, &mut ui_state.console);
             }
         }
     }
@@ -190,9 +191,10 @@ impl TabViewer for PanelViewer<'_> {
         })
     }
 
-    /// The canvas pans by itself; the other panels scroll when their content does not fit.
+    /// The canvas pans by itself and the console scrolls its own output; the other panels
+    /// scroll when their content does not fit.
     fn scroll_bars(&self, tab: &Panel) -> [bool; 2] {
-        [*tab != Panel::Canvas; 2]
+        [!matches!(tab, Panel::Canvas | Panel::ScriptConsole); 2]
     }
 }
 
@@ -215,8 +217,12 @@ fn no_sprite(ui: &mut Ui) {
 }
 
 fn tools(ui: &mut Ui, state: &mut AppState, registry: &Registry, keymap: &Keymap) {
-    let active = state.editor.active_tool();
-    let tools: Vec<_> = state.editor.tools().collect();
+    let active = state.editor.active_tool().to_owned();
+    let tools: Vec<(String, String)> = state
+        .editor
+        .tools()
+        .map(|(id, name)| (id.to_owned(), name.to_owned()))
+        .collect();
     ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
         // Compact rows: the whole list should fit without scrolling in the default layout.
         ui.spacing_mut().item_spacing.y = 1.0;
@@ -224,9 +230,9 @@ fn tools(ui: &mut Ui, state: &mut AppState, registry: &Registry, keymap: &Keymap
         ui.spacing_mut().button_padding.y = 2.0;
         for (id, name) in tools {
             let command = format!("tool.{id}");
-            let tip = with_shortcut(ui, keymap, name, &command);
+            let tip = with_shortcut(ui, keymap, &name, &command);
             if ui
-                .selectable_label(active == id, name)
+                .selectable_label(active == id, name.as_str())
                 .on_hover_text(tip)
                 .clicked()
             {

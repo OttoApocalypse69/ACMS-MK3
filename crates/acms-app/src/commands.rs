@@ -25,6 +25,8 @@ const DEFAULT_SPRITE_SIZE: u32 = 32;
 /// message.
 pub fn run(registry: &CommandRegistry<AppState>, state: &mut AppState, id: &str, params: &Params) {
     let result = registry.run(id, state, params);
+    // A script command only asks for its script to be run; this runs it.
+    crate::scripting::pump(registry, state);
     // The command may have opened, closed or switched sprites.
     state.sync_active_document();
     let Err(err) = result else {
@@ -265,17 +267,19 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
     crate::tile_commands::register(registry)?;
 
     // Tools: one command per registered tool, so each can have its own shortcut.
-    let tools: Vec<_> = Editor::new().tools().collect();
-    for (tool, name) in tools {
+    let editor = Editor::new();
+    for (tool, name) in editor.tools() {
+        let tool = tool.to_owned();
         registry.register(Command::new(
             format!("tool.{tool}"),
             format!("Tool: {name}"),
             move |state: &mut AppState, _| {
-                state.editor.set_active_tool(tool);
+                state.editor.set_active_tool(&tool);
                 Ok(())
             },
         ))?;
     }
+    crate::scripting::register_commands(registry)?;
 
     // Colour and brush
     registry.register(

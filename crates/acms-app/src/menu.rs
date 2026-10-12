@@ -165,34 +165,59 @@ const MENUS: &[(&str, &[Entry])] = &[
     ),
 ];
 
+/// The fixed part of the Scripts menu; the commands of the scripts follow it.
+const SCRIPT_MENU: [&str; 2] = ["script.reload", "script.clear_console"];
+
 pub fn show(
     ui: &mut Ui,
     state: &mut AppState,
     registry: &CommandRegistry<AppState>,
     keymap: &Keymap,
 ) {
+    let item = |ui: &mut Ui, state: &mut AppState, id: &str| {
+        let Some(command) = registry.get(id) else {
+            return;
+        };
+        let shortcuts: Vec<String> = keymap
+            .shortcuts_for(id)
+            .map(|shortcut| ui.ctx().format_shortcut(shortcut))
+            .collect();
+        let button = Button::new(command.name()).shortcut_text(shortcuts.join("  "));
+        if ui.add_enabled(command.is_enabled(state), button).clicked() {
+            commands::run(registry, state, id, &Params::new());
+        }
+    };
     MenuBar::new().ui(ui, |ui| {
         for (title, entries) in MENUS {
             ui.menu_button(*title, |ui| {
                 for entry in *entries {
-                    let Command(id) = entry else {
-                        ui.separator();
-                        continue;
-                    };
-                    let Some(command) = registry.get(id) else {
-                        continue;
-                    };
-                    let shortcuts: Vec<String> = keymap
-                        .shortcuts_for(id)
-                        .map(|shortcut| ui.ctx().format_shortcut(shortcut))
-                        .collect();
-                    let button = Button::new(command.name()).shortcut_text(shortcuts.join("  "));
-                    if ui.add_enabled(command.is_enabled(state), button).clicked() {
-                        commands::run(registry, state, id, &Params::new());
+                    match entry {
+                        Command(id) => item(ui, state, id),
+                        Separator => {
+                            ui.separator();
+                        }
                     }
                 }
             });
         }
+        // The commands scripts registered come and go, so this menu is built as it is shown.
+        ui.menu_button("Scripts", |ui| {
+            for id in SCRIPT_MENU {
+                item(ui, state, id);
+            }
+            let ids: Vec<String> = state
+                .scripts
+                .commands()
+                .iter()
+                .map(|command| command.id.clone())
+                .collect();
+            if !ids.is_empty() {
+                ui.separator();
+            }
+            for id in ids {
+                item(ui, state, &id);
+            }
+        });
     });
 }
 
@@ -205,8 +230,10 @@ mod tests {
     fn every_menu_item_is_a_command_that_runs_without_arguments() {
         let mut registry = CommandRegistry::new();
         register_builtin(&mut registry).unwrap();
-        for (title, entries) in MENUS {
-            for entry in *entries {
+        let scripts = SCRIPT_MENU.map(Command);
+        let menus = MENUS.iter().copied().chain([("Scripts", &scripts[..])]);
+        for (title, entries) in menus {
+            for entry in entries {
                 if let Command(id) = entry {
                     let command = registry.get(id);
                     assert!(command.is_some(), "{title}: no command `{id}`");

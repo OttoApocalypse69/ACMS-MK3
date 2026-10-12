@@ -225,6 +225,8 @@ pub enum Dialog {
         center: Option<acms_core::geom::Rect>,
         pivot: Option<acms_core::geom::Point>,
     },
+    /// A dialog a script built, with the values as the user has set them so far.
+    Script(acms_script::DialogSpec),
     /// The settings of an export; only those the kind uses are shown.
     Export {
         kind: ExportKind,
@@ -369,6 +371,8 @@ pub struct AppState {
     pub rename_layer_request: Option<LayerId>,
     /// Lines shown in the Log panel.
     pub log: Vec<String>,
+    /// The scripts: the Lua state, what they registered and the console's lines.
+    pub scripts: crate::scripting::ScriptState,
     /// Set by `app.quit`; the app closes the window at the end of the frame.
     pub quit_requested: bool,
 }
@@ -399,6 +403,7 @@ impl Default for AppState {
             file_request: None,
             rename_layer_request: None,
             log: Vec::new(),
+            scripts: crate::scripting::ScriptState::default(),
             quit_requested: false,
         }
     }

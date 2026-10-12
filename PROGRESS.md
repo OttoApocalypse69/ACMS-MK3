@@ -5,11 +5,38 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 ## Current state
 
 **Phases 0 to 6 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
-features, animation, game-dev features). Next is Phase 7 (not started).
+features, animation, game-dev features). **Phase 7 (scripting) is in progress.**
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directories 6, serde 1,
-serde_json 1, thiserror 2, anyhow 1, arboard 3.6.
+serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4).
+
+## Phase 7 task list
+
+Core:
+
+- [ ] Undo groups: several transactions (and commands) folded into one undo step, or rolled back together
+- [ ] Commands and tools can be added and removed while the app runs (for scripts and reload)
+
+Script host (`acms-script`):
+
+- [ ] Sandboxed Lua 5.4: no `os`, `io`, `debug`, `package`, no file loading, a time limit and a memory limit
+- [ ] API: `app.command`, `app.active_sprite`, `app.fg_color` / `bg_color`, `app.transaction`; sprite, layers, frames, palette, selection, tags; cels and images with `get_pixel` / `set_pixel`
+- [ ] `register_command`, `register_filter`, `register_tool`
+- [ ] Dialog builder (number, colour, text, checkbox, dropdown)
+- [ ] File access only inside a folder the user picked
+- [ ] Errors carry file and line; nothing a script does can panic the host
+
+App:
+
+- [ ] Scripts folder in the config directory, bundled examples, Reload Scripts
+- [ ] Script commands in the registry (palette, shortcuts, menu), script tools in the Tools panel
+- [ ] Script Console panel: output and a line to run Lua
+- [ ] Script dialogs
+- [ ] Bundled examples: outline filter, palette swap, mirror sprite, export every tag as a GIF, spray tool
+- [ ] The scripting API written down in `scripts/API.md`
+- [ ] Tests: every bundled script run headless; each is one undo step
+- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
 
 ## Phase 6 task list (done)
 

@@ -13,6 +13,7 @@ use crate::keymap::Keymap;
 use crate::menu;
 use crate::palette;
 use crate::panels::{PanelViewer, PanelsUi};
+use crate::scripting;
 use crate::state::AppState;
 use crate::status;
 use crate::theme::{self, ThemeKind};
@@ -77,9 +78,20 @@ fn adapt_clipboard_keys(ctx: &egui::Context, paste_seen: &mut bool) {
 
 impl AcmsApp {
     /// `keymap_file` is the user's keymap file; `None` means built-in shortcuts only.
-    pub fn new(ctx: &egui::Context, keymap_file: Option<&Path>) -> anyhow::Result<Self> {
+    /// `scripts_dir` is the folder of the user's scripts; `None` means only the examples that
+    /// come with the app.
+    pub fn new(
+        ctx: &egui::Context,
+        keymap_file: Option<&Path>,
+        scripts_dir: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let mut registry = CommandRegistry::new();
         commands::register_builtin(&mut registry)?;
+
+        // Scripts first: the keymap may bind keys to their commands.
+        let mut state = AppState::default();
+        state.scripts.folder = scripts_dir.map(Path::to_owned);
+        scripting::reload(&mut registry, &mut state);
 
         let (keymap, mut log) = match keymap_file {
             Some(path) => config::load_keymap(path),
@@ -96,8 +108,7 @@ impl AcmsApp {
                 .map(|id| format!("Keymap: there is no command `{id}`")),
         );
 
-        let mut state = AppState::default();
-        state.log = log;
+        state.log.extend(log);
         theme::install(ctx, state.theme);
 
         Ok(Self {
@@ -124,6 +135,8 @@ impl AcmsApp {
     /// without a window.
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+
+        scripting::maintain(&mut self.registry, &mut self.state);
 
         // Closing the window is quitting, which asks before unsaved changes are lost.
         let close_requested = ctx.input(|input| input.viewport().close_requested());
@@ -184,6 +197,12 @@ impl AcmsApp {
         // If a command replaced the layout meanwhile (Reset Panel Layout), the new one stays.
         if self.state.layout_generation == layout {
             self.state.dock = dock;
+        }
+
+        // What a script tool saw on the canvas this frame goes to its script now; what it
+        // draws is shown next frame.
+        if scripting::pump(&self.registry, &mut self.state) {
+            ctx.request_repaint();
         }
 
         // The palette needs its own state mutably and the rest of the app state read-only.
@@ -251,7 +270,7 @@ mod tests {
 
         fn with_keymap_file(keymap_file: Option<&Path>) -> Self {
             let ctx = egui::Context::default();
-            let app = AcmsApp::new(&ctx, keymap_file).unwrap();
+            let app = AcmsApp::new(&ctx, keymap_file, None).unwrap();
             let mut harness = Self { ctx, app };
             harness.frame(vec![]);
             harness
@@ -1005,7 +1024,8 @@ mod tests {
     #[test]
     fn tool_options_show_for_every_tool_and_ink() {
         let mut h = Harness::with_sprite();
-        let tools: Vec<&str> = h.app.state.editor.tools().map(|(id, _)| id).collect();
+        let editor = &h.app.state.editor;
+        let tools: Vec<String> = editor.tools().map(|(id, _)| id.to_owned()).collect();
         for ink in ["simple", "dither", "shade"] {
             h.app
                 .run_command("tool.set_ink", &Params::new().with("ink", ink));

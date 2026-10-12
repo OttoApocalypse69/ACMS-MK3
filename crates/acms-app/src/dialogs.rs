@@ -22,6 +22,8 @@ enum Outcome {
     Open(Dialog),
     Dismissed,
     Run(String, Params),
+    /// A script's dialog was answered: with its values, or `None` for Cancel.
+    Script(Option<acms_script::DialogSpec>),
 }
 
 /// Shows the open dialog, if any.
@@ -53,6 +55,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &CommandRegistr
                 color,
             } => tag(ui, state, index, name, from, to, direction, color),
             Dialog::FrameDuration { ms } => frame_duration(ui, ms),
+            Dialog::Script(spec) => script(ui, spec),
             Dialog::Slice {
                 name,
                 rect,
@@ -72,6 +75,11 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &CommandRegistr
     // Clicking outside the dialog or pressing Escape is the same as Cancel.
     let dismissed = modal.should_close();
     match modal.inner {
+        // The script behind a dialog is told when its dialog goes away.
+        Outcome::Open(Dialog::Script(_)) if dismissed => {
+            crate::scripting::answer_dialog(registry, state, None);
+        }
+        Outcome::Script(answer) => crate::scripting::answer_dialog(registry, state, answer),
         Outcome::Open(_) if dismissed => {}
         Outcome::Open(dialog) => state.dialog = Some(dialog),
         Outcome::Dismissed => {}
@@ -330,6 +338,62 @@ fn tag(
             direction,
             color,
         }),
+    }
+}
+
+/// A dialog a script built: one row per field.
+fn script(ui: &mut Ui, mut spec: acms_script::DialogSpec) -> Outcome {
+    use acms_script::FieldKind;
+    ui.heading(&spec.title);
+    Grid::new("script_dialog").num_columns(2).show(ui, |ui| {
+        for field in &mut spec.fields {
+            ui.label(&field.label);
+            match &mut field.kind {
+                FieldKind::Number {
+                    value,
+                    min,
+                    max,
+                    decimals,
+                } => {
+                    let places = usize::from(*decimals);
+                    let speed = if places == 0 { 0.2 } else { 0.01 };
+                    ui.add(
+                        DragValue::new(value)
+                            .range(*min..=*max)
+                            .fixed_decimals(places)
+                            .speed(speed),
+                    );
+                }
+                FieldKind::Color(color) => {
+                    let mut rgba = color.to_array();
+                    if ui.color_edit_button_srgba_unmultiplied(&mut rgba).changed() {
+                        *color = Rgba8::from_array(rgba);
+                    }
+                }
+                FieldKind::Text(text) => {
+                    ui.text_edit_singleline(text);
+                }
+                FieldKind::Check(on) => {
+                    ui.checkbox(on, "");
+                }
+                FieldKind::Dropdown { options, selected } => {
+                    let shown = options.get(*selected).map_or("", String::as_str);
+                    egui::ComboBox::from_id_salt(("script_dropdown", field.id.as_str()))
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            for (index, option) in options.iter().enumerate() {
+                                ui.selectable_value(selected, index, option.as_str());
+                            }
+                        });
+                }
+            }
+            ui.end_row();
+        }
+    });
+    match buttons(ui, "OK") {
+        (true, _) => Outcome::Script(Some(spec)),
+        (_, true) => Outcome::Script(None),
+        _ => Outcome::Open(Dialog::Script(spec)),
     }
 }
 

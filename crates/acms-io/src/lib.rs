@@ -1,6 +1,7 @@
 //! ACMS IO: the `.acms` project format and import/export.
 
 pub mod acms;
+pub mod export;
 pub mod palette;
 pub mod png;
 
@@ -23,6 +24,8 @@ pub enum IoError {
     PngDecode(#[from] ::png::DecodingError),
     #[error("could not write a PNG image ({0})")]
     PngEncode(#[from] ::png::EncodingError),
+    #[error("could not write a GIF ({0})")]
+    GifEncode(#[from] gif::EncodingError),
     #[error(
         "this file uses format version {found}, but this version of ACMS only reads up to \
          version {supported}"
@@ -178,6 +181,63 @@ pub(crate) mod test_util {
         ];
         let frames = vec![Frame { duration_ms: 100 }];
         Sprite::from_parts(16, 12, Palette::default_palette(), layers, frames, cels).unwrap()
+    }
+
+    /// A multi-layer, tagged animation: four frames of 16×12.
+    ///
+    /// ```text
+    ///            frame 0   1        2        3
+    /// Body       block at x = 1, 4, 7, 10 (each its own cel)
+    /// Ground     one strip, the cels of frames 0, 1 and 3 linked; frame 2 empty
+    /// tags       Idle [0]   Walk [1..3] ping-pong
+    /// durations  100, 80, 120, 60 ms
+    /// ```
+    ///
+    /// Every pixel is opaque, so a GIF can hold it exactly.
+    pub fn animated_sprite() -> Sprite {
+        use acms_core::geom::Rect;
+        use acms_core::image::Image;
+        use acms_core::sprite::{Direction, Slot, SpriteError, Tag};
+
+        let block = |w: u32, h: u32, color: Rgba8| {
+            Image::from_pixels(w, h, vec![color; (w * h) as usize]).unwrap()
+        };
+        let mut document = Document::new(Sprite::new(16, 12).unwrap());
+        let ground = LayerId(1);
+        document
+            .transact("Build", |tx| {
+                tx.update_layer(ground, |props| props.name = "Ground".to_owned())?;
+                let body = tx.add_layer(Slot::new(None, 1), "Body", false)?;
+                for (frame, ms) in [100, 80, 120, 60].into_iter().enumerate() {
+                    if frame > 0 {
+                        tx.add_frame(frame, None)?;
+                    }
+                    tx.set_frame_duration(frame, ms)?;
+                    let at = Rect::new(1 + 3 * frame as i32, 3, 4, 5);
+                    let shade = 60 * frame as u8;
+                    tx.set_pixels(body, frame, at, &block(4, 5, Rgba8::rgb(220, shade, 40)))?;
+                }
+                tx.link_cels(ground, 0, &[1, 3])?;
+                let strip = block(16, 2, Rgba8::rgb(40, 110, 60));
+                tx.set_pixels(ground, 3, Rect::new(0, 9, 16, 2), &strip)?;
+                tx.add_tag(Tag {
+                    name: "Idle".to_owned(),
+                    from: 0,
+                    to: 0,
+                    direction: Direction::Forward,
+                    color: Rgba8::rgb(90, 90, 200),
+                })?;
+                tx.add_tag(Tag {
+                    name: "Walk".to_owned(),
+                    from: 1,
+                    to: 3,
+                    direction: Direction::PingPong,
+                    color: Rgba8::new(200, 90, 90, 128),
+                })?;
+                Ok::<_, SpriteError>(())
+            })
+            .unwrap();
+        document.sprite().clone()
     }
 
     /// A sprite with a few strokes on it, including translucent pixels.

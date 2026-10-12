@@ -113,6 +113,93 @@ pub fn compose(sprite: &Sprite, frame: usize) -> Image {
     compose_rect(sprite, frame, None, sprite.bounds())
 }
 
+/// How the frames around the current one are shown faintly behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OnionSkin {
+    /// How many earlier frames are shown.
+    pub before: u8,
+    /// How many later frames are shown.
+    pub after: u8,
+    /// How strong the nearest frame is, 0 to 255; frames further away are fainter.
+    pub opacity: u8,
+    /// Earlier frames are coloured red and later ones blue, to tell them apart.
+    pub tint: bool,
+}
+
+impl Default for OnionSkin {
+    fn default() -> Self {
+        Self {
+            before: 1,
+            after: 1,
+            opacity: 96,
+            tint: true,
+        }
+    }
+}
+
+/// Most frames an onion skin shows on either side.
+pub const MAX_ONION_FRAMES: u8 = 8;
+
+const EARLIER_TINT: Rgba8 = Rgba8::rgb(235, 60, 70);
+const LATER_TINT: Rgba8 = Rgba8::rgb(60, 120, 240);
+
+/// The onion skin for one frame: the frames before and after it, flattened, tinted and faded,
+/// nearer ones on top. Canvas-sized. Frames that do not exist are left out; the animation is
+/// not wrapped around.
+pub fn onion_skin(sprite: &Sprite, frame: usize, onion: &OnionSkin) -> Image {
+    let bounds = sprite.bounds();
+    let mut out = Image::new(bounds.w, bounds.h);
+    let count = sprite.frames().len();
+    let reach = onion.before.max(onion.after).min(MAX_ONION_FRAMES);
+
+    for distance in (1..=reach).rev() {
+        let earlier = (distance <= onion.before)
+            .then(|| frame.checked_sub(usize::from(distance)))
+            .flatten();
+        let later = (distance <= onion.after)
+            .then(|| frame + usize::from(distance))
+            .filter(|later| *later < count);
+        // Fading evenly: with three frames shown, they get 3/3, 2/3 and 1/3 of the opacity.
+        let strength = |shown: u8| {
+            let step = u32::from(shown - distance + 1);
+            (u32::from(onion.opacity) * step / u32::from(shown.max(1))) as u8
+        };
+        let sides = [
+            (earlier, EARLIER_TINT, onion.before),
+            (later, LATER_TINT, onion.after),
+        ];
+        for (shown_frame, tint, shown) in sides {
+            let Some(shown_frame) = shown_frame else {
+                continue;
+            };
+            let flat = compose(sprite, shown_frame);
+            let opacity = strength(shown.min(MAX_ONION_FRAMES));
+            for y in 0..bounds.h as i32 {
+                for x in 0..bounds.w as i32 {
+                    let pixel = flat.get(x, y);
+                    if pixel.a == 0 {
+                        continue;
+                    }
+                    let color = if onion.tint {
+                        // Half its own colour, half the tint: the drawing stays readable.
+                        let mix = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
+                        Rgba8::new(
+                            mix(pixel.r, tint.r),
+                            mix(pixel.g, tint.g),
+                            mix(pixel.b, tint.b),
+                            pixel.a,
+                        )
+                    } else {
+                        pixel
+                    };
+                    out.set(x, y, with_opacity(color, opacity).over(out.get(x, y)));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The flattened picture of one frame, kept up to date by recomposing only what changed.
 #[derive(Default)]
 pub struct FrameCache {
@@ -566,5 +653,82 @@ mod tests {
             cache.refresh(&other, 0, None, Rect::EMPTY),
             Rect::from_size(4, 4)
         );
+    }
+    /// Five frames, each with one red pixel at x = its frame number.
+    fn filmstrip() -> Sprite {
+        let mut document = Document::new(Sprite::new(8, 1).unwrap());
+        document
+            .transact("Frames", |tx| {
+                for frame in 0..5 {
+                    if frame > 0 {
+                        tx.add_frame(frame, None)?;
+                    }
+                    let at = Rect::new(frame as i32, 0, 1, 1);
+                    tx.set_pixels(LayerId(1), frame, at, &filled(1, 1, RED))?;
+                }
+                Ok::<_, crate::sprite::SpriteError>(())
+            })
+            .unwrap();
+        document.sprite().clone()
+    }
+
+    #[test]
+    fn each_frame_is_composed_from_its_own_cels() {
+        let sprite = filmstrip();
+        for frame in 0..5 {
+            let flat = compose(&sprite, frame);
+            for x in 0..8 {
+                let expected = if x == frame as i32 {
+                    RED
+                } else {
+                    Rgba8::TRANSPARENT
+                };
+                assert_eq!(flat.get(x, 0), expected, "frame {frame}, x {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_onion_skin_shows_neighbouring_frames_fainter_with_distance() {
+        let sprite = filmstrip();
+        let onion = OnionSkin {
+            before: 2,
+            after: 1,
+            opacity: 200,
+            tint: false,
+        };
+        let skin = onion_skin(&sprite, 2, &onion);
+        // Two back at half strength, one back and one ahead at full; not the frame itself.
+        assert_eq!(skin.get(0, 0), Rgba8::new(255, 0, 0, 100));
+        assert_eq!(skin.get(1, 0), Rgba8::new(255, 0, 0, 200));
+        assert_eq!(skin.get(2, 0), Rgba8::TRANSPARENT);
+        assert_eq!(skin.get(3, 0), Rgba8::new(255, 0, 0, 200));
+        assert_eq!(skin.get(4, 0), Rgba8::TRANSPARENT);
+
+        // At the ends there is nothing before the first frame or after the last.
+        let first = onion_skin(&sprite, 0, &onion);
+        assert_eq!(first.get(1, 0).a, 200);
+        assert_eq!(first.content_bounds(), Rect::new(1, 0, 1, 1));
+        let last = onion_skin(&sprite, 4, &onion);
+        assert_eq!(last.content_bounds(), Rect::new(2, 0, 2, 1));
+
+        // Tinted, earlier frames lean red and later ones blue.
+        let tinted = onion_skin(
+            &sprite,
+            2,
+            &OnionSkin {
+                tint: true,
+                ..onion
+            },
+        );
+        assert!(tinted.get(1, 0).r > tinted.get(1, 0).b);
+        assert!(tinted.get(3, 0).b > 0 && tinted.get(3, 0).r < 255);
+
+        let off = OnionSkin {
+            before: 0,
+            after: 0,
+            ..onion
+        };
+        assert!(onion_skin(&sprite, 2, &off).content_bounds().is_empty());
     }
 }

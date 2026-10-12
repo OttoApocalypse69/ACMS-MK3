@@ -768,4 +768,33 @@ mod tests {
         assert_eq!(pixel(&editor, 5, 5), Rgba8::TRANSPARENT);
         assert_eq!(pixel(&editor, 6, 5), RED);
     }
+    #[test]
+    fn tools_draw_on_the_frame_being_shown() {
+        let mut editor = editor();
+        let document = editor.document_mut().unwrap();
+        document
+            .transact("Frame", |tx| tx.add_frame(1, None))
+            .unwrap();
+        assert!(document.set_active_frame(1));
+
+        drag(&mut editor, PointerButton::Primary, &[(1, 1), (4, 1)]);
+        let sprite = editor.document().unwrap().sprite();
+        assert_eq!(sprite.pixel(L1, 1, 2, 1), RED);
+        assert!(sprite.cel(L1, 0).is_none());
+
+        // The eyedropper sees the shown frame too, and the bucket fills it.
+        editor.set_active_tool("eyedropper");
+        editor.primary = Rgba8::BLACK;
+        drag(&mut editor, PointerButton::Primary, &[(2, 1)]);
+        assert_eq!(editor.primary, RED);
+        editor.document_mut().unwrap().set_active_frame(0);
+        editor.primary = GREEN;
+        drag(&mut editor, PointerButton::Primary, &[(2, 1)]);
+        assert_eq!(editor.primary, GREEN);
+        editor.set_active_tool("bucket");
+        drag(&mut editor, PointerButton::Primary, &[(8, 8)]);
+        let sprite = editor.document().unwrap().sprite();
+        assert_eq!(sprite.pixel(L1, 0, 0, 0), GREEN);
+        assert_eq!(sprite.pixel(L1, 1, 0, 0), Rgba8::TRANSPARENT);
+    }
 }

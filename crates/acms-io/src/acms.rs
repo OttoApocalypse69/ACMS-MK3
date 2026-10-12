@@ -18,8 +18,8 @@ use acms_core::compositor;
 use acms_core::geom::{Point, Rect};
 use acms_core::image::Image;
 use acms_core::sprite::{
-    BlendMode, CelSource, Frame, GroupLayer, ImageLayer, Layer, LayerId, LayerKind, Palette,
-    PaletteEntry, ReferenceLayer, Sprite, Symmetry,
+    BlendMode, CelSource, Direction, Frame, GroupLayer, ImageLayer, Layer, LayerId, LayerKind,
+    Palette, PaletteEntry, ReferenceLayer, Sprite, Symmetry, Tag,
 };
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
@@ -36,7 +36,8 @@ use crate::{IoError, write_atomically};
 ///   groups with children.
 /// - **3**: the palette has ramps, the sprite has a symmetry setting, and there are reference
 ///   layers, whose pictures are stored under `refs/`.
-pub const FORMAT_VERSION: u32 = 3;
+/// - **4**: tags, and linked cels (which share one image).
+pub const FORMAT_VERSION: u32 = 4;
 
 const MANIFEST: &str = "manifest.json";
 const THUMBNAIL: &str = "thumb.png";
@@ -62,6 +63,26 @@ struct Manifest {
     layers: Vec<LayerData>,
     frames: Vec<FrameData>,
     cels: Vec<CelData>,
+    tags: Vec<TagData>,
+    /// Cels that are one and the same.
+    links: Vec<LinkData>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TagData {
+    name: String,
+    /// The first and the last frame, both part of the tag.
+    from: usize,
+    to: usize,
+    /// One of [`Direction::id`].
+    direction: String,
+    color: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LinkData {
+    layer: u32,
+    frames: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -260,6 +281,24 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
     let layer_order = |id: LayerId| painted.iter().position(|&layer| layer == id);
     cels.sort_by_key(|&(layer, frame, _)| (layer_order(layer), frame));
 
+    // The image number of each cel: its own, or for a linked cel the one of the first cel
+    // of its group, which is the only one whose image is written.
+    let mut images: Vec<u32> = Vec::with_capacity(cels.len());
+    let mut next_image = 1;
+    for (index, &(layer, frame, _)) in cels.iter().enumerate() {
+        let first = sprite.linked_frames(layer, frame).first().copied();
+        let shared = first.filter(|first| *first != frame).and_then(|first| {
+            let earlier = cels[..index]
+                .iter()
+                .position(|c| (c.0, c.1) == (layer, first))?;
+            Some(images[earlier])
+        });
+        images.push(shared.unwrap_or_else(|| {
+            next_image += 1;
+            next_image - 1
+        }));
+    }
+
     let mut pictures = Vec::new();
     let layers = sprite
         .layers()
@@ -304,13 +343,32 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
             .collect(),
         cels: cels
             .iter()
-            .zip(1..)
-            .map(|(&(layer, frame, cel), image)| CelData {
+            .zip(&images)
+            .map(|(&(layer, frame, cel), &image)| CelData {
                 layer: layer.0,
                 frame,
                 x: cel.origin().x,
                 y: cel.origin().y,
                 image,
+            })
+            .collect(),
+        tags: sprite
+            .tags()
+            .iter()
+            .map(|tag| TagData {
+                name: tag.name.clone(),
+                from: tag.from,
+                to: tag.to,
+                direction: tag.direction.id().to_owned(),
+                color: tag.color.to_hex(),
+            })
+            .collect(),
+        links: sprite
+            .link_groups()
+            .into_iter()
+            .map(|(layer, frames)| LinkData {
+                layer: layer.0,
+                frames,
             })
             .collect(),
     };
@@ -323,9 +381,13 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
     zip.start_file(MANIFEST, text)?;
     serde_json::to_writer_pretty(&mut zip, &manifest)?;
 
-    for (&(_, _, cel), id) in cels.iter().zip(1..) {
-        zip.start_file(cel_path(id), image)?;
-        encode_png(cel.image(), &mut zip)?;
+    let mut written = 0;
+    for (&(_, _, cel), &id) in cels.iter().zip(&images) {
+        if id > written {
+            written = id;
+            zip.start_file(cel_path(id), image)?;
+            encode_png(cel.image(), &mut zip)?;
+        }
     }
     for (picture, id) in pictures.into_iter().zip(1..) {
         zip.start_file(reference_path(id), image)?;
@@ -359,7 +421,17 @@ fn migrate(mut manifest: serde_json::Value, version: u64) -> Result<serde_json::
     if version <= 2 {
         upgrade_2_to_3(&mut manifest);
     }
+    if version <= 3 {
+        upgrade_3_to_4(&mut manifest);
+    }
     Ok(manifest)
+}
+
+/// Version 3 had neither tags nor linked cels.
+fn upgrade_3_to_4(manifest: &mut serde_json::Value) {
+    manifest["tags"] = serde_json::json!([]);
+    manifest["links"] = serde_json::json!([]);
+    manifest["format_version"] = 4.into();
 }
 
 /// Version 2 had neither ramps nor a symmetry setting: none, and off.
@@ -467,7 +539,37 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
         frames,
         cels,
     )?;
-    Ok(sprite.with_symmetry(symmetry))
+    let tags = manifest
+        .tags
+        .into_iter()
+        .map(|tag| {
+            let direction = Direction::from_id(&tag.direction).ok_or_else(|| {
+                IoError::Invalid(format!("`{}` is not a playback direction", tag.direction))
+            })?;
+            if tag.from > tag.to || tag.to >= sprite.frames().len() {
+                return Err(IoError::Invalid(format!(
+                    "tag `{}` names frames that are not there",
+                    tag.name
+                )));
+            }
+            Ok(Tag {
+                name: tag.name,
+                from: tag.from,
+                to: tag.to,
+                direction,
+                color: color(&tag.color)?,
+            })
+        })
+        .collect::<Result<Vec<_>, IoError>>()?;
+    let links = manifest
+        .links
+        .into_iter()
+        .map(|link| (LayerId(link.layer), link.frames))
+        .collect();
+    Ok(sprite
+        .with_symmetry(symmetry)
+        .with_links(links)
+        .with_tags(tags))
 }
 
 /// Saves a sprite to a file. An existing file is replaced only once the new one is complete.
@@ -485,7 +587,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::test_util::{TempPath, drawn_sprite, layered_sprite};
+    use crate::test_util::{TempPath, animated_sprite, drawn_sprite, layered_sprite};
 
     fn archive(sprite: &Sprite) -> Vec<u8> {
         let mut bytes = Cursor::new(Vec::new());
@@ -582,7 +684,7 @@ mod tests {
         assert_eq!(sprite.palette().entries()[1].name.as_deref(), Some("glass"));
 
         // Saving writes the current version.
-        assert_eq!(manifest_json(&sprite)["format_version"], 3);
+        assert_eq!(manifest_json(&sprite)["format_version"], 4);
     }
 
     #[test]
@@ -627,7 +729,7 @@ mod tests {
         assert_eq!(names, ["cels/1.png", "manifest.json", "thumb.png"]);
 
         let manifest = manifest_json(&sprite);
-        assert_eq!(manifest["format_version"], 3);
+        assert_eq!(manifest["format_version"], 4);
         assert_eq!(manifest["width"], 24);
         assert_eq!(manifest["layers"][0]["kind"], "image");
         assert_eq!(manifest["layers"][0]["opacity"], 255);
@@ -650,7 +752,7 @@ mod tests {
             err,
             IoError::TooNew {
                 found: 99,
-                supported: 3
+                supported: 4
             }
         ));
         assert!(err.to_string().contains("format version 99"));
@@ -913,5 +1015,142 @@ mod tests {
             read(&bad_ramp, &with_picture),
             Err(IoError::Invalid(_))
         ));
+    }
+    #[test]
+    fn a_tagged_multi_layer_animation_round_trips() {
+        let sprite = animated_sprite();
+        let bytes = archive(&sprite);
+        let loaded = read_acms(Cursor::new(bytes.clone())).unwrap();
+        assert_eq!(loaded, sprite);
+
+        // Spot checks, in case both sides agreed on losing something.
+        let durations: Vec<u32> = loaded.frames().iter().map(|f| f.duration_ms).collect();
+        assert_eq!(durations, [100, 80, 120, 60]);
+        let tags: Vec<(&str, usize, usize, Direction)> = loaded
+            .tags()
+            .iter()
+            .map(|tag| (tag.name.as_str(), tag.from, tag.to, tag.direction))
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                ("Idle", 0, 0, Direction::Forward),
+                ("Walk", 1, 3, Direction::PingPong)
+            ]
+        );
+        assert_eq!(loaded.tags()[1].color, Rgba8::new(200, 90, 90, 128));
+        assert_eq!(loaded.link_groups(), [(LayerId(1), vec![0, 1, 3])]);
+        assert_eq!(loaded.cel(LayerId(1), 0), loaded.cel(LayerId(1), 3));
+        assert!(loaded.cel(LayerId(1), 2).is_none());
+        assert_eq!(loaded.cels().count(), 7);
+
+        // The three linked cels are one picture in the file: 1 + 4 images for 7 cels.
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let pictures = zip
+            .file_names()
+            .filter(|name| name.as_ref().is_ok_and(|n| n.starts_with("cels/")))
+            .count();
+        assert_eq!(pictures, 5);
+        let manifest = manifest_json(&sprite);
+        assert_eq!(manifest["cels"][0]["image"], manifest["cels"][2]["image"]);
+        assert_eq!(manifest["links"][0]["frames"], serde_json::json!([0, 1, 3]));
+        assert_eq!(manifest["tags"][1]["direction"], "pingpong");
+        // The thumbnail is still the first frame.
+        let thumb = decode_png(&read_entry(&mut zip, THUMBNAIL).unwrap()).unwrap();
+        assert_eq!(thumb, compositor::compose(&sprite, 0));
+    }
+
+    #[test]
+    fn linked_cels_are_still_linked_after_loading() {
+        use acms_core::document::Document;
+        use acms_core::geom::Rect;
+        use acms_core::image::Image;
+
+        let loaded = read_acms(Cursor::new(archive(&animated_sprite()))).unwrap();
+        let mut document = Document::new(loaded);
+        let dot = Image::from_pixels(1, 1, vec![Rgba8::WHITE]).unwrap();
+        document
+            .transact("Paint", |tx| {
+                tx.set_pixels(LayerId(1), 1, Rect::new(0, 0, 1, 1), &dot)
+            })
+            .unwrap();
+        for frame in [0, 1, 3] {
+            assert_eq!(
+                document.sprite().pixel(LayerId(1), frame, 0, 0),
+                Rgba8::WHITE
+            );
+        }
+        assert_eq!(
+            document.sprite().pixel(LayerId(1), 2, 0, 0),
+            Rgba8::TRANSPARENT
+        );
+    }
+
+    #[test]
+    fn a_version_3_file_is_upgraded_on_load() {
+        let sprite = layered_sprite();
+        let bytes = archive(&sprite);
+        // What the Phase 4 build wrote: the same manifest without the version 4 fields.
+        let mut manifest = manifest_json(&sprite);
+        let fields = manifest.as_object_mut().unwrap();
+        fields.remove("tags");
+        fields.remove("links");
+        fields.insert("format_version".to_owned(), 3.into());
+
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let cels: Vec<(String, Vec<u8>)> = (1..=4)
+            .map(|id| (cel_path(id), read_entry(&mut zip, &cel_path(id)).unwrap()))
+            .collect();
+        let manifest = manifest.to_string();
+        let mut files: Vec<(&str, &[u8])> = vec![(MANIFEST, manifest.as_bytes())];
+        files.extend(cels.iter().map(|(name, bytes)| (name.as_str(), &bytes[..])));
+
+        let loaded = read_acms(Cursor::new(archive_with(&files))).unwrap();
+        assert_eq!(loaded, sprite);
+        assert!(loaded.tags().is_empty() && loaded.link_groups().is_empty());
+    }
+
+    #[test]
+    fn a_file_saved_by_the_phase_4_build_still_opens() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples/phase4-v3.acms");
+        assert_eq!(load_acms(&path).unwrap(), phase_4_sprite());
+    }
+
+    #[test]
+    fn damaged_version_4_parts_are_errors_or_ignored_but_never_panics() {
+        let sprite = animated_sprite();
+        let good = manifest_json(&sprite);
+        let mut zip = ZipArchive::new(Cursor::new(archive(&sprite))).unwrap();
+        let cels: Vec<(String, Vec<u8>)> = (1..=5)
+            .map(|id| (cel_path(id), read_entry(&mut zip, &cel_path(id)).unwrap()))
+            .collect();
+        let read = |manifest: &serde_json::Value| {
+            let manifest = manifest.to_string();
+            let mut files: Vec<(&str, &[u8])> = vec![(MANIFEST, manifest.as_bytes())];
+            files.extend(cels.iter().map(|(name, bytes)| (name.as_str(), &bytes[..])));
+            read_acms(Cursor::new(archive_with(&files)))
+        };
+        assert_eq!(read(&good).unwrap(), sprite);
+
+        let mut odd_direction = good.clone();
+        odd_direction["tags"][0]["direction"] = "sideways".into();
+        assert!(matches!(read(&odd_direction), Err(IoError::Invalid(_))));
+        let mut past_the_end = good.clone();
+        past_the_end["tags"][1]["to"] = 9.into();
+        assert!(matches!(read(&past_the_end), Err(IoError::Invalid(_))));
+        let mut bad_color = good.clone();
+        bad_color["tags"][0]["color"] = "bluish".into();
+        assert!(matches!(read(&bad_color), Err(IoError::Invalid(_))));
+
+        // A link to a frame or layer that is not there is left out; the rest loads.
+        let mut stray = good.clone();
+        stray["links"] = serde_json::json!([
+            { "layer": 1, "frames": [0, 40] },
+            { "layer": 77, "frames": [0, 1] },
+            { "layer": 1, "frames": [2] }
+        ]);
+        let loaded = read(&stray).unwrap();
+        assert!(loaded.link_groups().is_empty());
+        assert_eq!(loaded.cels().count(), 7);
     }
 }

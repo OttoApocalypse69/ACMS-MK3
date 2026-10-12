@@ -45,6 +45,12 @@ pub enum SpriteError {
     TooLargeForBrush,
     #[error("the palette has no colours")]
     EmptyPalette,
+    #[error("the last frame cannot be deleted")]
+    LastFrame,
+    #[error("there is no tag {0}")]
+    UnknownTag(usize),
+    #[error("a tag must run from a frame to the same or a later frame that exists")]
+    InvalidTag,
     #[error("layer {0} is not a group")]
     NotAGroup(u32),
     #[error("the layer is locked")]
@@ -377,6 +383,100 @@ pub struct Frame {
     pub duration_ms: u32,
 }
 
+/// Longest a frame can be shown, in milliseconds (what a GIF can hold).
+pub const MAX_FRAME_MS: u32 = 655_350;
+
+/// How the frames of a tag are played.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Direction {
+    #[default]
+    Forward,
+    Reverse,
+    /// Forwards, then back again, without showing the end frames twice.
+    PingPong,
+}
+
+impl Direction {
+    pub const ALL: [Self; 3] = [Self::Forward, Self::Reverse, Self::PingPong];
+
+    /// Stable lower-case name, used in files, exports and command arguments.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Reverse => "reverse",
+            Self::PingPong => "pingpong",
+        }
+    }
+
+    /// Name shown in the UI.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Forward => "Forward",
+            Self::Reverse => "Reverse",
+            Self::PingPong => "Ping-pong",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|direction| direction.id() == id)
+    }
+}
+
+/// A named run of frames: one animation among several in a sprite.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tag {
+    pub name: String,
+    /// The first and the last frame, both part of the tag.
+    pub from: usize,
+    pub to: usize,
+    pub direction: Direction,
+    pub color: Rgba8,
+}
+
+/// Everything that is laid out along the time axis, and so changes together when frames are
+/// added, removed or reordered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FrameState {
+    pub frames: Vec<Frame>,
+    pub cels: HashMap<(LayerId, usize), Cel>,
+    pub links: HashMap<(LayerId, usize), u32>,
+    pub tags: Vec<Tag>,
+}
+
+impl FrameState {
+    /// Gives every frame a new position: `place(old)` is where the frame at `old` goes, or
+    /// `None` if it is removed. Cels and links move with their frames.
+    pub fn remap(&mut self, place: impl Fn(usize) -> Option<usize>) {
+        let cels = std::mem::take(&mut self.cels);
+        self.cels = cels
+            .into_iter()
+            .filter_map(|((layer, frame), cel)| Some(((layer, place(frame)?), cel)))
+            .collect();
+        let links = std::mem::take(&mut self.links);
+        self.links = links
+            .into_iter()
+            .filter_map(|((layer, frame), link)| Some(((layer, place(frame)?), link)))
+            .collect();
+        self.drop_single_links();
+    }
+
+    /// A link that only one cel is left in is no link.
+    pub fn drop_single_links(&mut self) {
+        let mut members: HashMap<(LayerId, u32), usize> = HashMap::new();
+        for ((layer, _), link) in &self.links {
+            *members.entry((*layer, *link)).or_default() += 1;
+        }
+        self.links
+            .retain(|(layer, _), link| members[&(*layer, *link)] > 1);
+    }
+
+    /// A link number no cel of this layer uses yet.
+    pub fn new_link(&self, layer: LayerId) -> u32 {
+        let used = self.links.iter().filter(|((l, _), _)| *l == layer);
+        used.map(|(_, link)| *link + 1).max().unwrap_or(1)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaletteEntry {
     pub color: Rgba8,
@@ -582,6 +682,10 @@ pub struct Sprite {
     /// How strokes are mirrored. Saved with the sprite, but a way of working rather than
     /// part of the picture: changing it is not an undo step.
     symmetry: Symmetry,
+    tags: Vec<Tag>,
+    /// Which cels are one and the same: cels of a layer with the same number here always
+    /// hold the same pixels. Kept apart from the cels, so that an empty cel can be linked.
+    links: HashMap<(LayerId, usize), u32>,
 }
 
 /// The size of the canvas and everything whose coordinates depend on it.
@@ -641,6 +745,8 @@ impl Sprite {
             cels: HashMap::new(),
             selection: None,
             symmetry: Symmetry::Off,
+            tags: Vec::new(),
+            links: HashMap::new(),
         };
         let mut ids: Vec<LayerId> = sprite.walk().iter().map(|entry| entry.layer.id).collect();
         ids.sort();
@@ -927,8 +1033,99 @@ impl Sprite {
             .fold(Rect::EMPTY, |bounds, (_, cel)| bounds.union(cel.rect()))
     }
 
+    /// The tags, in the order they were made.
+    pub fn tags(&self) -> &[Tag] {
+        &self.tags
+    }
+
+    /// The same sprite with these tags, for building one from a file. Tags that do not fit
+    /// the frames are dropped.
+    pub fn with_tags(mut self, tags: Vec<Tag>) -> Self {
+        let count = self.frames.len();
+        self.tags = tags
+            .into_iter()
+            .filter(|tag| tag.from <= tag.to && tag.to < count)
+            .collect();
+        self
+    }
+
+    /// The same sprite with cels linked, for building one from a file: each entry is a layer
+    /// and the frames whose cels are one and the same. The first frame's cel is the one kept.
+    pub fn with_links(mut self, groups: Vec<(LayerId, Vec<usize>)>) -> Self {
+        let mut state = self.frame_state();
+        for (layer, frames) in groups {
+            let valid = self.check_cel(layer, 0).is_ok()
+                && frames.len() > 1
+                && frames.iter().all(|frame| *frame < self.frames.len());
+            if !valid {
+                continue;
+            }
+            let link = state.new_link(layer);
+            let cel = state.cels.get(&(layer, frames[0])).cloned();
+            for frame in frames {
+                state.links.insert((layer, frame), link);
+                match &cel {
+                    Some(cel) => state.cels.insert((layer, frame), cel.clone()),
+                    None => state.cels.remove(&(layer, frame)),
+                };
+            }
+        }
+        self.set_frame_state(state);
+        self
+    }
+
+    /// The frames whose cels on this layer are linked with the one in `frame`, that frame
+    /// included, in order. Empty if the cel is not linked.
+    pub fn linked_frames(&self, layer: LayerId, frame: usize) -> Vec<usize> {
+        let Some(link) = self.links.get(&(layer, frame)) else {
+            return Vec::new();
+        };
+        let mut frames: Vec<usize> = self
+            .links
+            .iter()
+            .filter(|((l, _), other)| *l == layer && *other == link)
+            .map(|((_, frame), _)| *frame)
+            .collect();
+        frames.sort_unstable();
+        frames
+    }
+
+    /// Every group of linked cels, as a layer and its frames, in a fixed order.
+    pub fn link_groups(&self) -> Vec<(LayerId, Vec<usize>)> {
+        let mut groups: Vec<(LayerId, Vec<usize>)> = Vec::new();
+        let mut keys: Vec<(LayerId, usize)> = self.links.keys().copied().collect();
+        keys.sort();
+        for (layer, frame) in keys {
+            if groups
+                .iter()
+                .any(|(l, frames)| *l == layer && frames.contains(&frame))
+            {
+                continue;
+            }
+            groups.push((layer, self.linked_frames(layer, frame)));
+        }
+        groups
+    }
+
+    pub(crate) fn frame_state(&self) -> FrameState {
+        FrameState {
+            frames: self.frames.clone(),
+            cels: self.cels.clone(),
+            links: self.links.clone(),
+            tags: self.tags.clone(),
+        }
+    }
+
+    pub(crate) fn set_frame_state(&mut self, state: FrameState) {
+        self.frames = state.frames;
+        self.cels = state.cels;
+        self.links = state.links;
+        self.tags = state.tags;
+    }
+
     /// Replaces the pixels of `rect` with `pixels` (which must be `rect`-sized), then re-crops
-    /// the cel to its content. Anything outside the canvas is dropped.
+    /// the cel to its content. Anything outside the canvas is dropped. Cels linked with this
+    /// one change with it.
     ///
     /// The caller has checked that the layer and frame exist.
     pub(crate) fn write_region(
@@ -938,6 +1135,27 @@ impl Sprite {
         rect: Rect,
         pixels: &Image,
     ) {
+        self.write_cel(layer, frame, rect, pixels);
+        let Some(&link) = self.links.get(&(layer, frame)) else {
+            return;
+        };
+        let cel = self.cels.get(&(layer, frame)).cloned();
+        let others: Vec<(LayerId, usize)> = self
+            .links
+            .iter()
+            .filter(|(key, other)| key.0 == layer && key.1 != frame && **other == link)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in others {
+            match &cel {
+                Some(cel) => self.cels.insert(key, cel.clone()),
+                None => self.cels.remove(&key),
+            };
+        }
+    }
+
+    /// Writes one cel, leaving any cels linked with it alone.
+    fn write_cel(&mut self, layer: LayerId, frame: usize, rect: Rect, pixels: &Image) {
         debug_assert_eq!((rect.w, rect.h), (pixels.width(), pixels.height()));
         let target = rect.intersect(self.bounds());
         if target.is_empty() {

@@ -11,8 +11,9 @@ use crate::geom::{Point, Rect};
 use crate::image::Image;
 use crate::selection::Mask;
 use crate::sprite::{
-    CanvasState, Cel, CelSource, Layer, LayerId, LayerKind, LayerProps, MAX_SPRITE_SIZE, Palette,
-    PlacedCel, Slot, Sprite, SpriteError, Symmetry,
+    CanvasState, Cel, CelSource, DEFAULT_FRAME_MS, Frame, FrameState, Layer, LayerId, LayerKind,
+    LayerProps, MAX_FRAME_MS, MAX_SPRITE_SIZE, Palette, PlacedCel, Slot, Sprite, SpriteError,
+    Symmetry, Tag,
 };
 
 /// Default cap on the memory the undo history may hold.
@@ -81,6 +82,11 @@ enum Op {
         before: Box<Palette>,
         after: Box<Palette>,
     },
+    /// Frames, the cels in them, links between cels or tags changed.
+    Frames {
+        before: Box<FrameState>,
+        after: Box<FrameState>,
+    },
 }
 
 impl Op {
@@ -100,6 +106,7 @@ impl Op {
             Self::Selection { after, .. } => sprite.set_selection(after.clone()),
             Self::Canvas { after, .. } => sprite.set_canvas_state((**after).clone()),
             Self::Palette { after, .. } => sprite.set_palette((**after).clone()),
+            Self::Frames { after, .. } => sprite.set_frame_state((**after).clone()),
         }
     }
 
@@ -119,6 +126,7 @@ impl Op {
             Self::Selection { before, .. } => sprite.set_selection(before.clone()),
             Self::Canvas { before, .. } => sprite.set_canvas_state((**before).clone()),
             Self::Palette { before, .. } => sprite.set_palette((**before).clone()),
+            Self::Frames { before, .. } => sprite.set_frame_state((**before).clone()),
         }
     }
 
@@ -131,7 +139,9 @@ impl Op {
             Self::Move { id, .. } | Self::Props { id, .. } => sprite.layer_bounds(*id),
             // The outline is drawn by the view, not composed into the picture.
             Self::Selection { .. } | Self::Palette { .. } => Rect::EMPTY,
-            Self::Canvas { .. } => Rect::from_size(MAX_SPRITE_SIZE, MAX_SPRITE_SIZE),
+            Self::Canvas { .. } | Self::Frames { .. } => {
+                Rect::from_size(MAX_SPRITE_SIZE, MAX_SPRITE_SIZE)
+            }
         }
     }
 
@@ -144,6 +154,10 @@ impl Op {
                 .map(|(_, _, cel)| cel.image().byte_size())
                 .sum(),
             Self::Move { .. } | Self::Props { .. } => 0,
+            // The pictures are shared with the sprite; only the bookkeeping is extra.
+            Self::Frames { before, after } => {
+                (before.cels.len() + after.cels.len()) * std::mem::size_of::<Cel>()
+            }
             Self::Palette { before, after } => {
                 (before.len() + after.len()) * std::mem::size_of::<crate::color::Rgba8>()
             }
@@ -273,6 +287,225 @@ impl Transaction<'_> {
         if before.as_deref() != after.as_deref() {
             self.push(Op::Selection { before, after });
         }
+        Ok(())
+    }
+
+    /// Changes what is laid out along the time axis, as one reversible step.
+    fn edit_frames(&mut self, edit: impl FnOnce(&mut FrameState)) {
+        let before = self.sprite.frame_state();
+        let mut after = before.clone();
+        edit(&mut after);
+        if after != before {
+            self.push(Op::Frames {
+                before: Box::new(before),
+                after: Box::new(after),
+            });
+        }
+    }
+
+    fn check_frame(&self, frame: usize) -> Result<(), SpriteError> {
+        if frame < self.sprite.frames().len() {
+            Ok(())
+        } else {
+            Err(SpriteError::UnknownFrame(frame))
+        }
+    }
+
+    /// Adds a frame so that it ends up at position `at`. With `copy_of`, the new frame gets
+    /// that frame's duration and a copy of its cels; otherwise it is empty.
+    pub fn add_frame(&mut self, at: usize, copy_of: Option<usize>) -> Result<(), SpriteError> {
+        if at > self.sprite.frames().len() {
+            return Err(SpriteError::UnknownFrame(at));
+        }
+        if let Some(source) = copy_of {
+            self.check_frame(source)?;
+        }
+        self.edit_frames(|state| {
+            let copied: Vec<(LayerId, Cel)> = state
+                .cels
+                .iter()
+                .filter(|((_, frame), _)| Some(*frame) == copy_of)
+                .map(|((layer, _), cel)| (*layer, cel.clone()))
+                .collect();
+            let duration_ms = copy_of.map_or(DEFAULT_FRAME_MS, |f| state.frames[f].duration_ms);
+
+            state.remap(|frame| Some(if frame >= at { frame + 1 } else { frame }));
+            state.frames.insert(at, Frame { duration_ms });
+            for (layer, cel) in copied {
+                state.cels.insert((layer, at), cel);
+            }
+            // A frame put inside a tag makes the tag longer; one put before it moves it.
+            for tag in &mut state.tags {
+                if at <= tag.from {
+                    tag.from += 1;
+                    tag.to += 1;
+                } else if at <= tag.to {
+                    tag.to += 1;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Deletes a frame and its cels. The sprite keeps at least one frame.
+    pub fn remove_frame(&mut self, frame: usize) -> Result<(), SpriteError> {
+        self.check_frame(frame)?;
+        if self.sprite.frames().len() == 1 {
+            return Err(SpriteError::LastFrame);
+        }
+        self.edit_frames(|state| {
+            state.remap(|old| match old.cmp(&frame) {
+                std::cmp::Ordering::Less => Some(old),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(old - 1),
+            });
+            state.frames.remove(frame);
+            // A tag loses the frame; a tag that was only this frame goes with it.
+            state
+                .tags
+                .retain(|tag| !(tag.from == frame && tag.to == frame));
+            for tag in &mut state.tags {
+                if frame < tag.from {
+                    tag.from -= 1;
+                }
+                if frame <= tag.to {
+                    tag.to -= 1;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Moves a frame so that it ends up at position `to`. Tags stay where they are on the
+    /// time axis.
+    pub fn move_frame(&mut self, from: usize, to: usize) -> Result<(), SpriteError> {
+        self.check_frame(from)?;
+        self.check_frame(to)?;
+        self.edit_frames(|state| {
+            let moved = state.frames.remove(from);
+            state.frames.insert(to, moved);
+            state.remap(|old| {
+                Some(if old == from {
+                    to
+                } else if from < old && old <= to {
+                    old - 1
+                } else if to <= old && old < from {
+                    old + 1
+                } else {
+                    old
+                })
+            });
+        });
+        Ok(())
+    }
+
+    /// Sets how long a frame is shown, clamped to `1..=MAX_FRAME_MS` milliseconds.
+    pub fn set_frame_duration(&mut self, frame: usize, ms: u32) -> Result<(), SpriteError> {
+        self.check_frame(frame)?;
+        self.edit_frames(|state| state.frames[frame].duration_ms = ms.clamp(1, MAX_FRAME_MS));
+        Ok(())
+    }
+
+    /// Puts what one cel holds into another cel, replacing what was there. With `copy` the
+    /// source keeps its pixels; otherwise it is left empty. Both must be on image layers that
+    /// are not locked.
+    pub fn move_cel(
+        &mut self,
+        from: (LayerId, usize),
+        to: (LayerId, usize),
+        copy: bool,
+    ) -> Result<(), SpriteError> {
+        self.sprite.check_cel(from.0, from.1)?;
+        self.sprite.check_cel(to.0, to.1)?;
+        if from == to {
+            return Ok(());
+        }
+        let canvas = self.sprite.bounds();
+        let pixels = self.sprite.read_region(from.0, from.1, canvas);
+        self.set_pixels(to.0, to.1, canvas, &pixels)?;
+        if !copy {
+            // Linked with the target, the source is the target and has just been written.
+            let same = self.sprite.linked_frames(from.0, from.1).contains(&to.1) && from.0 == to.0;
+            if !same {
+                self.set_pixels(from.0, from.1, canvas, &Image::new(canvas.w, canvas.h))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Makes the cels of one layer in `frames` one and the same cel, holding what the cel in
+    /// `source` holds: from then on, drawing on any of them changes all of them.
+    pub fn link_cels(
+        &mut self,
+        layer: LayerId,
+        source: usize,
+        frames: &[usize],
+    ) -> Result<(), SpriteError> {
+        if self.sprite.check_cel(layer, source)?.locked {
+            return Err(SpriteError::LayerLocked(layer.0));
+        }
+        for frame in frames {
+            self.check_frame(*frame)?;
+        }
+        self.edit_frames(|state| {
+            let link = match state.links.get(&(layer, source)) {
+                Some(link) => *link,
+                None => state.new_link(layer),
+            };
+            let cel = state.cels.get(&(layer, source)).cloned();
+            for frame in frames.iter().copied().chain([source]) {
+                state.links.insert((layer, frame), link);
+                match &cel {
+                    Some(cel) => state.cels.insert((layer, frame), cel.clone()),
+                    None => state.cels.remove(&(layer, frame)),
+                };
+            }
+            state.drop_single_links();
+        });
+        Ok(())
+    }
+
+    /// Makes a linked cel a cel of its own again. It keeps its pixels.
+    pub fn unlink_cel(&mut self, layer: LayerId, frame: usize) -> Result<(), SpriteError> {
+        self.sprite.check_cel(layer, frame)?;
+        self.edit_frames(|state| {
+            state.links.remove(&(layer, frame));
+            state.drop_single_links();
+        });
+        Ok(())
+    }
+
+    fn check_tag(&self, tag: &Tag) -> Result<(), SpriteError> {
+        if tag.from > tag.to || tag.to >= self.sprite.frames().len() {
+            return Err(SpriteError::InvalidTag);
+        }
+        Ok(())
+    }
+
+    /// Adds a tag. Returns its position among the tags.
+    pub fn add_tag(&mut self, tag: Tag) -> Result<usize, SpriteError> {
+        self.check_tag(&tag)?;
+        self.edit_frames(|state| state.tags.push(tag));
+        Ok(self.sprite.tags().len() - 1)
+    }
+
+    /// Replaces the tag at `index`.
+    pub fn set_tag(&mut self, index: usize, tag: Tag) -> Result<(), SpriteError> {
+        if index >= self.sprite.tags().len() {
+            return Err(SpriteError::UnknownTag(index));
+        }
+        self.check_tag(&tag)?;
+        self.edit_frames(|state| state.tags[index] = tag);
+        Ok(())
+    }
+
+    pub fn remove_tag(&mut self, index: usize) -> Result<(), SpriteError> {
+        if index >= self.sprite.tags().len() {
+            return Err(SpriteError::UnknownTag(index));
+        }
+        self.edit_frames(|state| {
+            state.tags.remove(index);
+        });
         Ok(())
     }
 
@@ -684,6 +917,7 @@ impl Document {
 
     /// Makes sure the active layer exists, falling back to the topmost image layer.
     fn repair_active_layer(&mut self) {
+        self.active_frame = self.active_frame.min(self.sprite.frames().len() - 1);
         if self.sprite.layer(self.active_layer).is_some() {
             return;
         }
@@ -700,6 +934,16 @@ impl Document {
     /// The frame being shown and edited.
     pub fn active_frame(&self) -> usize {
         self.active_frame
+    }
+
+    /// Shows another frame. Returns `false` if there is no such frame. Not an undo step.
+    pub fn set_active_frame(&mut self, frame: usize) -> bool {
+        let exists = frame < self.sprite.frames().len();
+        if exists && frame != self.active_frame {
+            self.active_frame = frame;
+            self.damage = Rect::from_size(MAX_SPRITE_SIZE, MAX_SPRITE_SIZE);
+        }
+        exists
     }
 
     /// Runs `edit` and records everything it changes as one undo step called `name`.
@@ -1863,6 +2107,370 @@ mod tests {
         assert_eq!(sprite.fitted(4, 16), Rect::new(3, 0, 2, 8));
         assert_eq!(sprite.fitted(2, 2), Rect::new(0, 0, 8, 8));
         assert_eq!(sprite.fitted(1000, 1), Rect::new(0, 3, 8, 1));
+    }
+
+    /// A document with three frames, each holding a 1×1 red pixel at x = its frame number,
+    /// and a tag over frames 1 to 2.
+    fn animated() -> Document {
+        let mut doc = document();
+        doc.transact("Setup", |tx| {
+            tx.add_frame(1, None)?;
+            tx.add_frame(2, None)?;
+            for frame in 0..3 {
+                tx.set_pixels(
+                    L1,
+                    frame,
+                    Rect::new(frame as i32, 0, 1, 1),
+                    &filled(1, 1, RED),
+                )?;
+            }
+            tx.set_frame_duration(1, 40)?;
+            tx.add_tag(tag("Walk", 1, 2))?;
+            Ok::<_, SpriteError>(())
+        })
+        .unwrap();
+        doc
+    }
+
+    fn tag(name: &str, from: usize, to: usize) -> Tag {
+        Tag {
+            name: name.to_owned(),
+            from,
+            to,
+            direction: crate::sprite::Direction::Forward,
+            color: BLUE,
+        }
+    }
+
+    /// Where the red pixel of each frame is: the frame it was first drawn in, or `None`.
+    fn frame_marks(doc: &Document) -> Vec<Option<i32>> {
+        (0..doc.sprite().frames().len())
+            .map(|frame| doc.sprite().cel(L1, frame).map(|cel| cel.origin().x))
+            .collect()
+    }
+
+    fn tag_spans(doc: &Document) -> Vec<(usize, usize)> {
+        doc.sprite().tags().iter().map(|t| (t.from, t.to)).collect()
+    }
+
+    /// Runs `edit` as one transaction and checks that undo and redo restore the sprite
+    /// exactly.
+    fn undoes_exactly<T>(
+        doc: &mut Document,
+        edit: impl FnOnce(&mut Transaction<'_>) -> Result<T, SpriteError>,
+    ) -> T {
+        let before = doc.sprite().clone();
+        let steps = doc.history_cursor();
+        let value = doc.transact("Edit", edit).unwrap();
+        assert_eq!(doc.history_cursor(), steps + 1, "not exactly one undo step");
+        let after = doc.sprite().clone();
+        assert!(doc.undo());
+        assert_eq!(*doc.sprite(), before, "undo did not restore the sprite");
+        assert!(doc.redo());
+        assert_eq!(*doc.sprite(), after, "redo did not restore the change");
+        value
+    }
+
+    #[test]
+    fn frames_are_added_empty_or_as_a_copy() {
+        let mut doc = animated();
+        undoes_exactly(&mut doc, |tx| tx.add_frame(1, None));
+        assert_eq!(frame_marks(&doc), [Some(0), None, Some(1), Some(2)]);
+        assert_eq!(doc.sprite().frames()[1].duration_ms, DEFAULT_FRAME_MS);
+        // Put before the tag, the frame pushes it along.
+        assert_eq!(tag_spans(&doc), [(2, 3)]);
+
+        // A copy takes the cels and the duration; inside a tag it makes the tag longer.
+        undoes_exactly(&mut doc, |tx| tx.add_frame(3, Some(2)));
+        assert_eq!(
+            frame_marks(&doc),
+            [Some(0), None, Some(1), Some(1), Some(2)]
+        );
+        assert_eq!(doc.sprite().frames()[3].duration_ms, 40);
+        assert_eq!(tag_spans(&doc), [(2, 4)]);
+        // The copy is a cel of its own.
+        paint(&mut doc, "Paint", Rect::new(7, 7, 1, 1), BLUE);
+        assert_eq!(doc.sprite().pixel(L1, 0, 7, 7), BLUE);
+        doc.transact("Paint", |tx| {
+            tx.set_pixels(L1, 3, Rect::new(9, 9, 1, 1), &filled(1, 1, BLUE))
+        })
+        .unwrap();
+        assert_eq!(doc.sprite().pixel(L1, 2, 9, 9), Rgba8::TRANSPARENT);
+
+        // At the very end, after the tag: the tag stays as it is.
+        undoes_exactly(&mut doc, |tx| tx.add_frame(5, None));
+        assert_eq!(tag_spans(&doc), [(2, 4)]);
+
+        let bad = doc.transact("Add", |tx| tx.add_frame(9, None));
+        assert_eq!(bad, Err(SpriteError::UnknownFrame(9)));
+        let bad = doc.transact("Add", |tx| tx.add_frame(0, Some(9)));
+        assert_eq!(bad, Err(SpriteError::UnknownFrame(9)));
+    }
+
+    #[test]
+    fn frames_are_removed_with_their_cels_and_tags_follow() {
+        let mut doc = animated();
+        undoes_exactly(&mut doc, |tx| tx.remove_frame(0));
+        assert_eq!(frame_marks(&doc), [Some(1), Some(2)]);
+        assert_eq!(tag_spans(&doc), [(0, 1)]);
+        assert_eq!(doc.sprite().frames()[0].duration_ms, 40);
+
+        undoes_exactly(&mut doc, |tx| tx.remove_frame(1));
+        assert_eq!(tag_spans(&doc), [(0, 0)]);
+        assert_eq!(
+            doc.transact("Remove", |tx| tx.remove_frame(0)),
+            Err(SpriteError::LastFrame)
+        );
+        assert_eq!(
+            doc.transact("Remove", |tx| tx.remove_frame(4)),
+            Err(SpriteError::UnknownFrame(4))
+        );
+
+        // A tag that was only the removed frame goes with it.
+        let mut doc = animated();
+        doc.transact("Tag", |tx| tx.add_tag(tag("Blink", 0, 0)))
+            .unwrap();
+        undoes_exactly(&mut doc, |tx| tx.remove_frame(0));
+        assert_eq!(tag_spans(&doc), [(0, 1)]);
+    }
+
+    #[test]
+    fn the_active_frame_stays_on_a_frame_that_exists() {
+        let mut doc = animated();
+        assert!(doc.set_active_frame(2));
+        assert!(!doc.set_active_frame(3));
+        assert_eq!(doc.active_frame(), 2);
+        // Showing another frame redraws everything, and is not an undo step.
+        doc.take_damage();
+        let steps = doc.history().len();
+        doc.set_active_frame(1);
+        assert_eq!(doc.take_damage(), doc.sprite().bounds());
+        assert_eq!(doc.history().len(), steps);
+
+        doc.set_active_frame(2);
+        doc.transact("Remove", |tx| tx.remove_frame(2)).unwrap();
+        assert_eq!(doc.active_frame(), 1);
+        doc.undo();
+        assert_eq!(doc.active_frame(), 1);
+    }
+
+    #[test]
+    fn frames_move_with_their_cels() {
+        let mut doc = animated();
+        undoes_exactly(&mut doc, |tx| tx.move_frame(0, 2));
+        assert_eq!(frame_marks(&doc), [Some(1), Some(2), Some(0)]);
+        assert_eq!(doc.sprite().frames()[0].duration_ms, 40);
+        undoes_exactly(&mut doc, |tx| tx.move_frame(2, 1));
+        assert_eq!(frame_marks(&doc), [Some(1), Some(0), Some(2)]);
+        // Tags name places on the time axis, not frames.
+        assert_eq!(tag_spans(&doc), [(1, 2)]);
+
+        let steps = doc.history().len();
+        doc.transact("Move", |tx| tx.move_frame(1, 1)).unwrap();
+        assert_eq!(doc.history().len(), steps);
+        assert_eq!(
+            doc.transact("Move", |tx| tx.move_frame(0, 3)),
+            Err(SpriteError::UnknownFrame(3))
+        );
+    }
+
+    #[test]
+    fn durations_are_clamped() {
+        let mut doc = animated();
+        undoes_exactly(&mut doc, |tx| tx.set_frame_duration(0, 250));
+        assert_eq!(doc.sprite().frames()[0].duration_ms, 250);
+        doc.transact("Duration", |tx| tx.set_frame_duration(0, 0))
+            .unwrap();
+        assert_eq!(doc.sprite().frames()[0].duration_ms, 1);
+        doc.transact("Duration", |tx| tx.set_frame_duration(0, u32::MAX))
+            .unwrap();
+        assert_eq!(doc.sprite().frames()[0].duration_ms, MAX_FRAME_MS);
+    }
+
+    #[test]
+    fn cels_are_moved_and_copied_between_frames_and_layers() {
+        let mut doc = animated();
+        let upper = doc
+            .transact("Add", |tx| tx.add_layer(Slot::new(None, 1), "Upper", false))
+            .unwrap();
+
+        undoes_exactly(&mut doc, |tx| tx.move_cel((L1, 0), (upper, 2), false));
+        assert!(doc.sprite().cel(L1, 0).is_none());
+        assert_eq!(doc.sprite().pixel(upper, 2, 0, 0), RED);
+
+        // A copy leaves the source, and replaces what the target held.
+        undoes_exactly(&mut doc, |tx| tx.move_cel((L1, 1), (L1, 2), true));
+        assert_eq!(frame_marks(&doc), [None, Some(1), Some(1)]);
+
+        let steps = doc.history().len();
+        doc.transact("Move", |tx| tx.move_cel((L1, 1), (L1, 1), false))
+            .unwrap();
+        assert_eq!(doc.history().len(), steps);
+        assert_eq!(
+            doc.transact("Move", |tx| tx.move_cel((L1, 1), (L1, 7), false)),
+            Err(SpriteError::UnknownFrame(7))
+        );
+        doc.transact("Lock", |tx| {
+            tx.update_layer(upper, |props| {
+                if let Some(image) = &mut props.image {
+                    image.locked = true;
+                }
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            doc.transact("Move", |tx| tx.move_cel((L1, 1), (upper, 0), true)),
+            Err(SpriteError::LayerLocked(upper.0))
+        );
+    }
+
+    #[test]
+    fn linked_cels_change_together_and_undo_together() {
+        let mut doc = animated();
+        undoes_exactly(&mut doc, |tx| tx.link_cels(L1, 0, &[2]));
+        assert_eq!(frame_marks(&doc), [Some(0), Some(1), Some(0)]);
+        assert_eq!(doc.sprite().linked_frames(L1, 0), [0, 2]);
+        assert_eq!(doc.sprite().linked_frames(L1, 2), [0, 2]);
+        assert!(doc.sprite().linked_frames(L1, 1).is_empty());
+        assert_eq!(doc.sprite().link_groups(), [(L1, vec![0, 2])]);
+
+        // Drawing on either shows on both, and is still one undo step.
+        let before = doc.sprite().clone();
+        doc.transact("Paint", |tx| {
+            tx.set_pixels(L1, 2, Rect::new(5, 5, 2, 2), &filled(2, 2, BLUE))
+        })
+        .unwrap();
+        assert_eq!(doc.sprite().pixel(L1, 0, 6, 6), BLUE);
+        assert_eq!(doc.sprite().pixel(L1, 1, 6, 6), Rgba8::TRANSPARENT);
+        assert_eq!(doc.sprite().cel(L1, 0), doc.sprite().cel(L1, 2));
+        doc.undo();
+        assert_eq!(*doc.sprite(), before);
+        doc.redo();
+
+        // Erasing everything empties both; undo brings both back.
+        let drawn = doc.sprite().clone();
+        doc.transact("Erase", |tx| {
+            tx.set_pixels(L1, 0, Rect::new(0, 0, 16, 16), &Image::new(16, 16))
+        })
+        .unwrap();
+        assert!(doc.sprite().cel(L1, 0).is_none() && doc.sprite().cel(L1, 2).is_none());
+        doc.undo();
+        assert_eq!(*doc.sprite(), drawn);
+
+        // Links follow their frames around.
+        undoes_exactly(&mut doc, |tx| tx.add_frame(0, None));
+        assert_eq!(doc.sprite().linked_frames(L1, 1), [1, 3]);
+        undoes_exactly(&mut doc, |tx| tx.move_frame(3, 0));
+        assert_eq!(doc.sprite().linked_frames(L1, 0), [0, 2]);
+        // With one of the two gone, the other is an ordinary cel again.
+        undoes_exactly(&mut doc, |tx| tx.remove_frame(0));
+        assert!(doc.sprite().link_groups().is_empty());
+    }
+
+    #[test]
+    fn cels_are_linked_in_groups_and_unlinked_one_by_one() {
+        let mut doc = animated();
+        doc.transact("Link", |tx| tx.link_cels(L1, 1, &[0, 2]))
+            .unwrap();
+        assert_eq!(frame_marks(&doc), [Some(1), Some(1), Some(1)]);
+        assert_eq!(doc.sprite().linked_frames(L1, 0), [0, 1, 2]);
+
+        undoes_exactly(&mut doc, |tx| tx.unlink_cel(L1, 0));
+        assert_eq!(doc.sprite().linked_frames(L1, 1), [1, 2]);
+        // It kept its pixels, and is on its own now.
+        doc.transact("Paint", |tx| {
+            tx.set_pixels(L1, 0, Rect::new(9, 9, 1, 1), &filled(1, 1, BLUE))
+        })
+        .unwrap();
+        assert_eq!(frame_marks(&doc), [Some(1), Some(1), Some(1)]);
+        assert_eq!(doc.sprite().pixel(L1, 1, 9, 9), Rgba8::TRANSPARENT);
+
+        undoes_exactly(&mut doc, |tx| tx.unlink_cel(L1, 2));
+        assert!(doc.sprite().link_groups().is_empty());
+        // Unlinking what is not linked is nothing.
+        let steps = doc.history().len();
+        doc.transact("Unlink", |tx| tx.unlink_cel(L1, 2)).unwrap();
+        assert_eq!(doc.history().len(), steps);
+
+        // An empty cel can be linked, and joins in when the other is drawn on.
+        let mut doc = animated();
+        doc.transact("Add", |tx| tx.add_frame(3, None)).unwrap();
+        doc.transact("Link", |tx| tx.link_cels(L1, 3, &[0]))
+            .unwrap();
+        assert_eq!(frame_marks(&doc), [None, Some(1), Some(2), None]);
+        doc.transact("Paint", |tx| {
+            tx.set_pixels(L1, 3, Rect::new(4, 0, 1, 1), &filled(1, 1, RED))
+        })
+        .unwrap();
+        assert_eq!(frame_marks(&doc), [Some(4), Some(1), Some(2), Some(4)]);
+    }
+
+    #[test]
+    fn moving_a_cel_onto_one_it_is_linked_with_keeps_both() {
+        let mut doc = animated();
+        doc.transact("Link", |tx| tx.link_cels(L1, 0, &[2]))
+            .unwrap();
+        doc.transact("Move", |tx| tx.move_cel((L1, 0), (L1, 2), false))
+            .unwrap();
+        assert_eq!(frame_marks(&doc), [Some(0), Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn tags_are_added_changed_and_removed() {
+        let mut doc = animated();
+        let index = undoes_exactly(&mut doc, |tx| tx.add_tag(tag("Idle", 0, 0)));
+        assert_eq!(index, 1);
+        let mut edited = tag("Run", 0, 2);
+        edited.direction = crate::sprite::Direction::PingPong;
+        undoes_exactly(&mut doc, |tx| tx.set_tag(1, edited.clone()));
+        assert_eq!(doc.sprite().tags()[1], edited);
+        undoes_exactly(&mut doc, |tx| tx.remove_tag(0));
+        assert_eq!(doc.sprite().tags(), [edited]);
+
+        for bad in [tag("Backwards", 2, 1), tag("Too far", 1, 3)] {
+            let result = doc.transact("Tag", |tx| tx.add_tag(bad.clone()));
+            assert_eq!(result, Err(SpriteError::InvalidTag));
+            let result = doc.transact("Tag", |tx| tx.set_tag(0, bad.clone()));
+            assert_eq!(result, Err(SpriteError::InvalidTag));
+        }
+        assert_eq!(
+            doc.transact("Tag", |tx| tx.remove_tag(5)),
+            Err(SpriteError::UnknownTag(5))
+        );
+        assert_eq!(
+            doc.transact("Tag", |tx| tx.set_tag(5, tag("x", 0, 0))),
+            Err(SpriteError::UnknownTag(5))
+        );
+    }
+
+    #[test]
+    fn layer_operations_reach_every_frame() {
+        let mut doc = animated();
+        let upper = doc
+            .transact("Add", |tx| tx.add_layer(Slot::new(None, 1), "Upper", false))
+            .unwrap();
+        doc.transact("Paint", |tx| {
+            tx.set_pixels(upper, 1, Rect::new(8, 8, 1, 1), &filled(1, 1, BLUE))
+        })
+        .unwrap();
+        let pictures: Vec<Image> = (0..3)
+            .map(|frame| compositor::compose(doc.sprite(), frame))
+            .collect();
+
+        undoes_exactly(&mut doc, |tx| tx.merge_down(upper));
+        assert_eq!(doc.sprite().pixel(L1, 1, 8, 8), BLUE);
+        doc.undo();
+        let flat = undoes_exactly(&mut doc, |tx| tx.flatten());
+        for (frame, picture) in pictures.iter().enumerate() {
+            assert_eq!(compositor::compose(doc.sprite(), frame), *picture);
+        }
+        assert_eq!(doc.sprite().pixel(flat, 2, 2, 0), RED);
+        doc.undo();
+
+        // Deleting a layer and bringing it back restores its cels in every frame.
+        undoes_exactly(&mut doc, |tx| tx.remove_layer(L1));
+        let copy = undoes_exactly(&mut doc, |tx| tx.duplicate_layer(upper));
+        assert_eq!(doc.sprite().pixel(copy, 1, 8, 8), BLUE);
     }
 }
 

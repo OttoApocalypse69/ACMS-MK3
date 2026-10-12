@@ -12,6 +12,7 @@ pub mod geom;
 pub mod image;
 pub mod palette;
 pub mod pattern;
+pub mod playback;
 pub mod selection;
 pub mod sprite;
 pub mod stroke;

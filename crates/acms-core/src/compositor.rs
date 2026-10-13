@@ -20,6 +20,7 @@ fn mul(a: u32, b: u32) -> u32 {
 }
 
 /// A colour with its alpha scaled by a layer opacity (0 to 255).
+#[inline]
 pub fn with_opacity(color: Rgba8, opacity: u8) -> Rgba8 {
     let alpha = mul(u32::from(color.a), u32::from(opacity)) as u8;
     Rgba8::new(color.r, color.g, color.b, alpha).normalized()
@@ -44,6 +45,7 @@ fn blend_channel(mode: BlendMode, src: u8, dst: u8) -> u8 {
 ///
 /// The blend only shows where there is something below: on a transparent backdrop every mode
 /// looks like [`BlendMode::Normal`], and on a translucent one it is mixed in proportionally.
+#[inline]
 pub fn blend(mode: BlendMode, src: Rgba8, dst: Rgba8) -> Rgba8 {
     if mode == BlendMode::Normal || dst.a == 0 || src.a == 0 {
         return src.over(dst);
@@ -62,6 +64,107 @@ pub fn blend(mode: BlendMode, src: Rgba8, dst: Rgba8) -> Rgba8 {
     mixed.over(dst)
 }
 
+/// How many pixels, counted once per layer that covers them, are worth spreading over several
+/// threads. Below this, starting the threads costs more than it saves: the area redrawn while
+/// a stroke is drawn is far smaller.
+const PARALLEL_FROM: usize = 200_000;
+
+/// Most threads one flattening is spread over.
+const MAX_THREADS: usize = 8;
+
+/// One layer's part in flattening a rectangle.
+struct Pass<'a> {
+    cel: Option<&'a Cel>,
+    overlay: Option<Overlay<'a>>,
+    opacity: u8,
+    blend: BlendMode,
+    /// The part of the rectangle this layer has anything in.
+    covered: Rect,
+}
+
+impl Pass<'_> {
+    /// Paints a run of this layer's pixels onto the pixels below them.
+    fn paint_run(&self, from: &[Rgba8], onto: &mut [Rgba8]) {
+        let covers = self.blend == BlendMode::Normal && self.opacity == 255;
+        for (below, &color) in onto.iter_mut().zip(from) {
+            let color = if self.opacity == 255 {
+                color
+            } else {
+                with_opacity(color, self.opacity)
+            };
+            if color.a == 0 {
+                continue;
+            }
+            *below = if below.a == 0 || (covers && color.a == 255) {
+                color
+            } else {
+                blend(self.blend, color, *below)
+            };
+        }
+    }
+
+    /// Paints this layer onto the rows `first_row..` of the output that `rows` holds; `rect`
+    /// is the rectangle the whole output stands for.
+    fn paint(&self, rows: &mut [Rgba8], first_row: i32, rect: Rect) {
+        let width = rect.w as usize;
+        let row_count = (rows.len() / width) as i32;
+        let top = self.covered.y.max(first_row);
+        let bottom = self.covered.bottom().min(first_row + row_count);
+        let cel_rect = self.cel.map_or(Rect::EMPTY, Cel::rect);
+
+        for y in top..bottom {
+            let out_row = &mut rows[(y - first_row) as usize * width..][..width];
+            // The cel's pixels on this row, if it has any here.
+            let cel_row = self
+                .cel
+                .filter(|_| y >= cel_rect.y && y < cel_rect.bottom())
+                .map(|cel| {
+                    let cel_width = cel_rect.w as usize;
+                    &cel.image().pixels()[(y - cel_rect.y) as usize * cel_width..][..cel_width]
+                });
+            // Without a stroke in the way, the two rows are walked side by side.
+            if let (None, Some(row)) = (self.overlay, cel_row) {
+                let left = self.covered.x.max(cel_rect.x);
+                let right = self.covered.right().min(cel_rect.right());
+                if left < right {
+                    let count = (right - left) as usize;
+                    let from = &row[(left - cel_rect.x) as usize..][..count];
+                    let onto = &mut out_row[(left - rect.x) as usize..][..count];
+                    self.paint_run(from, onto);
+                }
+                continue;
+            }
+            for x in self.covered.x..self.covered.right() {
+                let stroke = self.overlay.and_then(|overlay| overlay.buffer.get(x, y));
+                let color = match (stroke, cel_row) {
+                    (Some(color), _) => color,
+                    (None, Some(row)) if x >= cel_rect.x && x < cel_rect.right() => {
+                        row[(x - cel_rect.x) as usize]
+                    }
+                    _ => continue,
+                };
+                let color = if self.opacity == 255 {
+                    color
+                } else {
+                    with_opacity(color, self.opacity)
+                };
+                if color.a == 0 {
+                    continue;
+                }
+                let below = &mut out_row[(x - rect.x) as usize];
+                // On nothing, and when it hides what is below, the colour stands as it is;
+                // `blend` would work out the same.
+                let stands = below.a == 0 || (color.a == 255 && self.blend == BlendMode::Normal);
+                *below = if stands {
+                    color
+                } else {
+                    blend(self.blend, color, *below)
+                };
+            }
+        }
+    }
+}
+
 /// Flattens a canvas rectangle of one frame. The result is `rect`-sized; anything outside the
 /// canvas is transparent.
 ///
@@ -73,9 +176,20 @@ pub fn compose_rect(
     overlay: Option<Overlay<'_>>,
     rect: Rect,
 ) -> Image {
-    let mut out = Image::new(rect.w, rect.h);
-    let visible = rect.intersect(sprite.bounds());
+    let available = std::thread::available_parallelism().map_or(1, |count| count.get());
+    compose_rect_on(sprite, frame, overlay, rect, available.min(MAX_THREADS))
+}
 
+/// [`compose_rect`] on at most `max_threads` threads. The picture is the same for any number.
+fn compose_rect_on(
+    sprite: &Sprite,
+    frame: usize,
+    overlay: Option<Overlay<'_>>,
+    rect: Rect,
+    max_threads: usize,
+) -> Image {
+    let visible = rect.intersect(sprite.bounds());
+    let mut passes = Vec::new();
     for entry in sprite.walk() {
         let Some(image) = entry.layer.as_image() else {
             continue;
@@ -86,26 +200,51 @@ pub fn compose_rect(
         let id = entry.layer.id;
         let cel = sprite.cel(id, frame);
         let overlay = overlay.filter(|o| o.layer == id && o.frame == frame);
-
-        // Only the part of the rectangle this layer has anything in.
         let cel_rect = cel.map_or(Rect::EMPTY, Cel::rect);
         let overlay_rect = overlay.map_or(Rect::EMPTY, |o| o.buffer.bounds());
         let covered = cel_rect.union(overlay_rect).intersect(visible);
-
-        for y in covered.y..covered.bottom() {
-            for x in covered.x..covered.right() {
-                let color = overlay
-                    .and_then(|o| o.buffer.get(x, y))
-                    .unwrap_or_else(|| cel.map_or(Rgba8::TRANSPARENT, |cel| cel.pixel(x, y)));
-                let color = with_opacity(color, image.opacity);
-                if color.a != 0 {
-                    let (ox, oy) = (x - rect.x, y - rect.y);
-                    out.set(ox, oy, blend(image.blend, color, out.get(ox, oy)));
-                }
-            }
+        if !covered.is_empty() {
+            passes.push(Pass {
+                cel,
+                overlay,
+                opacity: image.opacity,
+                blend: image.blend,
+                covered,
+            });
         }
     }
-    out
+
+    let width = rect.w as usize;
+    let mut out = vec![Rgba8::TRANSPARENT; width * rect.h as usize];
+    let work: usize = passes.iter().map(|pass| pass.covered.area()).sum();
+    let threads = if work < PARALLEL_FROM {
+        1
+    } else {
+        max_threads.min(rect.h as usize)
+    };
+
+    if threads <= 1 {
+        for pass in &passes {
+            pass.paint(&mut out, rect.y, rect);
+        }
+    } else {
+        // Bands of rows are independent of each other: each thread paints every layer onto
+        // its own band, bottom to top.
+        let band_rows = (rect.h as usize).div_ceil(threads);
+        let passes = &passes;
+        std::thread::scope(|scope| {
+            for (index, band) in out.chunks_mut(band_rows * width).enumerate() {
+                let first_row = rect.y + (index * band_rows) as i32;
+                scope.spawn(move || {
+                    for pass in passes {
+                        pass.paint(band, first_row, rect);
+                    }
+                });
+            }
+        });
+    }
+    // The buffer was made to exactly this size.
+    Image::from_pixels(rect.w, rect.h, out).unwrap_or_else(|| Image::new(rect.w, rect.h))
 }
 
 /// Flattens a whole frame.
@@ -200,12 +339,23 @@ pub fn onion_skin(sprite: &Sprite, frame: usize, onion: &OnionSkin) -> Image {
     out
 }
 
+/// Most memory the pictures of frames other than the one shown may take.
+const KEPT_FRAME_BYTES: usize = 128 * 1024 * 1024;
+
 /// The flattened picture of one frame, kept up to date by recomposing only what changed.
+///
+/// The pictures of frames shown earlier are kept too, for as long as the sprite stays as it
+/// is, so that playing an animation flattens every frame once and not once per loop.
 #[derive(Default)]
 pub struct FrameCache {
     image: Image,
     frame: usize,
     valid: bool,
+    /// Whether `image` is the frame as it is, without a stroke in progress drawn into it.
+    clean: bool,
+    /// The state of the sprite the kept pictures are of; see [`FrameCache::note_revision`].
+    revision: Option<u64>,
+    kept: std::collections::HashMap<usize, Image>,
 }
 
 impl FrameCache {
@@ -217,6 +367,19 @@ impl FrameCache {
     /// [`FrameCache::refresh`] recomposes all of it.
     pub fn invalidate(&mut self) {
         self.valid = false;
+        self.kept.clear();
+        self.revision = None;
+    }
+
+    /// Says which state of the sprite the next [`FrameCache::refresh`] will be given: a number
+    /// that changes whenever the sprite does, like [`crate::document::Document::revision`].
+    /// The pictures of other frames are only kept while it stays the same. Without this call
+    /// none are kept.
+    pub fn note_revision(&mut self, revision: u64) {
+        if self.revision != Some(revision) {
+            self.kept.clear();
+            self.revision = Some(revision);
+        }
     }
 
     /// Brings the picture up to date. `damage` is the canvas area that changed since the last
@@ -230,12 +393,32 @@ impl FrameCache {
         damage: Rect,
     ) -> Rect {
         let bounds = sprite.bounds();
+        if self.image.bounds() != bounds {
+            self.kept.clear();
+        }
         if !self.valid || self.frame != frame || self.image.bounds() != bounds {
-            self.image = compose_rect(sprite, frame, overlay, bounds);
+            let kept = (overlay.is_none())
+                .then(|| self.kept.remove(&frame))
+                .flatten();
+            let next = match kept {
+                Some(image) => image,
+                None => compose_rect(sprite, frame, overlay, bounds),
+            };
+            let previous = std::mem::replace(&mut self.image, next);
+            // The frame that was shown is kept for when it comes round again.
+            let room = (self.kept.len() + 1) * previous.byte_size() <= KEPT_FRAME_BYTES;
+            if self.valid && self.clean && self.revision.is_some() && previous.bounds() == bounds {
+                if !room {
+                    self.kept.clear();
+                }
+                self.kept.insert(self.frame, previous);
+            }
             self.frame = frame;
             self.valid = true;
+            self.clean = overlay.is_none();
             return bounds;
         }
+        self.clean = overlay.is_none();
 
         let damage = damage.intersect(bounds);
         if !damage.is_empty() {
@@ -654,6 +837,169 @@ mod tests {
             Rect::from_size(4, 4)
         );
     }
+
+    #[test]
+    fn the_picture_is_the_same_on_one_thread_and_on_many() {
+        // Large enough for the threads to be used, with every kind of layer in it: opaque,
+        // translucent, blended, faded, and cels that cover only part of the canvas.
+        let size = 300;
+        let mut doc = Document::new(Sprite::new(size, size).unwrap());
+        let noise = |seed: u32, w: u32, h: u32, alpha: Option<u8>| {
+            let mut state = seed;
+            let pixels = (0..w * h)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let [r, g, b, a] = state.to_be_bytes();
+                    Rgba8::new(r, g, b, alpha.unwrap_or(a)).normalized()
+                })
+                .collect();
+            Image::from_pixels(w, h, pixels).unwrap()
+        };
+        let modes = [
+            BlendMode::Normal,
+            BlendMode::Multiply,
+            BlendMode::Screen,
+            BlendMode::Overlay,
+            BlendMode::Add,
+            BlendMode::Normal,
+        ];
+        for (index, mode) in modes.into_iter().enumerate() {
+            let index = index as u32;
+            let layer = match index {
+                0 => LayerId(1),
+                _ => doc
+                    .transact("Add", |tx| {
+                        tx.add_layer(Slot::new(None, index as usize), "Layer", false)
+                    })
+                    .unwrap(),
+            };
+            let inset = (index * 17) as i32;
+            let side = size - 2 * index * 17;
+            let alpha = index.is_multiple_of(2).then_some(255);
+            doc.transact("Paint", |tx| {
+                tx.set_pixels(
+                    layer,
+                    0,
+                    Rect::new(inset, inset, side, side),
+                    &noise(index + 1, side, side, alpha),
+                )?;
+                tx.update_layer(layer, |props| {
+                    if let Some(image) = &mut props.image {
+                        image.blend = mode;
+                        image.opacity = 255 - (index * 30) as u8;
+                    }
+                })
+            })
+            .unwrap();
+        }
+        let sprite = doc.sprite();
+        for rect in [
+            sprite.bounds(),
+            Rect::new(-20, 10, 290, 301),
+            Rect::new(7, 7, 1, 280),
+        ] {
+            let one = compose_rect_on(sprite, 0, None, rect, 1);
+            for threads in [2, 3, 8, 64, 1000] {
+                let many = compose_rect_on(sprite, 0, None, rect, threads);
+                assert!(one == many, "{threads} threads differ on {rect:?}");
+            }
+            assert!(one == compose_rect(sprite, 0, None, rect));
+        }
+        // And both are what painting pixel by pixel, the plain way, gives.
+        let whole = compose(sprite, 0);
+        let mut plain = Image::new(size, size);
+        for entry in sprite.walk() {
+            let image = entry.layer.as_image().unwrap();
+            for y in 0..size as i32 {
+                for x in 0..size as i32 {
+                    let color = with_opacity(sprite.pixel(entry.layer.id, 0, x, y), image.opacity);
+                    if color.a != 0 {
+                        plain.set(x, y, blend(image.blend, color, plain.get(x, y)));
+                    }
+                }
+            }
+        }
+        assert!(whole == plain);
+    }
+
+    #[test]
+    #[ignore = "a measurement; run it in release"]
+    fn time_to_flatten_a_large_sprite() {
+        let mut doc = Document::new(Sprite::new(512, 512).unwrap());
+        for index in 0..20_u32 {
+            let layer = match index {
+                0 => LayerId(1),
+                _ => doc
+                    .transact("Add", |tx| {
+                        tx.add_layer(Slot::new(None, index as usize), "Layer", false)
+                    })
+                    .unwrap(),
+            };
+            let alpha = if index == 0 { 255 } else { 40 };
+            let color = Rgba8::new((index * 12) as u8, 200, 128, alpha);
+            doc.transact("Paint", |tx| {
+                tx.set_pixels(
+                    layer,
+                    0,
+                    Rect::from_size(512, 512),
+                    &filled(512, 512, color),
+                )
+            })
+            .unwrap();
+        }
+        let sprite = doc.sprite();
+        eprintln!("cores: {:?}", std::thread::available_parallelism());
+        for threads in [1, 2, 4, 8, 16] {
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(compose_rect_on(sprite, 0, None, sprite.bounds(), threads));
+            }
+            eprintln!("{threads} threads: {:?}", started.elapsed() / 10);
+        }
+    }
+
+    #[test]
+    fn frames_shown_before_are_kept_until_the_sprite_changes() {
+        let mut document = Document::new(filmstrip());
+        let mut cache = FrameCache::new();
+        let all = Rect::from_size(8, 1);
+        let show = |document: &Document, cache: &mut FrameCache, frame: usize| {
+            cache.note_revision(document.revision());
+            let redrawn = cache.refresh(document.sprite(), frame, None, all);
+            assert_eq!(redrawn, all);
+            assert_eq!(*cache.image(), compose(document.sprite(), frame));
+        };
+        for frame in [0, 1, 2, 3, 4, 0, 1, 2] {
+            show(&document, &mut cache, frame);
+        }
+        // Every frame but the one shown is kept.
+        assert_eq!(cache.kept.len(), 4);
+
+        // An edit to a frame that is not shown: nothing stale may be shown afterwards.
+        let pixel = Image::from_pixels(1, 1, vec![Rgba8::WHITE]).unwrap();
+        document
+            .transact("Paint", |tx| {
+                tx.set_pixels(LayerId(1), 3, Rect::new(7, 0, 1, 1), &pixel)
+            })
+            .unwrap();
+        for frame in [3, 4, 2, 3] {
+            show(&document, &mut cache, frame);
+        }
+        // Undo is a change too.
+        document.undo();
+        show(&document, &mut cache, 3);
+        show(&document, &mut cache, 2);
+
+        // Without being told the state of the sprite, the cache keeps nothing.
+        let mut untold = FrameCache::new();
+        untold.refresh(document.sprite(), 0, None, all);
+        untold.refresh(document.sprite(), 1, None, all);
+        assert!(untold.kept.is_empty());
+        // A picture with a stroke in progress drawn into it is not kept either.
+        cache.invalidate();
+        assert!(cache.kept.is_empty());
+    }
+
     /// Five frames, each with one red pixel at x = its frame number.
     fn filmstrip() -> Sprite {
         let mut document = Document::new(Sprite::new(8, 1).unwrap());

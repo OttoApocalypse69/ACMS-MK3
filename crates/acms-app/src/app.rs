@@ -1375,4 +1375,123 @@ mod tests {
         assert!(mirrored, "Mirror Sprite was not found in the Scripts menu");
         assert!(reloaded, "Reload Scripts was not found in the Scripts menu");
     }
+
+    /// The time one frame may take at 120 frames a second.
+    const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_micros(8333);
+
+    /// A 512 × 512 sprite with 20 layers, each with a picture covering the whole canvas.
+    fn large_sprite() -> Harness {
+        use acms_core::geom::Rect;
+        use acms_core::image::Image;
+        let mut h = Harness::new();
+        let size = Params::new().with("width", 512_u32).with("height", 512_u32);
+        h.app.run_command("file.new", &size);
+        for _ in 1..20 {
+            h.app.run_command("layer.new", &Params::new());
+        }
+        let document = h.app.state.editor.document_mut().unwrap();
+        let layers: Vec<LayerId> = document
+            .sprite()
+            .walk()
+            .iter()
+            .map(|entry| entry.layer.id)
+            .collect();
+        assert_eq!(layers.len(), 20);
+        for (index, layer) in layers.into_iter().enumerate() {
+            // An opaque background, and above it layers that all let the ones below show.
+            let shade = (index * 12) as u8;
+            let alpha = if index == 0 { 255 } else { 40 };
+            let pixels = vec![Rgba8::new(shade, 255 - shade, 128, alpha); 512 * 512];
+            let image = Image::from_pixels(512, 512, pixels).unwrap();
+            document
+                .transact("Fill", |tx| {
+                    tx.set_pixels(layer, 0, Rect::new(0, 0, 512, 512), &image)
+                })
+                .unwrap();
+        }
+        h.frame(vec![]);
+        h.frame(vec![]);
+        h
+    }
+
+    /// One frame as the windowing layer runs it, short of the GPU: the UI, the compositor and
+    /// turning the shapes into triangles.
+    fn timed_frame(h: &mut Harness, events: Vec<Event>) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        let output = h.frame(events);
+        let _ = h.ctx.tessellate(output.shapes, output.pixels_per_point);
+        started.elapsed()
+    }
+
+    /// Run with `cargo test --release -p acms-app -- --ignored frame_time --nocapture`.
+    /// Timings in a debug build say nothing, so the budget is only enforced in release.
+    #[test]
+    #[ignore = "a measurement; run it in release"]
+    fn frame_time_while_drawing_on_a_large_sprite() {
+        let mut h = large_sprite();
+        h.app
+            .run_command("brush.set_size", &Params::new().with("size", 8_u32));
+        let at = |h: &Harness, x: i32, y: i32| h.app.panels.canvas.screen_pos(x, y);
+
+        let start = at(&h, 40, 40);
+        h.pointer_move(start);
+        h.pointer_button(start, PointerButton::Primary, true);
+        let mut times = Vec::new();
+        for step in 0..400 {
+            // A fast scribble: several pixels a frame, back and forth across the canvas.
+            let x = 40 + (step * 7) % 430;
+            let y = 40 + (step * 3) % 430;
+            let pos = at(&h, x, y);
+            times.push(timed_frame(&mut h, vec![Event::PointerMoved(pos)]));
+        }
+        let end = at(&h, 40, 40);
+        h.pointer_button(end, PointerButton::Primary, false);
+        assert_eq!(h.history().last().map(String::as_str), Some("Pencil"));
+
+        // Frames with nothing going on.
+        let idle: Vec<_> = (0..50).map(|_| timed_frame(&mut h, vec![])).collect();
+        // The worst there is: every layer of the whole canvas flattened again.
+        h.app.run_command("layer.set_visible", &Params::new());
+        let full = timed_frame(&mut h, vec![]);
+        h.app.run_command("layer.set_visible", &Params::new());
+        // Stepping through an animation: the first time round each frame is flattened, after
+        // that its picture is known.
+        h.app.run_command("frame.duplicate", &Params::new());
+        h.app.run_command("frame.duplicate", &Params::new());
+        timed_frame(&mut h, vec![]);
+        let mut first_round = Vec::new();
+        let mut later_rounds = Vec::new();
+        for step in 0..30 {
+            h.app.run_command("frame.next", &Params::new());
+            let time = timed_frame(&mut h, vec![]);
+            if step < 2 {
+                first_round.push(time);
+            } else if step >= 3 {
+                later_rounds.push(time);
+            }
+        }
+
+        times.sort();
+        later_rounds.sort();
+        let mean = times.iter().sum::<std::time::Duration>() / times.len() as u32;
+        let worst = times[times.len() - 1];
+        let p99 = times[times.len() * 99 / 100];
+        let idle_mean = idle.iter().sum::<std::time::Duration>() / idle.len() as u32;
+        let stepping = later_rounds[later_rounds.len() - 1];
+        eprintln!("drawing: mean {mean:?}, 99th percentile {p99:?}, worst {worst:?}");
+        eprintln!("idle: mean {idle_mean:?}");
+        eprintln!(
+            "flattening everything: {full:?}; a frame shown for the first time: {first_round:?}"
+        );
+        eprintln!("a frame shown again: worst {stepping:?}");
+        if !cfg!(debug_assertions) {
+            assert!(p99 < FRAME_BUDGET, "99th percentile {p99:?}");
+            assert!(mean < FRAME_BUDGET / 2, "mean {mean:?}");
+            assert!(
+                stepping < FRAME_BUDGET,
+                "a frame shown again took {stepping:?}"
+            );
+            assert!(full < FRAME_BUDGET, "flattening everything took {full:?}");
+        }
+    }
 }

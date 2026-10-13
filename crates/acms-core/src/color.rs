@@ -63,6 +63,7 @@ impl Rgba8 {
     }
 
     /// Normal blending: this colour drawn on top of `below`.
+    #[inline]
     pub fn over(self, below: Self) -> Self {
         let src_a = u32::from(self.a);
         let dst_a = u32::from(below.a);
@@ -71,6 +72,21 @@ impl Rgba8 {
         let out_a = src_a * 255 + dst_weight;
         if out_a == 0 {
             return Self::TRANSPARENT;
+        }
+        // On something opaque the result is opaque, and the general rule below comes down to
+        // `(src * a + dst * (255 - a) + 127) / 255`, which needs no division at all: for
+        // numbers this small, `v / 255` is `(v + 1 + (v >> 8)) >> 8`. This is the common
+        // case, paint over a background, and gives exactly the same values.
+        if dst_a == 255 {
+            let rest = 255 - src_a;
+            // Red and blue are worked out together, 16 bits apart in one number; neither
+            // can spill into the other, since 255 * 255 + 127 + 1 + 254 fits in 16 bits.
+            let pair = |low: u8, high: u8| u32::from(low) | u32::from(high) << 16;
+            let v = pair(self.r, self.b) * src_a + pair(below.r, below.b) * rest + 0x007F_007F;
+            let red_blue = (v + 0x0001_0001 + ((v >> 8) & 0x00FF_00FF)) >> 8;
+            let g = u32::from(self.g) * src_a + u32::from(below.g) * rest + 127;
+            let green = (g + 1 + (g >> 8)) >> 8;
+            return Self::new(red_blue as u8, green as u8, (red_blue >> 16) as u8, 255);
         }
         let channel = |src: u8, dst: u8| {
             let sum = u32::from(src) * src_a * 255 + u32::from(dst) * dst_weight;
@@ -88,6 +104,34 @@ impl Rgba8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blending_onto_an_opaque_colour_takes_the_same_values_as_the_general_rule() {
+        // The general rule, written out again without the shortcut.
+        let general = |src: u8, src_a: u8, dst: u8| {
+            let (src_a, dst_weight) = (u32::from(src_a), 255 * (255 - u32::from(src_a)));
+            let out_a = src_a * 255 + dst_weight;
+            let sum = u32::from(src) * src_a * 255 + u32::from(dst) * dst_weight;
+            ((sum + out_a / 2) / out_a) as u8
+        };
+        for src_a in 0..=255_u8 {
+            for src in 0..=255_u8 {
+                for dst in (0..=255_u8).step_by(3) {
+                    // Three different values in the three channels, so that one leaking
+                    // into another would show.
+                    let above = Rgba8::new(src, 255 - src, src ^ 0x5A, src_a);
+                    let below = Rgba8::rgb(dst, dst ^ 0xA5, 255 - dst);
+                    let over = above.over(below);
+                    let expected = Rgba8::rgb(
+                        general(above.r, src_a, below.r),
+                        general(above.g, src_a, below.g),
+                        general(above.b, src_a, below.b),
+                    );
+                    assert_eq!(over, expected, "{above:?} over {below:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn hex_round_trips() {

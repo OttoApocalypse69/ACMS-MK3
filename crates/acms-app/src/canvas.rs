@@ -618,6 +618,7 @@ impl CanvasView {
             }
             _ => None,
         };
+        self.cache.note_revision(document.revision());
         match current {
             Some(texture) => {
                 // Only the part that changed is flattened and uploaded again.

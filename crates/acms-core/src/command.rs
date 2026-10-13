@@ -146,6 +146,11 @@ impl Params {
         self.0.is_empty()
     }
 
+    /// Every parameter with its value, in order of name.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.0.iter().map(|(name, value)| (name.as_str(), value))
+    }
+
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.0.get(name)
     }

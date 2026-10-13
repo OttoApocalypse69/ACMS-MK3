@@ -227,6 +227,24 @@ pub enum Dialog {
     },
     /// A dialog a script built, with the values as the user has set them so far.
     Script(acms_script::DialogSpec),
+    /// The preferences as the user has set them so far in the dialog.
+    Preferences(crate::settings::Preferences),
+    /// The list of commands and their keys.
+    Keymap {
+        /// Only commands with this text in their name are listed.
+        filter: String,
+        /// The command whose new keys are being waited for.
+        capture: Option<String>,
+        /// What the last change did, e.g. which command lost the keys.
+        note: String,
+    },
+    /// Sprites with unsaved changes were found from a run that did not end normally.
+    Recover,
+    /// The settings of a timelapse export.
+    Timelapse {
+        scale: u32,
+        step_ms: u32,
+    },
     /// The settings of an export; only those the kind uses are shown.
     Export {
         kind: ExportKind,
@@ -315,6 +333,7 @@ pub enum FileRequest {
     ImportPalette,
     ExportPalette,
     ReferenceImage,
+    ImportAseprite,
     /// Asks where to save, then runs `command` with `params` and the path.
     Export {
         command: &'static str,
@@ -373,6 +392,14 @@ pub struct AppState {
     pub log: Vec<String>,
     /// The scripts: the Lua state, what they registered and the console's lines.
     pub scripts: crate::scripting::ScriptState,
+    /// Where the app's own files are.
+    pub paths: crate::settings::Paths,
+    pub prefs: crate::settings::Preferences,
+    /// The files opened or saved last, newest first.
+    pub recent: Vec<PathBuf>,
+    /// Changes to the keymap that commands asked for; the app carries them out.
+    pub keymap_changes: Vec<crate::settings::KeymapChange>,
+    pub recovery: crate::recovery::RecoveryState,
     /// Set by `app.quit`; the app closes the window at the end of the frame.
     pub quit_requested: bool,
 }
@@ -404,6 +431,11 @@ impl Default for AppState {
             rename_layer_request: None,
             log: Vec::new(),
             scripts: crate::scripting::ScriptState::default(),
+            paths: crate::settings::Paths::default(),
+            prefs: crate::settings::Preferences::default(),
+            recent: Vec::new(),
+            keymap_changes: Vec::new(),
+            recovery: crate::recovery::RecoveryState::default(),
             quit_requested: false,
         }
     }
@@ -498,7 +530,8 @@ impl AppState {
     }
 
     /// Opens `document` in a new tab and switches to it. `path` is the file it came from.
-    pub fn open_document(&mut self, document: Document, path: Option<PathBuf>) {
+    pub fn open_document(&mut self, mut document: Document, path: Option<PathBuf>) {
+        document.set_history_limit(self.prefs.history_mb as usize * 1024 * 1024);
         let saved_revision = document.revision();
         self.editor.add_document(document);
         self.sync_active_document();
@@ -533,6 +566,11 @@ impl AppState {
                 parked.map_or(0, |doc| doc.saved_revision),
             )
         }
+    }
+
+    /// The file an open sprite was loaded from or last saved to.
+    pub fn path_of(&self, id: DocId) -> Option<&PathBuf> {
+        self.doc_state(id).0
     }
 
     /// The open document that came from `path`, if there is one.

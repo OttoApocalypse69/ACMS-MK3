@@ -1,7 +1,6 @@
 //! The eframe application: wires the registry, keymap, palette, dialogs and dock together.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use acms_core::command::{CommandRegistry, Params};
 use egui_dock::{DockArea, DockState};
@@ -13,7 +12,9 @@ use crate::keymap::Keymap;
 use crate::menu;
 use crate::palette;
 use crate::panels::{PanelViewer, PanelsUi};
+use crate::recovery;
 use crate::scripting;
+use crate::settings::{self, KeymapChange, Paths};
 use crate::state::AppState;
 use crate::status;
 use crate::theme::{self, ThemeKind};
@@ -77,23 +78,21 @@ fn adapt_clipboard_keys(ctx: &egui::Context, paste_seen: &mut bool) {
 }
 
 impl AcmsApp {
-    /// `keymap_file` is the user's keymap file; `None` means built-in shortcuts only.
-    /// `scripts_dir` is the folder of the user's scripts; `None` means only the examples that
-    /// come with the app.
-    pub fn new(
-        ctx: &egui::Context,
-        keymap_file: Option<&Path>,
-        scripts_dir: Option<&Path>,
-    ) -> anyhow::Result<Self> {
+    /// `paths` says where the user's files are: the keymap, the scripts, the preferences and
+    /// so on. Whatever is missing there is neither read nor written.
+    pub fn new(ctx: &egui::Context, paths: Paths) -> anyhow::Result<Self> {
         let mut registry = CommandRegistry::new();
         commands::register_builtin(&mut registry)?;
 
         // Scripts first: the keymap may bind keys to their commands.
         let mut state = AppState::default();
-        state.scripts.folder = scripts_dir.map(Path::to_owned);
+        state.scripts.folder = paths.scripts.clone();
+        state.paths = paths;
+        settings::load(&mut state);
         scripting::reload(&mut registry, &mut state);
+        recovery::check_at_start(&mut state);
 
-        let (keymap, mut log) = match keymap_file {
+        let (keymap, mut log) = match state.paths.keymap.as_deref() {
             Some(path) => config::load_keymap(path),
             None => (Keymap::with_defaults(), Vec::new()),
         };
@@ -131,12 +130,63 @@ impl AcmsApp {
         commands::run(&self.registry, &mut self.state, id, params);
     }
 
+    /// Carries out the changes to the keymap that commands asked for, and writes the user's
+    /// keymap file.
+    fn apply_keymap_changes(&mut self) {
+        let changes = std::mem::take(&mut self.state.keymap_changes);
+        if changes.is_empty() {
+            return;
+        }
+        for change in changes {
+            match change {
+                KeymapChange::Bind { command, keys } => {
+                    if let Some(shortcut) = crate::keymap::parse_chord(&keys) {
+                        self.keymap.bind(shortcut, command, Params::new());
+                    }
+                }
+                KeymapChange::Unbind { keys } => {
+                    if let Some(shortcut) = crate::keymap::parse_chord(&keys) {
+                        self.keymap.unbind(shortcut);
+                    }
+                }
+                KeymapChange::Clear { command } => self.keymap.clear(&command),
+                KeymapChange::Reset(Some(command)) => self.keymap.reset(&command),
+                KeymapChange::Reset(None) => self.keymap = Keymap::with_defaults(),
+            }
+        }
+        if let Some(path) = self.state.paths.keymap.clone()
+            && let Err(why) = settings::write_text(&path, &self.keymap.to_user_json())
+        {
+            self.state.log.push(format!("Keymap: {why}"));
+        }
+    }
+
+    /// What has to happen when the app closes normally.
+    fn exit(&mut self) {
+        settings::save_session(&mut self.state);
+        recovery::clean_exit(&mut self.state);
+    }
+
     /// One frame of the whole UI. Separate from [`eframe::App::ui`] so tests can drive it
     /// without a window.
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
         scripting::maintain(&mut self.registry, &mut self.state);
+        self.apply_keymap_changes();
+        if (ctx.zoom_factor() - self.state.prefs.ui_scale).abs() > 0.001 {
+            ctx.set_zoom_factor(self.state.prefs.ui_scale);
+        }
+
+        // Files dropped onto the window are opened.
+        let dropped: Vec<_> = ctx.input(|input| {
+            let files = input.raw.dropped_files.iter();
+            files.map(|file| file.path().to_owned()).collect()
+        });
+        for path in dropped {
+            let params = Params::new().with("path", path.to_string_lossy().into_owned());
+            self.run_command("file.open", &params);
+        }
 
         // Closing the window is quitting, which asks before unsaved changes are lost.
         let close_requested = ctx.input(|input| input.viewport().close_requested());
@@ -148,6 +198,10 @@ impl AcmsApp {
         // A playing animation moves on with the clock, and asks to be drawn again when its
         // next frame is due.
         let now = ctx.input(|input| input.time);
+        // So does autosave: an idle app draws nothing, and would never get round to it.
+        if let Some(wait) = recovery::tick(&mut self.state, now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+        }
         if let Some(wait) = self.state.tick_playback(now) {
             ctx.request_repaint_after(std::time::Duration::from_millis(u64::from(wait)));
         }
@@ -219,7 +273,23 @@ impl AcmsApp {
             self.run_command(&id, &Params::new());
         }
 
-        dialogs::show(&ctx, &mut self.state, &self.registry);
+        dialogs::show(&ctx, &mut self.state, &self.registry, &self.keymap);
+
+        // Say so while a file is held over the window.
+        if ctx.input(|input| !input.raw.hovered_files.is_empty()) {
+            let tokens = self.shown_theme.tokens();
+            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_hint"));
+            let screen = ctx.content_rect();
+            let painter = ctx.layer_painter(layer);
+            painter.rect_filled(screen, 0.0, tokens.surface.gamma_multiply(0.8));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop to open",
+                egui::FontId::proportional(24.0),
+                tokens.text,
+            );
+        }
 
         if self.state.theme != self.shown_theme {
             self.shown_theme = self.state.theme;
@@ -242,6 +312,10 @@ impl eframe::App for AcmsApp {
             ui.ctx().request_repaint();
         }
     }
+
+    fn on_exit(&mut self) {
+        self.exit();
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +325,8 @@ mod tests {
     use acms_core::sprite::LayerId;
     use acms_core::stroke;
     use egui::{Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, RawInput, Vec2};
+
+    use std::path::Path;
 
     use super::*;
     use crate::state::{Dialog, FileRequest};
@@ -270,7 +346,11 @@ mod tests {
 
         fn with_keymap_file(keymap_file: Option<&Path>) -> Self {
             let ctx = egui::Context::default();
-            let app = AcmsApp::new(&ctx, keymap_file, None).unwrap();
+            let paths = Paths {
+                keymap: keymap_file.map(Path::to_owned),
+                ..Paths::default()
+            };
+            let app = AcmsApp::new(&ctx, paths).unwrap();
             let mut harness = Self { ctx, app };
             harness.frame(vec![]);
             harness
@@ -1374,6 +1454,217 @@ mod tests {
         assert!(opened, "the Scripts menu did not open");
         assert!(mirrored, "Mirror Sprite was not found in the Scripts menu");
         assert!(reloaded, "Reload Scripts was not found in the Scripts menu");
+    }
+
+    /// A harness whose files live in `dir`.
+    fn harness_in(dir: &config::TempDir) -> Harness {
+        let ctx = egui::Context::default();
+        let app = AcmsApp::new(&ctx, Paths::in_dir(dir.path())).unwrap();
+        let mut harness = Harness { ctx, app };
+        harness.frame(vec![]);
+        harness
+    }
+
+    #[test]
+    fn keys_bound_in_the_app_work_at_once_and_next_time() {
+        let dir = config::TempDir::new("app-keymap");
+        let mut h = harness_in(&dir);
+        let grid = |h: &Harness| h.app.state.view.show_grid;
+        assert!(grid(&h));
+        let bind = Params::new()
+            .with("command", "view.toggle_grid")
+            .with("keys", "Ctrl+J");
+        h.app.run_command("keymap.bind", &bind);
+        h.app
+            .run_command("keymap.clear", &Params::new().with("command", "edit.undo"));
+        h.frame(vec![]);
+        h.press(CTRL, Key::J);
+        assert!(!grid(&h));
+        // The old key still works: a command can have several.
+        h.press(CTRL, Key::G);
+        assert!(grid(&h));
+        assert!(h.app.keymap.shortcuts_for("edit.undo").next().is_none());
+
+        // The file holds the two changes, and the next run has them.
+        let file = std::fs::read_to_string(dir.path().join("keymap.json")).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&file).unwrap();
+        assert_eq!(file["bindings"].as_array().map(Vec::len), Some(2), "{file}");
+        let mut again = harness_in(&dir);
+        again.press(CTRL, Key::J);
+        assert!(!grid(&again));
+        assert!(again.app.keymap.shortcuts_for("edit.undo").next().is_none());
+
+        // Reset brings the defaults back, here and in the file.
+        again.app.run_command("keymap.reset", &Params::new());
+        again.frame(vec![]);
+        assert_eq!(again.app.keymap.shortcuts_for("edit.undo").count(), 1);
+        assert!(again.app.keymap.shortcuts_for("view.toggle_grid").count() == 1);
+        let file = std::fs::read_to_string(dir.path().join("keymap.json")).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&file).unwrap();
+        assert_eq!(file["bindings"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn the_keymap_editor_takes_the_next_key_press() {
+        let mut h = Harness::new();
+        h.app.run_command("keymap.edit", &Params::new());
+        h.frame(vec![]);
+        assert!(matches!(h.app.state.dialog, Some(Dialog::Keymap { .. })));
+        // "Change…" was clicked for a command: the dialog waits for keys.
+        let waiting = |command: &str| Dialog::Keymap {
+            filter: String::new(),
+            capture: Some(command.to_owned()),
+            note: String::new(),
+        };
+        h.app.state.dialog = Some(waiting("layer.flatten"));
+        h.frame(vec![]);
+        // Escape cancels the waiting, not the dialog.
+        h.press(Modifiers::NONE, Key::Escape);
+        assert!(matches!(
+            h.app.state.dialog,
+            Some(Dialog::Keymap { capture: None, .. })
+        ));
+
+        // A key that already has a command: it moves, and the dialog says so.
+        h.app.state.dialog = Some(waiting("layer.flatten"));
+        h.frame(vec![]);
+        h.press(CTRL, Key::G);
+        let Some(Dialog::Keymap { capture, note, .. }) = &h.app.state.dialog else {
+            panic!("the dialog closed: {:?}", h.app.state.dialog);
+        };
+        assert_eq!(*capture, None);
+        assert_eq!(
+            note,
+            "Ctrl+G now runs \"Flatten Layers\"; it was the key for \"Toggle Pixel Grid\"."
+        );
+        // The key press was taken by the dialog, not run as the shortcut it used to be.
+        assert!(h.app.state.view.show_grid);
+        let flatten: Vec<_> = h.app.keymap.shortcuts_for("layer.flatten").collect();
+        assert_eq!(flatten.len(), 1);
+        assert!(
+            h.app
+                .keymap
+                .shortcuts_for("view.toggle_grid")
+                .next()
+                .is_none()
+        );
+
+        // Escape now closes the dialog, and the new key works.
+        h.press(Modifiers::NONE, Key::Escape);
+        assert_eq!(h.app.state.dialog, None);
+    }
+
+    #[test]
+    fn a_file_dropped_on_the_window_is_opened() {
+        #[derive(Debug)]
+        struct Dropped(std::path::PathBuf);
+        impl egui::DroppedFile for Dropped {
+            fn path(&self) -> &Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                std::fs::read(&self.0).map_err(|err| err.to_string())
+            }
+        }
+        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples");
+        let mut h = Harness::new();
+        for name in ["phase5-v4.acms", "aseprite/layers.aseprite"] {
+            let input = RawInput {
+                dropped_files: vec![std::sync::Arc::new(Dropped(samples.join(name)))],
+                ..h.input()
+            };
+            h.frame_with(input);
+            h.frame(vec![]);
+        }
+        assert_eq!(h.app.state.editor.documents().count(), 2);
+        assert_eq!(h.app.state.dialog, None);
+        // Something that is not a sprite says so instead of opening.
+        let input = RawInput {
+            dropped_files: vec![std::sync::Arc::new(Dropped(
+                samples.join("aseprite/README.md"),
+            ))],
+            ..h.input()
+        };
+        h.frame_with(input);
+        assert!(matches!(h.app.state.dialog, Some(Dialog::Message { .. })));
+        assert_eq!(h.app.state.editor.documents().count(), 2);
+    }
+
+    #[test]
+    fn the_interface_size_and_the_new_dialogs_are_drawn() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(1, 3), (4, 3)]);
+        h.app
+            .run_command("prefs.set", &Params::new().with("ui_scale", 1.5));
+        // The new size is asked for in one frame and in force from the next.
+        h.frame(vec![]);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        assert_eq!(h.ctx.zoom_factor(), 1.5);
+        // Each dialog is shown for a few frames; drawing it must not fail or close it.
+        for id in ["app.preferences", "keymap.edit", "file.export_timelapse"] {
+            h.app.run_command(id, &Params::new());
+            let opened = h.app.state.dialog.clone();
+            assert!(opened.is_some(), "{id}");
+            h.frame(vec![]);
+            h.frame(vec![]);
+            assert_eq!(h.app.state.dialog, opened, "{id}");
+            h.press(Modifiers::NONE, Key::Escape);
+            assert_eq!(h.app.state.dialog, None, "{id}");
+        }
+        // Drawing still lands on the right pixel at another interface size.
+        h.frame(vec![]);
+        h.drag_pixels(PointerButton::Primary, &[(9, 9), (12, 9)]);
+        assert_ne!(h.pixel(10, 9), Rgba8::TRANSPARENT);
+        assert_eq!(h.pixel(10, 10), Rgba8::TRANSPARENT);
+    }
+
+    #[test]
+    fn closing_normally_saves_the_session_and_clears_the_recovery_folder() {
+        let dir = config::TempDir::new("app-exit");
+        let mut h = harness_in(&dir);
+        let size = Params::new().with("width", 16_u32).with("height", 16_u32);
+        h.app.run_command("file.new", &size);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        h.drag_pixels(PointerButton::Primary, &[(1, 3), (4, 3)]);
+        h.app.run_command("view.layout_drawing", &Params::new());
+        recovery::autosave(&mut h.app.state, true);
+        let kept = || {
+            std::fs::read_dir(dir.path().join("recovery"))
+                .unwrap()
+                .count()
+        };
+        assert_eq!(kept(), 2);
+
+        h.app.exit();
+        assert_eq!(kept(), 0);
+        let again = harness_in(&dir);
+        assert_eq!(again.app.state.dialog, None);
+        let timeline = crate::panels::Panel::Timeline;
+        assert!(again.app.state.dock.find_tab(&timeline).is_none());
+    }
+
+    #[test]
+    fn a_crash_is_noticed_at_the_next_start() {
+        let dir = config::TempDir::new("app-crash");
+        let mut h = harness_in(&dir);
+        let size = Params::new().with("width", 16_u32).with("height", 16_u32);
+        h.app.run_command("file.new", &size);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        h.drag_pixels(PointerButton::Primary, &[(1, 3), (4, 3)]);
+        recovery::autosave(&mut h.app.state, true);
+        // The app goes away without closing.
+        drop(h);
+
+        let mut again = harness_in(&dir);
+        assert_eq!(again.app.state.dialog, Some(Dialog::Recover));
+        again.frame(vec![]);
+        again.app.run_command("file.recover", &Params::new());
+        again.frame(vec![]);
+        assert_ne!(again.pixel(2, 3), Rgba8::TRANSPARENT);
+        assert!(again.app.state.has_unsaved_changes());
     }
 
     /// The time one frame may take at 120 frames a second.

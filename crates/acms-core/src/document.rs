@@ -1330,6 +1330,11 @@ impl Document {
         self.entries.iter().map(Entry::byte_size).sum()
     }
 
+    /// How much memory the history may use, in bytes.
+    pub fn history_limit(&self) -> usize {
+        self.history_limit
+    }
+
     /// Changes how much memory the history may use. Oldest steps are dropped first.
     pub fn set_history_limit(&mut self, bytes: usize) {
         self.history_limit = bytes;

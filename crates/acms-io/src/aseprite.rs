@@ -619,17 +619,15 @@ mod tests {
         fn cel(
             &mut self,
             layer: u16,
-            x: i16,
-            y: i16,
+            at: (i16, i16),
             opacity: u8,
-            w: u16,
-            h: u16,
+            size: (u16, u16),
             color: Rgba8,
         ) -> &mut Self {
-            let mut data = Self::cel_header(layer, x, y, opacity, 0);
-            data.extend(w.to_le_bytes());
-            data.extend(h.to_le_bytes());
-            for _ in 0..u32::from(w) * u32::from(h) {
+            let mut data = Self::cel_header(layer, at.0, at.1, opacity, 0);
+            data.extend(size.0.to_le_bytes());
+            data.extend(size.1.to_le_bytes());
+            for _ in 0..u32::from(size.0) * u32::from(size.1) {
                 data.extend(color.to_array());
             }
             self.push(0x2005, data)
@@ -736,9 +734,9 @@ mod tests {
             .layer("Leg", 0, 1, 3, 16, 255)
             .layer("Tiles", 2, 0, 3, 0, 255)
             .layer("Top", 0, 0, 3, 5, 255)
-            .cel(0, 1, 2, 255, 3, 2, RED)
-            .cel(4, 0, 0, 128, 1, 1, GREEN)
-            .cel(7, -2, -2, 255, 4, 4, GREEN)
+            .cel(0, (1, 2), 255, (3, 2), RED)
+            .cel(4, (0, 0), 128, (1, 1), GREEN)
+            .cel(7, (-2, -2), 255, (4, 4), GREEN)
             .tags(&[
                 ("walk", 0, 1, 2),
                 ("back", 1, 2, 1),
@@ -747,7 +745,10 @@ mod tests {
             ])
             .slice("button", [1, 1, 6, 5], Some([2, 1, 2, 3]), Some([3, 4]))
             .slice("plain", [0, 0, 2, 2], None, None);
-        writer.frame().linked_cel(0, 0).cel(5, 0, 0, 255, 1, 1, RED);
+        writer
+            .frame()
+            .linked_cel(0, 0)
+            .cel(5, (0, 0), 255, (1, 1), RED);
         writer.frame().linked_cel(0, 1);
         writer.finish(8, 8)
     }

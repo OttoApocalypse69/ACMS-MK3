@@ -12,7 +12,8 @@ pub const PANEL_PADDING: i8 = 12;
 /// Corner radius of buttons, inputs and popups.
 pub const RADIUS: u8 = 6;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ThemeKind {
     #[default]
     Dark,

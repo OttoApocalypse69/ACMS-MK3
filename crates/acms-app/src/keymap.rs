@@ -129,6 +129,23 @@ fn params_from_json(args: serde_json::Map<String, serde_json::Value>) -> Result<
     Ok(params)
 }
 
+/// The inverse of [`params_from_json`]. A colour is written as its hex text, which a command
+/// expecting a colour reads back.
+fn params_to_json(params: &Params) -> serde_json::Value {
+    let mut args = serde_json::Map::new();
+    for (name, value) in params.iter() {
+        let value = match value {
+            Value::Bool(flag) => serde_json::Value::from(*flag),
+            Value::Int(whole) => serde_json::Value::from(*whole),
+            Value::Float(float) => serde_json::Value::from(*float),
+            Value::Text(text) => serde_json::Value::from(text.as_str()),
+            Value::Color(color) => serde_json::Value::from(color.to_hex()),
+        };
+        args.insert(name.to_owned(), value);
+    }
+    serde_json::Value::Object(args)
+}
+
 #[derive(Default)]
 pub struct Keymap {
     /// Sorted so chords with more modifiers come first; see [`Keymap::triggered`].
@@ -188,6 +205,73 @@ impl Keymap {
             }
         }
         Ok(skipped)
+    }
+
+    /// Gives a command back the chords it has by default, and takes away the others it was
+    /// given. A default chord that meanwhile runs something else is taken back from that.
+    pub fn reset(&mut self, command: &str) {
+        self.bindings
+            .retain(|b| !(b.command == command && b.params.is_empty()));
+        for (chord, default) in DEFAULT_BINDINGS {
+            if *default == command
+                && let Some(shortcut) = parse_chord(chord)
+            {
+                self.bind(shortcut, command, Params::new());
+            }
+        }
+    }
+
+    /// Takes every chord away from a command (those that run it without arguments).
+    pub fn clear(&mut self, command: &str) {
+        self.bindings
+            .retain(|b| !(b.command == command && b.params.is_empty()));
+    }
+
+    /// The command a chord runs, if any.
+    pub fn command_for(&self, shortcut: KeyboardShortcut) -> Option<&str> {
+        self.bindings
+            .iter()
+            .find(|b| b.shortcut == shortcut)
+            .map(|b| b.command.as_str())
+    }
+
+    /// The keymap as a keymap file: only what differs from the defaults, so that defaults
+    /// added by later versions still reach the user.
+    pub fn to_user_json(&self) -> String {
+        let defaults = Self::with_defaults();
+        let same = |a: &Binding, b: &Binding| a.command == b.command && a.params == b.params;
+        let mut entries = Vec::new();
+        // Default chords that are gone.
+        for default in &defaults.bindings {
+            if !self.bindings.iter().any(|b| b.shortcut == default.shortcut) {
+                entries.push(serde_json::json!({
+                    "keys": format_chord(default.shortcut),
+                    "command": null,
+                }));
+            }
+        }
+        // Chords that do something other than by default.
+        for binding in &self.bindings {
+            let default = defaults
+                .bindings
+                .iter()
+                .find(|d| d.shortcut == binding.shortcut);
+            if default.is_some_and(|default| same(default, binding)) {
+                continue;
+            }
+            let mut entry = serde_json::json!({
+                "keys": format_chord(binding.shortcut),
+                "command": binding.command,
+            });
+            if !binding.params.is_empty() {
+                entry["args"] = params_to_json(&binding.params);
+            }
+            entries.push(entry);
+        }
+        // Sorted, so that the file does not change from one save to the next for no reason.
+        entries.sort_by_key(|entry| entry["keys"].as_str().map(str::to_owned));
+        let file = serde_json::json!({ "bindings": entries });
+        serde_json::to_string_pretty(&file).unwrap_or_else(|_| "{ \"bindings\": [] }".to_owned())
     }
 
     /// The command of every binding; a command bound to two chords appears twice.
@@ -262,9 +346,121 @@ pub fn parse_chord(text: &str) -> Option<KeyboardShortcut> {
     Some(KeyboardShortcut::new(modifiers, key))
 }
 
+/// A chord as text, the way [`parse_chord`] reads it: `"Ctrl+Shift+P"`.
+pub fn format_chord(shortcut: KeyboardShortcut) -> String {
+    let mut text = String::new();
+    let modifiers = shortcut.modifiers;
+    if modifiers.command || modifiers.ctrl || modifiers.mac_cmd {
+        text.push_str("Ctrl+");
+    }
+    if modifiers.shift {
+        text.push_str("Shift+");
+    }
+    if modifiers.alt {
+        text.push_str("Alt+");
+    }
+    text.push_str(shortcut.logical_key.name());
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chords_are_written_the_way_they_are_read() {
+        for (chord, _) in DEFAULT_BINDINGS {
+            let shortcut = parse_chord(chord).unwrap();
+            assert_eq!(
+                parse_chord(&format_chord(shortcut)),
+                Some(shortcut),
+                "{chord}"
+            );
+        }
+        let all = Modifiers::COMMAND
+            .plus(Modifiers::SHIFT)
+            .plus(Modifiers::ALT);
+        assert_eq!(
+            format_chord(KeyboardShortcut::new(all, Key::F5)),
+            "Ctrl+Shift+Alt+F5"
+        );
+        assert_eq!(
+            format_chord(KeyboardShortcut::new(Modifiers::NONE, Key::Period)),
+            "Period"
+        );
+    }
+
+    /// The bindings as text, for comparing two keymaps.
+    fn listed(keymap: &Keymap) -> Vec<String> {
+        let mut lines: Vec<String> = keymap
+            .bindings
+            .iter()
+            .map(|b| format!("{} {} {:?}", format_chord(b.shortcut), b.command, b.params))
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    #[test]
+    fn the_saved_file_holds_only_the_changes_and_brings_them_back() {
+        let mut keymap = Keymap::with_defaults();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&keymap.to_user_json()).unwrap(),
+            serde_json::json!({ "bindings": [] })
+        );
+
+        let chord = |text: &str| parse_chord(text).unwrap();
+        keymap.bind(chord("Ctrl+J"), "view.toggle_grid", Params::new());
+        keymap.unbind(chord("Ctrl+G"));
+        keymap.bind(chord("B"), "tool.eraser", Params::new());
+        let size = Params::new().with("size", 3_i64).with("round", true);
+        keymap.bind(chord("Ctrl+3"), "brush.set_size", size);
+        let color = Params::new().with("color", acms_core::color::Rgba8::rgb(255, 0, 0));
+        keymap.bind(chord("Alt+R"), "color.set_primary", color);
+
+        let json = keymap.to_user_json();
+        let file: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Five entries: nothing about the fifty-odd chords that were left alone.
+        assert_eq!(file["bindings"].as_array().map(Vec::len), Some(5), "{json}");
+
+        let mut loaded = Keymap::with_defaults();
+        assert_eq!(loaded.apply_user_json(&json).unwrap(), Vec::<String>::new());
+        // The colour comes back as the text a colour parameter is read from.
+        let mut expected = listed(&keymap);
+        for line in &mut expected {
+            if line.contains("color.set_primary") {
+                *line = line.replace(
+                    "Color(Rgba8 { r: 255, g: 0, b: 0, a: 255 })",
+                    "Text(\"#FF0000\")",
+                );
+            }
+        }
+        assert_eq!(listed(&loaded), expected);
+        assert_eq!(loaded.to_user_json(), json);
+    }
+
+    #[test]
+    fn resetting_a_command_gives_it_its_default_chords_back() {
+        let chord = |text: &str| parse_chord(text).unwrap();
+        let defaults = listed(&Keymap::with_defaults());
+        let mut keymap = Keymap::with_defaults();
+        // Undo gets another key, and its own key goes to something else.
+        keymap.bind(chord("Ctrl+J"), "edit.undo", Params::new());
+        keymap.bind(chord("Ctrl+Z"), "view.toggle_grid", Params::new());
+        assert_eq!(
+            keymap.command_for(chord("Ctrl+Z")),
+            Some("view.toggle_grid")
+        );
+
+        keymap.reset("edit.undo");
+        assert_eq!(chords_for(&keymap, "edit.undo"), [chord("Ctrl+Z")]);
+        assert_eq!(keymap.command_for(chord("Ctrl+J")), None);
+        assert_eq!(listed(&keymap), defaults);
+        // A command without default chords ends up with none.
+        keymap.bind(chord("Ctrl+J"), "layer.flatten", Params::new());
+        keymap.reset("layer.flatten");
+        assert_eq!(listed(&keymap), defaults);
+    }
 
     #[test]
     fn parses_chords() {

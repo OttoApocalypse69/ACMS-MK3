@@ -110,10 +110,84 @@ fn file_open(state: &mut AppState, params: &Params) -> CommandResult {
         state.activate_document(open);
         return Ok(());
     }
+    // Files of other programs are imported: the sprite is new, and has no file of its own yet.
+    if acms_io::aseprite::is_aseprite_path(&path) {
+        return import_aseprite(state, &path);
+    }
     let sprite = load_acms(&path)
         .map_err(|err| CommandError::failed(format!("Could not open {}: {err}", path.display())))?;
     state.log.push(format!("Opened {}", path.display()));
+    crate::settings::note_recent(state, &path);
     state.open_document(Document::new(sprite), Some(path));
+    Ok(())
+}
+
+fn import_aseprite(state: &mut AppState, path: &Path) -> CommandResult {
+    let imported = acms_io::aseprite::import_aseprite_from_path(path).map_err(|err| {
+        CommandError::failed(format!("Could not import {}: {err}", path.display()))
+    })?;
+    state.log.push(format!("Imported {}", path.display()));
+    state.log.extend(imported.notes.iter().cloned());
+    state.open_document(Document::new(imported.sprite), None);
+    if !imported.notes.is_empty() {
+        state.dialog = Some(Dialog::Message {
+            title: "Imported with Changes".to_owned(),
+            text: imported.notes.join("\n"),
+        });
+    }
+    Ok(())
+}
+
+fn file_import_aseprite(state: &mut AppState, params: &Params) -> CommandResult {
+    match params.text("path") {
+        Some(path) => import_aseprite(state, Path::new(path)),
+        None => {
+            state.file_request = Some(FileRequest::ImportAseprite);
+            Ok(())
+        }
+    }
+}
+
+/// Replays the undo history of the active sprite into a GIF.
+fn file_export_timelapse(state: &mut AppState, params: &Params) -> CommandResult {
+    use acms_io::export::{TimelapseOptions, export_timelapse_to_path};
+    let Some(path) = params.text("path").map(PathBuf::from) else {
+        if params.is_empty() {
+            let defaults = TimelapseOptions::default();
+            state.dialog = Some(Dialog::Timelapse {
+                scale: defaults.scale,
+                step_ms: defaults.step_ms,
+            });
+        } else {
+            state.file_request = Some(FileRequest::Export {
+                command: "file.export_timelapse",
+                params: params.clone(),
+                file_type: ("GIF animation", "gif"),
+            });
+        }
+        return Ok(());
+    };
+    let defaults = TimelapseOptions::default();
+    let whole = |name: &str, default: u32| match params.int(name) {
+        Some(value) => u32::try_from(value).unwrap_or(0),
+        None => default,
+    };
+    let options = TimelapseOptions {
+        scale: whole("scale", defaults.scale),
+        step_ms: whole("step_ms", defaults.step_ms).clamp(10, 10_000),
+        ..defaults
+    };
+    let document = state.editor.document_mut().ok_or_else(no_document)?;
+    let steps = export_timelapse_to_path(document, options, &path).map_err(|err| {
+        CommandError::failed(format!(
+            "Could not export {}: {}",
+            path.display(),
+            sentence(err)
+        ))
+    })?;
+    state
+        .log
+        .push(format!("Exported {} ({steps} pictures)", path.display()));
     Ok(())
 }
 
@@ -124,6 +198,7 @@ fn save_to(state: &mut AppState, path: &Path) -> CommandResult {
     state.saved_revision = document.revision();
     state.file_path = Some(path.to_owned());
     state.log.push(format!("Saved {}", path.display()));
+    crate::settings::note_recent(state, path);
     Ok(())
 }
 
@@ -280,6 +355,30 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
         ))?;
     }
     crate::scripting::register_commands(registry)?;
+    crate::settings::register_commands(registry)?;
+    crate::recovery::register_commands(registry)?;
+    registry.register(
+        Command::new(
+            "file.import_aseprite",
+            "Import Aseprite File…",
+            file_import_aseprite,
+        )
+        .optional_param("path", Text),
+    )?;
+    registry.register(
+        Command::new(
+            "file.export_timelapse",
+            "Export Timelapse…",
+            file_export_timelapse,
+        )
+        .optional_param("path", Text)
+        .optional_param("scale", Int)
+        .optional_param("step_ms", Int)
+        .enabled_when(|state| {
+            let document = state.editor.document();
+            document.is_some_and(|document| document.history_cursor() > 0)
+        }),
+    )?;
 
     // Colour and brush
     registry.register(
@@ -388,6 +487,7 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
         "Toggle Light / Dark Theme",
         |state: &mut AppState, _| {
             state.theme = state.theme.toggled();
+            crate::settings::save_preferences(state);
             Ok(())
         },
     ))?;
@@ -397,6 +497,7 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
         |state: &mut AppState, _| {
             state.dock = panels::default_layout();
             state.layout_generation += 1;
+            crate::settings::save_session(state);
             Ok(())
         },
     ))?;

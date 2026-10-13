@@ -24,7 +24,7 @@ use crate::preview::{self, PreviewUi};
 use crate::state::AppState;
 use crate::timeline::{self, TimelineUi};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Panel {
     /// The central area where the open sprite is shown. Cannot be closed.
     Canvas,
@@ -89,6 +89,41 @@ pub fn default_layout() -> DockState<Panel> {
     let [main, _bottom] = tree.split_below(main, 0.7, vec![Timeline, Tileset, ScriptConsole, Log]);
     let [_canvas, tools] = tree.split_left(main, 0.17, vec![Tools]);
     tree.split_below(tools, 0.76, vec![ToolOptions, Preview]);
+
+    dock
+}
+
+/// A layout for animating: the timeline gets a third of the window, and the preview sits
+/// where the animation can be watched while drawing.
+pub fn animation_layout() -> DockState<Panel> {
+    use Panel::*;
+
+    let mut dock = DockState::new(vec![Canvas]);
+    let tree = dock.main_surface_mut();
+    let [main, right] = tree.split_right(NodeIndex::root(), 0.77, vec![Preview]);
+    let [_preview, colour] = tree.split_below(right, 0.3, vec![Colour, Palette]);
+    tree.split_below(colour, 0.5, vec![Layers, History]);
+
+    let [main, _bottom] = tree.split_below(main, 0.6, vec![Timeline, Tileset, ScriptConsole, Log]);
+    let [_canvas, tools] = tree.split_left(main, 0.17, vec![Tools]);
+    tree.split_below(tools, 0.8, vec![ToolOptions]);
+
+    dock
+}
+
+/// A layout for drawing: as much canvas as possible, with only what a single picture needs
+/// around it.
+pub fn drawing_layout() -> DockState<Panel> {
+    use Panel::*;
+
+    let mut dock = DockState::new(vec![Canvas]);
+    let tree = dock.main_surface_mut();
+    let [main, colour] = tree.split_right(NodeIndex::root(), 0.8, vec![Colour]);
+    let [_colour, palette] = tree.split_below(colour, 0.5, vec![Palette]);
+    tree.split_below(palette, 0.4, vec![Layers, History]);
+
+    let [_canvas, tools] = tree.split_left(main, 0.15, vec![Tools]);
+    tree.split_below(tools, 0.7, vec![ToolOptions]);
 
     dock
 }

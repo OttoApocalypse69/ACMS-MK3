@@ -20,7 +20,9 @@ mod palette;
 mod panels;
 mod pixel_commands;
 mod preview;
+mod recovery;
 mod scripting;
+mod settings;
 mod state;
 mod status;
 mod theme;
@@ -35,15 +37,13 @@ fn main() -> anyhow::Result<()> {
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
-    let keymap_file = config::keymap_path();
-    let scripts_dir = config::scripts_dir();
+    let paths = settings::Paths::user();
 
     eframe::run_native(
         "acms-mk3",
         options,
         Box::new(|cc| {
-            let mut app =
-                app::AcmsApp::new(&cc.egui_ctx, keymap_file.as_deref(), scripts_dir.as_deref())?;
+            let mut app = app::AcmsApp::new(&cc.egui_ctx, paths)?;
             app.use_system_clipboard();
             Ok(Box::new(app))
         }),

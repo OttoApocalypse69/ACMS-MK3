@@ -8,12 +8,15 @@ use crate::commands;
 use crate::keymap::Keymap;
 use crate::state::AppState;
 
+#[derive(Clone, Copy)]
 enum Entry {
     Command(&'static str),
     Separator,
+    /// The submenu of the files opened last.
+    Recent,
 }
 
-use Entry::{Command, Separator};
+use Entry::{Command, Recent, Separator};
 
 const MENUS: &[(&str, &[Entry])] = &[
     (
@@ -21,6 +24,8 @@ const MENUS: &[(&str, &[Entry])] = &[
         &[
             Command("file.new"),
             Command("file.open"),
+            Recent,
+            Command("file.import_aseprite"),
             Separator,
             Command("file.save"),
             Command("file.save_as"),
@@ -31,6 +36,7 @@ const MENUS: &[(&str, &[Entry])] = &[
             Command("file.export_tileset"),
             Command("file.export_tilemap"),
             Command("file.export_tilemap_csv"),
+            Command("file.export_timelapse"),
             Separator,
             Command("file.close"),
             Command("app.quit"),
@@ -46,6 +52,9 @@ const MENUS: &[(&str, &[Entry])] = &[
             Command("edit.copy"),
             Command("edit.paste"),
             Command("edit.clear"),
+            Separator,
+            Command("app.preferences"),
+            Command("keymap.edit"),
         ],
     ),
     (
@@ -159,11 +168,43 @@ const MENUS: &[(&str, &[Entry])] = &[
             Separator,
             Command("view.command_palette"),
             Command("view.toggle_theme"),
+            Separator,
             Command("view.reset_layout"),
+            Command("view.layout_animation"),
+            Command("view.layout_drawing"),
+            Separator,
             Command("view.clear_log"),
         ],
     ),
 ];
+
+/// File → Open Recent: the files opened or saved last, newest first.
+fn recent(ui: &mut Ui, state: &mut AppState, registry: &CommandRegistry<AppState>) {
+    ui.menu_button("Open Recent", |ui| {
+        if state.recent.is_empty() {
+            ui.add_enabled(false, Button::new("No recent files"));
+            return;
+        }
+        for path in state.recent.clone() {
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            if ui
+                .button(name)
+                .on_hover_text(path.display().to_string())
+                .clicked()
+            {
+                let params = Params::new().with("path", path.to_string_lossy().into_owned());
+                commands::run(registry, state, "file.open", &params);
+            }
+        }
+        ui.separator();
+        if ui.button("Clear Recent Files").clicked() {
+            commands::run(registry, state, "file.clear_recent", &Params::new());
+        }
+    });
+}
 
 /// The fixed part of the Scripts menu; the commands of the scripts follow it.
 const SCRIPT_MENU: [&str; 2] = ["script.reload", "script.clear_console"];
@@ -196,6 +237,7 @@ pub fn show(
                         Separator => {
                             ui.separator();
                         }
+                        Recent => recent(ui, state, registry),
                     }
                 }
             });
@@ -253,7 +295,7 @@ mod tests {
             .flat_map(|(_, entries)| entries.iter())
             .filter_map(|entry| match entry {
                 Command(id) => Some(*id),
-                Separator => None,
+                Separator | Recent => None,
             })
             .collect();
         let total = ids.len();

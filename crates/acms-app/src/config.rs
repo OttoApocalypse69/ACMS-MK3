@@ -20,6 +20,13 @@ pub fn scripts_dir() -> Option<PathBuf> {
     Some(dirs.config_dir().join("scripts"))
 }
 
+/// Where sprites with unsaved changes are autosaved: a `recovery` folder in the app's own
+/// data folder, which unlike the configuration is not meant to be carried between machines.
+pub fn recovery_dir() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "acms-mk3")?;
+    Some(dirs.data_local_dir().join("recovery"))
+}
+
 /// Builds the keymap: the built-in defaults with the file at `path` applied on top.
 ///
 /// A missing or broken file is never fatal: the defaults are used instead. The returned lines
@@ -80,6 +87,33 @@ impl TempFile {
 impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A folder in the OS temp directory that is deleted, with what is in it, when dropped.
+#[cfg(test)]
+pub struct TempDir(PathBuf);
+
+#[cfg(test)]
+impl TempDir {
+    /// `name` must be unique among the tests, which run in parallel.
+    pub fn new(name: &str) -> Self {
+        let folder = format!("acms-test-{}-{name}", std::process::id());
+        let path = std::env::temp_dir().join(folder);
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

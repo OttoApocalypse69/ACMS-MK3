@@ -14,7 +14,10 @@ use acms_io::png::MAX_EXPORT_SCALE;
 use egui::{DragValue, Grid, Id, Modal, RichText, Ui};
 
 use crate::commands;
+use crate::keymap::{self, Keymap};
+use crate::settings::Preferences;
 use crate::state::{Anchor, AppState, Dialog, ExportKind, FileRequest, SizePurpose};
+use crate::theme::ThemeKind;
 
 /// What the user did with a dialog this frame.
 enum Outcome {
@@ -24,10 +27,20 @@ enum Outcome {
     Run(String, Params),
     /// A script's dialog was answered: with its values, or `None` for Cancel.
     Script(Option<acms_script::DialogSpec>),
+    /// Run a command and keep the dialog up, as it is given here.
+    RunAndStay(String, Params, Dialog),
+    /// Keep the dialog up even though Escape was pressed: the key was meant for something
+    /// inside it.
+    Stay(Dialog),
 }
 
 /// Shows the open dialog, if any.
-pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &CommandRegistry<AppState>) {
+pub fn show(
+    ctx: &egui::Context,
+    state: &mut AppState,
+    registry: &CommandRegistry<AppState>,
+    keymap: &Keymap,
+) {
     let Some(dialog) = state.dialog.take() else {
         return;
     };
@@ -56,6 +69,14 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &CommandRegistr
             } => tag(ui, state, index, name, from, to, direction, color),
             Dialog::FrameDuration { ms } => frame_duration(ui, ms),
             Dialog::Script(spec) => script(ui, spec),
+            Dialog::Preferences(draft) => preferences(ui, draft),
+            Dialog::Keymap {
+                filter,
+                capture,
+                note,
+            } => keymap_editor(ui, state, registry, keymap, filter, capture, note),
+            Dialog::Recover => recover(ui, state),
+            Dialog::Timelapse { scale, step_ms } => timelapse(ui, state, scale, step_ms),
             Dialog::Slice {
                 name,
                 rect,
@@ -80,6 +101,14 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, registry: &CommandRegistr
             crate::scripting::answer_dialog(registry, state, None);
         }
         Outcome::Script(answer) => crate::scripting::answer_dialog(registry, state, answer),
+        Outcome::Stay(dialog) => state.dialog = Some(dialog),
+        Outcome::RunAndStay(id, params, dialog) => {
+            commands::run(registry, state, &id, &params);
+            // If the command had something to say, that is shown instead.
+            if state.dialog.is_none() {
+                state.dialog = Some(dialog);
+            }
+        }
         Outcome::Open(_) if dismissed => {}
         Outcome::Open(dialog) => state.dialog = Some(dialog),
         Outcome::Dismissed => {}
@@ -338,6 +367,323 @@ fn tag(
             direction,
             color,
         }),
+    }
+}
+
+fn preferences(ui: &mut Ui, mut draft: Preferences) -> Outcome {
+    ui.heading("Preferences");
+    Grid::new("preferences").num_columns(2).show(ui, |ui| {
+        ui.label("Theme");
+        egui::ComboBox::from_id_salt("preferences_theme")
+            .selected_text(match draft.theme {
+                ThemeKind::Dark => "Dark",
+                ThemeKind::Light => "Light",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut draft.theme, ThemeKind::Dark, "Dark");
+                ui.selectable_value(&mut draft.theme, ThemeKind::Light, "Light");
+            });
+        ui.end_row();
+
+        ui.label("Interface size")
+            .on_hover_text("How large text and controls are drawn. The sprite is not affected.");
+        let mut percent = (draft.ui_scale * 100.0).round();
+        let range = Preferences::UI_SCALES;
+        ui.add(
+            DragValue::new(&mut percent)
+                .range(range.start() * 100.0..=range.end() * 100.0)
+                .speed(5.0)
+                .suffix(" %"),
+        );
+        // Whole steps of 5 %, so that the number shown is the number used.
+        draft.ui_scale = (percent / 5.0).round() * 5.0 / 100.0;
+        ui.end_row();
+
+        ui.label("Undo memory")
+            .on_hover_text("How much memory the undo history of one sprite may use. The oldest steps are forgotten first.");
+        ui.add(
+            DragValue::new(&mut draft.history_mb)
+                .range(Preferences::HISTORY_MB)
+                .speed(8.0)
+                .suffix(" MB"),
+        );
+        ui.end_row();
+
+        ui.label("Autosave every")
+            .on_hover_text("Sprites with unsaved changes are copied to a recovery folder, and offered back after a crash. 0 turns this off.");
+        ui.add(
+            DragValue::new(&mut draft.autosave_minutes)
+                .range(Preferences::AUTOSAVE_MINUTES)
+                .speed(0.2)
+                .suffix(" min"),
+        );
+        ui.end_row();
+    });
+
+    match buttons(ui, "OK") {
+        (true, _) => {
+            let theme = match draft.theme {
+                ThemeKind::Dark => "dark",
+                ThemeKind::Light => "light",
+            };
+            let params = Params::new()
+                .with("theme", theme)
+                .with("ui_scale", f64::from(draft.ui_scale))
+                .with("history_mb", draft.history_mb)
+                .with("autosave_minutes", draft.autosave_minutes);
+            Outcome::Run("prefs.set".to_owned(), params)
+        }
+        (_, true) => Outcome::Dismissed,
+        _ => Outcome::Open(Dialog::Preferences(draft)),
+    }
+}
+
+/// Every command that can be run by a key, with its keys and the buttons to change them.
+fn keymap_editor(
+    ui: &mut Ui,
+    state: &AppState,
+    registry: &CommandRegistry<AppState>,
+    keymap: &Keymap,
+    mut filter: String,
+    capture: Option<String>,
+    note: String,
+) -> Outcome {
+    ui.set_min_width(520.0);
+    ui.heading("Keyboard Shortcuts");
+    let name_of = |id: &str| {
+        registry
+            .get(id)
+            .map_or_else(|| id.to_owned(), |command| command.name().to_owned())
+    };
+
+    // Waiting for the keys of one command: the next key press is the answer.
+    if let Some(command) = capture {
+        ui.label(format!("Press the new keys for \"{}\".", name_of(&command)));
+        ui.label(RichText::new("Escape cancels.").weak());
+        let pressed = ui.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => Some(egui::KeyboardShortcut::new(*modifiers, *key)),
+                _ => None,
+            })
+        });
+        return match pressed {
+            Some(shortcut) if shortcut.logical_key == egui::Key::Escape => {
+                Outcome::Stay(Dialog::Keymap {
+                    filter,
+                    capture: None,
+                    note,
+                })
+            }
+            Some(shortcut) => {
+                let keys = keymap::format_chord(shortcut);
+                // Read back the way the keymap will: Ctrl and Cmd are one modifier there.
+                let previous = keymap::parse_chord(&keys)
+                    .and_then(|shortcut| keymap.command_for(shortcut))
+                    .filter(|previous| *previous != command);
+                let note = match previous {
+                    Some(previous) => format!(
+                        "{keys} now runs \"{}\"; it was the key for \"{}\".",
+                        name_of(&command),
+                        name_of(previous)
+                    ),
+                    None => format!("{keys} now runs \"{}\".", name_of(&command)),
+                };
+                let params = Params::new()
+                    .with("command", command.as_str())
+                    .with("keys", keys.as_str());
+                let dialog = Dialog::Keymap {
+                    filter,
+                    capture: None,
+                    note,
+                };
+                Outcome::RunAndStay("keymap.bind".to_owned(), params, dialog)
+            }
+            None => Outcome::Open(Dialog::Keymap {
+                filter,
+                capture: Some(command),
+                note,
+            }),
+        };
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Find");
+        ui.add(egui::TextEdit::singleline(&mut filter).hint_text("part of a command's name"));
+    });
+    if !note.is_empty() {
+        ui.label(RichText::new(&note).weak());
+    }
+    let wanted = filter.to_lowercase();
+    let mut action = None;
+    let mut capture = None;
+    egui::ScrollArea::vertical()
+        .max_height(360.0)
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            Grid::new("keymap")
+                .num_columns(5)
+                .striped(true)
+                .show(ui, |ui| {
+                    for command in registry.iter().filter(|c| c.runs_without_params()) {
+                        let id = command.id();
+                        if !command.name().to_lowercase().contains(&wanted) {
+                            continue;
+                        }
+                        let keys: Vec<String> = keymap
+                            .shortcuts_for(id)
+                            .map(|shortcut| ui.ctx().format_shortcut(shortcut))
+                            .collect();
+                        ui.label(command.name()).on_hover_text(id);
+                        if keys.is_empty() {
+                            ui.label(RichText::new("—").weak());
+                        } else {
+                            ui.label(keys.join(", "));
+                        }
+                        if ui
+                            .small_button("Change…")
+                            .on_hover_text("Press the keys that should run this command")
+                            .clicked()
+                        {
+                            capture = Some(id.to_owned());
+                        }
+                        let clear = ui
+                            .add_enabled(!keys.is_empty(), egui::Button::new("Clear").small())
+                            .on_hover_text("Take its keys away");
+                        if clear.clicked() {
+                            action = Some(("keymap.clear", id.to_owned()));
+                        }
+                        if ui
+                            .small_button("Reset")
+                            .on_hover_text("Give it the keys it comes with")
+                            .clicked()
+                        {
+                            action = Some(("keymap.reset", id.to_owned()));
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    let _ = state;
+
+    ui.add_space(8.0);
+    let (reset_all, close) = ui
+        .horizontal(|ui| {
+            let reset_all = ui
+                .button("Reset All")
+                .on_hover_text("Every command gets the keys it comes with")
+                .clicked();
+            (reset_all, ui.button("Close").clicked())
+        })
+        .inner;
+
+    let stay = |capture: Option<String>, note: String| Dialog::Keymap {
+        filter: filter.clone(),
+        capture,
+        note,
+    };
+    if let Some((id, command)) = action {
+        let params = Params::new().with("command", command.as_str());
+        return Outcome::RunAndStay(id.to_owned(), params, stay(None, String::new()));
+    }
+    if reset_all {
+        let note = "Every command has the keys it comes with.".to_owned();
+        return Outcome::RunAndStay("keymap.reset".to_owned(), Params::new(), stay(None, note));
+    }
+    if close {
+        return Outcome::Dismissed;
+    }
+    Outcome::Open(stay(capture, note))
+}
+
+/// Asks what to do with the sprites a run that did not end normally left behind.
+fn recover(ui: &mut Ui, state: &AppState) -> Outcome {
+    ui.heading("Recover Unsaved Sprites");
+    let found = &state.recovery.found;
+    ui.label(match found.len() {
+        1 => "ACMS did not close properly last time. One sprite with unsaved changes was kept:"
+            .to_owned(),
+        count => format!(
+            "ACMS did not close properly last time. {count} sprites with unsaved changes were kept:"
+        ),
+    });
+    for leftover in found {
+        let label = ui.label(format!("  •  {}", leftover.title()));
+        if let Some(original) = &leftover.original {
+            label.on_hover_text(original.display().to_string());
+        }
+    }
+    ui.add_space(8.0);
+    let (recover, discard, later) = ui
+        .horizontal(|ui| {
+            let recover = ui
+                .button("Recover")
+                .on_hover_text("Open them as they were when they were last autosaved")
+                .clicked();
+            let discard = ui
+                .button("Discard")
+                .on_hover_text("Delete the kept copies")
+                .clicked();
+            let later = ui
+                .button("Later")
+                .on_hover_text("Keep the copies and ask again next time")
+                .clicked();
+            (recover, discard, later)
+        })
+        .inner;
+    if recover {
+        Outcome::Run("file.recover".to_owned(), Params::new())
+    } else if discard {
+        Outcome::Run(
+            "file.recover".to_owned(),
+            Params::new().with("discard", true),
+        )
+    } else if later {
+        Outcome::Dismissed
+    } else {
+        Outcome::Open(Dialog::Recover)
+    }
+}
+
+fn timelapse(ui: &mut Ui, state: &AppState, mut scale: u32, mut step_ms: u32) -> Outcome {
+    ui.heading("Export Timelapse");
+    ui.label("How the sprite was made, replayed from the undo history as a GIF.");
+    Grid::new("timelapse").num_columns(2).show(ui, |ui| {
+        ui.label("Scale");
+        ui.add(
+            DragValue::new(&mut scale)
+                .range(1..=MAX_EXPORT_SCALE)
+                .suffix("×"),
+        );
+        ui.end_row();
+
+        ui.label("Time per step");
+        ui.add(
+            DragValue::new(&mut step_ms)
+                .range(10..=2000)
+                .speed(5.0)
+                .suffix(" ms"),
+        );
+        ui.end_row();
+
+        if let Some(document) = state.editor.document() {
+            ui.label("Steps");
+            ui.label(document.history_cursor().to_string())
+                .on_hover_text("Undo steps since the sprite was opened. A very long history is thinned out to 400 pictures.");
+            ui.end_row();
+        }
+    });
+    match buttons(ui, "Export…") {
+        (true, _) => {
+            let params = Params::new().with("scale", scale).with("step_ms", step_ms);
+            Outcome::Run("file.export_timelapse".to_owned(), params)
+        }
+        (_, true) => Outcome::Dismissed,
+        _ => Outcome::Open(Dialog::Timelapse { scale, step_ms }),
     }
 }
 
@@ -688,8 +1034,21 @@ pub fn resolve_file_request(
     let text = |path: PathBuf| path.to_string_lossy().into_owned();
 
     let (command, params) = match request {
+        FileRequest::ImportAseprite => {
+            let picked = dialog
+                .add_filter("Aseprite file", &["aseprite", "ase"])
+                .pick_file();
+            let Some(path) = picked else { return };
+            (
+                "file.import_aseprite",
+                Params::new().with("path", text(path)),
+            )
+        }
         FileRequest::Open => {
-            let picked = dialog.add_filter("ACMS sprite", &["acms"]).pick_file();
+            let picked = dialog
+                .add_filter("Sprites", &["acms", "aseprite", "ase"])
+                .add_filter("ACMS sprite", &["acms"])
+                .pick_file();
             let Some(path) = picked else { return };
             ("file.open", Params::new().with("path", text(path)))
         }

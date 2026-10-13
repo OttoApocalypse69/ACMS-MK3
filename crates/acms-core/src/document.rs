@@ -1283,6 +1283,39 @@ impl Document {
         while self.cursor < cursor && self.redo() {}
     }
 
+    /// Shows the sprite as it was after each of the given numbers of undo steps (0 is the
+    /// oldest state the history still knows; [`Document::history_cursor`] is now), in the
+    /// order given, and then puts everything back as it was. For replaying how a sprite was
+    /// made.
+    ///
+    /// Does nothing while an undo group is open.
+    pub fn replay(&mut self, steps: &[usize], mut each: impl FnMut(&Sprite)) {
+        if self.group.is_some() {
+            return;
+        }
+        let now = (
+            self.cursor,
+            self.active_layer,
+            self.active_frame,
+            self.active_slice,
+            self.damage,
+        );
+        for &step in steps {
+            self.jump_to(step);
+            each(&self.sprite);
+        }
+        // Going back and forth changes nothing, so nothing needs to be redrawn either.
+        self.jump_to(now.0);
+        (
+            _,
+            self.active_layer,
+            self.active_frame,
+            self.active_slice,
+            self.damage,
+        ) = now;
+        self.repair_active_layer();
+    }
+
     /// A number that identifies the current state of the sprite: it changes with every edit,
     /// and undoing back to an earlier state brings the earlier number back.
     pub fn revision(&self) -> u64 {
@@ -1389,6 +1422,41 @@ mod tests {
         assert!(doc.redo());
         assert_eq!(*doc.sprite(), after, "redo did not restore the edit");
         value
+    }
+
+    #[test]
+    fn replaying_shows_every_state_and_puts_everything_back() {
+        let mut doc = document();
+        let mut states = vec![doc.sprite().clone()];
+        paint(&mut doc, "One", Rect::new(0, 0, 2, 2), Rgba8::BLACK);
+        states.push(doc.sprite().clone());
+        let upper = doc
+            .transact("Layer", |tx| tx.add_layer(top(1), "Upper", false))
+            .unwrap();
+        states.push(doc.sprite().clone());
+        doc.transact("Frame", |tx| tx.add_frame(1, None)).unwrap();
+        states.push(doc.sprite().clone());
+        paint_on(&mut doc, upper, "Two", Rect::new(4, 4, 2, 2), Rgba8::WHITE);
+        // One step that was undone: it is not part of how the sprite got here.
+        doc.undo();
+        doc.set_active_layer(upper);
+        doc.set_active_frame(1);
+        doc.take_damage();
+        let (revision, history) = (doc.revision(), doc.history().len());
+
+        let mut seen = Vec::new();
+        doc.replay(&[0, 1, 2, 3], |sprite| seen.push(sprite.clone()));
+        assert_eq!(seen, states);
+        // Any order and any choice of steps, also ones that do not exist.
+        let mut seen = Vec::new();
+        doc.replay(&[3, 0, 99], |sprite| seen.push(sprite.clone()));
+        assert_eq!(seen[..2], [states[3].clone(), states[0].clone()]);
+
+        assert_eq!(*doc.sprite(), states[3]);
+        assert_eq!((doc.revision(), doc.history().len()), (revision, history));
+        assert_eq!((doc.active_layer(), doc.active_frame()), (upper, 1));
+        assert!(doc.can_redo());
+        assert!(doc.take_damage().is_empty());
     }
 
     #[test]

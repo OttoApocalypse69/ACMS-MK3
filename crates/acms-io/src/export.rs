@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use acms_core::compositor;
+use acms_core::document::Document;
 use acms_core::geom::{Point, Rect};
 use acms_core::image::Image;
 use acms_core::sprite::Sprite;
@@ -70,6 +71,117 @@ pub fn export_gif<W: Write>(
         encoder.write_frame(&frame)?;
     }
     Ok(())
+}
+
+/// How the undo history is replayed into a GIF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimelapseOptions {
+    /// Whole-number enlargement.
+    pub scale: u32,
+    /// How long each step is shown, in milliseconds.
+    pub step_ms: u32,
+    /// How long the finished picture is shown before the GIF starts over.
+    pub hold_ms: u32,
+    /// Most frames the GIF may have; a longer history is thinned out evenly.
+    pub max_frames: usize,
+}
+
+impl Default for TimelapseOptions {
+    fn default() -> Self {
+        Self {
+            scale: 1,
+            step_ms: 100,
+            hold_ms: 2000,
+            max_frames: 400,
+        }
+    }
+}
+
+/// Which of the states `0..=last` a timelapse of at most `max` frames shows: all of them if
+/// they fit, otherwise evenly spaced ones, always with the first and the last.
+fn timelapse_steps(last: usize, max: usize) -> Vec<usize> {
+    let max = max.max(2);
+    if last < max {
+        return (0..=last).collect();
+    }
+    (0..max).map(|index| index * last / (max - 1)).collect()
+}
+
+/// Writes how the sprite was made as a looping GIF: one picture for the sprite as it was
+/// when the history begins, and one after every undo step up to now. Shows the frame the
+/// document is showing. Returns the number of pictures written.
+///
+/// The document is walked back and forth through its history and left exactly as it was.
+/// The limits of [`export_gif`] apply; if the canvas changed size on the way, the GIF is as
+/// large as the largest and smaller states sit in its top left corner.
+pub fn export_timelapse<W: Write>(
+    document: &mut Document,
+    options: TimelapseOptions,
+    writer: W,
+) -> Result<usize, IoError> {
+    check_scale(options.scale)?;
+    let now = document.history_cursor();
+    if now == 0 {
+        return Err(unsupported(
+            "there is nothing to replay: the sprite has not been changed since it was opened",
+        ));
+    }
+    if document.in_group() {
+        return Err(unsupported("the history cannot be replayed right now"));
+    }
+    let steps = timelapse_steps(now, options.max_frames);
+    let shown = document.active_frame();
+
+    let (mut width, mut height) = (0, 0);
+    document.replay(&steps, |sprite| {
+        width = sprite.width().max(width);
+        height = sprite.height().max(height);
+    });
+    let side = |pixels: u32| {
+        u16::try_from(pixels * options.scale)
+            .map_err(|_| unsupported("the picture is too large for a GIF"))
+    };
+    let (gif_width, gif_height) = (side(width)?, side(height)?);
+
+    let mut encoder = gif::Encoder::new(writer, gif_width, gif_height, &[])?;
+    encoder.set_repeat(gif::Repeat::Infinite)?;
+    let mut result = Ok(());
+    let mut written = 0;
+    document.replay(&steps, |sprite| {
+        if result.is_err() {
+            return;
+        }
+        let frame = shown.min(sprite.frames().len() - 1);
+        let mut canvas = Image::new(width, height);
+        canvas.blit(&compositor::compose(sprite, frame), Point::new(0, 0));
+        let mut rgba = canvas.scaled_up(options.scale).to_rgba_bytes();
+        let mut picture = gif::Frame::from_rgba_speed(gif_width, gif_height, &mut rgba, 10);
+        written += 1;
+        let ms = if written == steps.len() {
+            options.hold_ms
+        } else {
+            options.step_ms
+        };
+        picture.delay = ((ms + 5) / 10).clamp(1, u32::from(u16::MAX)) as u16;
+        picture.dispose = gif::DisposalMethod::Background;
+        result = encoder.write_frame(&picture);
+    });
+    result?;
+    Ok(written)
+}
+
+/// [`export_timelapse`] into a file.
+pub fn export_timelapse_to_path(
+    document: &mut Document,
+    options: TimelapseOptions,
+    path: &Path,
+) -> Result<usize, IoError> {
+    let mut written = 0;
+    write_atomically(path, |file| {
+        written = export_timelapse(document, options, file)?;
+        Ok(())
+    })?;
+    Ok(written)
 }
 
 /// [`export_gif`] into a file.
@@ -973,5 +1085,112 @@ mod tests {
             std::fs::remove_file(file).unwrap();
         }
         assert!(!target.path().exists());
+    }
+
+    #[test]
+    fn a_timelapse_shows_the_sprite_after_every_step() {
+        use acms_core::color::Rgba8;
+        use acms_core::sprite::LayerId;
+        let mut document = Document::new(Sprite::new(6, 4).unwrap());
+        let colors = [
+            Rgba8::rgb(200, 0, 0),
+            Rgba8::rgb(0, 200, 0),
+            Rgba8::rgb(0, 0, 200),
+        ];
+        let mut states = vec![compositor::compose(document.sprite(), 0)];
+        for (index, color) in colors.into_iter().enumerate() {
+            let dot = Image::from_pixels(1, 1, vec![color]).unwrap();
+            document
+                .transact("Dot", |tx| {
+                    tx.set_pixels(LayerId(1), 0, Rect::new(index as i32, 1, 1, 1), &dot)
+                })
+                .unwrap();
+            states.push(compositor::compose(document.sprite(), 0));
+        }
+        // A step that was undone is not part of the story.
+        document.undo();
+        states.pop();
+        let before = (document.sprite().clone(), document.revision());
+
+        let options = TimelapseOptions {
+            scale: 2,
+            step_ms: 80,
+            hold_ms: 1500,
+            max_frames: 100,
+        };
+        let mut bytes = Vec::new();
+        assert_eq!(
+            export_timelapse(&mut document, options, &mut bytes).unwrap(),
+            3
+        );
+        let frames = decode_gif(&bytes);
+        assert_eq!(frames.len(), 3);
+        for (frame, state) in frames.iter().zip(&states) {
+            assert_eq!(frame.0, state.scaled_up(2));
+        }
+        let delays: Vec<u16> = frames.iter().map(|frame| frame.1).collect();
+        assert_eq!(delays, [8, 8, 150]);
+        // The document is where it was, redo step and all.
+        assert_eq!((document.sprite().clone(), document.revision()), before);
+        assert!(document.can_redo());
+    }
+
+    #[test]
+    fn a_long_history_is_thinned_and_a_changing_canvas_fits() {
+        assert_eq!(timelapse_steps(3, 10), [0, 1, 2, 3]);
+        assert_eq!(timelapse_steps(9, 10), (0..=9).collect::<Vec<_>>());
+        assert_eq!(timelapse_steps(100, 5), [0, 25, 50, 75, 100]);
+        assert_eq!(timelapse_steps(7, 0), [0, 7]);
+        let many = timelapse_steps(12_345, 400);
+        assert_eq!((many.len(), many[0], many[399]), (400, 0, 12_345));
+        assert!(many.windows(2).all(|pair| pair[0] < pair[1]));
+
+        use acms_core::color::Rgba8;
+        use acms_core::sprite::LayerId;
+        let mut document = Document::new(Sprite::new(4, 4).unwrap());
+        let fill = Image::from_pixels(4, 4, vec![Rgba8::rgb(9, 9, 9); 16]).unwrap();
+        document
+            .transact("Fill", |tx| {
+                tx.set_pixels(LayerId(1), 0, Rect::new(0, 0, 4, 4), &fill)
+            })
+            .unwrap();
+        document
+            .transact("Shrink", |tx| tx.resize_canvas(2, 3, 0, 0))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let options = TimelapseOptions::default();
+        assert_eq!(
+            export_timelapse(&mut document, options, &mut bytes).unwrap(),
+            3
+        );
+        let frames = decode_gif(&bytes);
+        // As large as the largest state; the smaller one sits in the corner.
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.0.bounds() == Rect::new(0, 0, 4, 4))
+        );
+        assert_eq!(frames[2].0.get(1, 2), Rgba8::rgb(9, 9, 9));
+        assert_eq!(frames[2].0.get(2, 2), Rgba8::TRANSPARENT);
+        assert_eq!(frames[2].0.get(1, 3), Rgba8::TRANSPARENT);
+        assert_eq!(
+            (document.sprite().width(), document.sprite().height()),
+            (2, 3)
+        );
+    }
+
+    #[test]
+    fn a_timelapse_needs_a_history() {
+        let mut document = Document::new(Sprite::new(4, 4).unwrap());
+        let mut bytes = Vec::new();
+        let options = TimelapseOptions::default();
+        let err = export_timelapse(&mut document, options, &mut bytes).unwrap_err();
+        assert!(err.to_string().contains("nothing to replay"), "{err}");
+        let no_scale = TimelapseOptions {
+            scale: 0,
+            ..options
+        };
+        assert!(export_timelapse(&mut document, no_scale, &mut bytes).is_err());
+        assert!(bytes.is_empty());
     }
 }

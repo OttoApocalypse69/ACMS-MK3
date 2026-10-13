@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 acms-core = { version = "0.1.0", path = "../acms-core" }
+aseprite-loader = "0.4.2"
 gif = "0.14.2"
 png = "0.18.1"
 serde = { version = "1.0.229", features = ["derive"] }

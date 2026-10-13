@@ -5,11 +5,39 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 ## Current state
 
 **Phases 0 to 7 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
-features, animation, game-dev features, scripting). Next is Phase 8 (not started).
+features, animation, game-dev features, scripting). **Phase 8 (polish) is in progress.**
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directories 6, serde 1,
 serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4).
+
+## Phase 8 task list
+
+`PLAN.md` gives Phase 8 no "Done when"; it is done when every item below is.
+
+Performance (new target, 2026-10-14):
+
+- [ ] Measure a frame of the whole app while drawing on a 512 × 512 sprite with 20 layers; get it under 8.3 ms (120 fps) and keep a test that measures it
+
+Settings:
+
+- [ ] Preferences file and dialog (theme, interface scale, pixel grid, history memory, autosave interval)
+- [ ] Keymap editor: see every command and its keys, rebind, clear, reset; saved to the keymap file
+- [ ] Layout presets, and the layout kept between runs
+
+Files:
+
+- [ ] Recent files (File → Open Recent)
+- [ ] Autosave to a recovery folder; offer recovery after a crash
+- [ ] Drag and drop a file onto the window to open it
+- [ ] Import `.aseprite` / `.ase` (evaluate existing crates first)
+- [ ] Timelapse export: the undo history replayed as a GIF
+
+Finish:
+
+- [ ] Hi-DPI check, light theme check, empty states, tooltips everywhere
+- [ ] Release profile, CI workflow building Windows and Linux, README with screenshots, scripting docs linked
+- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
 
 ## Phase 7 task list (done)
 
@@ -635,16 +663,13 @@ written into `PLAN.md`: adding and removing palette colours stays; dragging a sw
 the palette was added to Phase 4 and built (`palette.move_color`); section 4.1 now describes the
 reference layer as built.
 
-Open after Phase 7:
+The three questions left by Phase 7 were settled on 2026-10-14 ("you can keep your
+changes/decisions") and written into `PLAN.md`: the five additions to the scripting API, the
+10 second / 256 MB limits, and a user script replacing the example of the same name.
 
-1. The scripting API has five things the plan's list does not name, each needed by one of the
-   plan's own example scripts: `cel:set_image`, `app.active_layer` / `active_frame` /
-   `active_cel`, `sprite.tags`, `app.choose_folder` and `app.join_path`. Should the Phase 7
-   list in `PLAN.md` name them?
-2. A script may run for 10 seconds and use 256 MB before it is stopped. The plan asks only
-   that a script cannot crash the app. Keep the limits, change the numbers, or drop them?
-3. A file in the user's scripts folder with the name of a bundled example replaces the
-   example. Keep that, or load both and report the clash of ids?
+On the same day the performance target in `PLAN.md` 4.6 was changed from 60 to 120 fps.
+
+None open.
 
 ## The keymap file
 

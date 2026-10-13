@@ -161,7 +161,7 @@ Pencil, eraser, line, rectangle, ellipse (outline and filled), bucket fill (cont
 - The app uploads that buffer to a texture and draws it with nearest filtering.
 - Overlays are drawn on top with egui's painter: pixel grid, tile grid, selection outline (marching ants), symmetry axes, onion skin (as extra composited frames with tint), slices, tool preview.
 - Zoom is integer steps when zoomed in (1×, 2×, 3× …), centred on the cursor. Pan with middle mouse or space + drag.
-- Target: 60 fps while drawing on a 512×512 sprite with 20 layers; app start under 1 second.
+- Target: 120 fps while drawing on a 512×512 sprite with 20 layers (a frame of the whole app in under 8.3 ms); app start under 1 second.
 
 ### 4.7 Project file: `.acms`
 
@@ -260,12 +260,13 @@ Work through the phases in order. The app must build and run at the end of every
 ### Phase 7 — Scripting
 - Lua host in `acms-script`. Scripts folder in the user config directory, plus bundled examples. Reload without restarting.
 - API (keep it small and documented):
-  - `app.command(id, params)`, `app.active_sprite`, `app.fg_color` / `bg_color`
-  - `sprite`: size, layers, frames, palette, selection; `cel:get_pixel` / `set_pixel` / `image`
+  - `app.command(id, params)`, `app.active_sprite`, `app.active_layer` / `active_frame` / `active_cel`, `app.fg_color` / `bg_color`
+  - `sprite`: size, layers, frames, palette, selection, tags; `cel:get_pixel` / `set_pixel` / `image` / `set_image`
   - `app.transaction(name, fn)` — everything inside is one undo step
   - `register_command{ id, name, run }`, `register_filter{...}`, `register_tool{ on_down, on_move, on_up }`
   - a small dialog builder (number, colour, text, checkbox, dropdown) for script parameters
-- Sandbox: no `os`, no `io`, no `debug`, no loading native modules. File access only through an explicit, user-confirmed API.
+- Sandbox: no `os`, no `io`, no `debug`, no loading native modules. File access only through an explicit, user-confirmed API (`app.choose_folder`, then file names inside that folder). A script is stopped after 10 seconds or 256 MB.
+- A file in the user's scripts folder with the name of a bundled example replaces the example.
 - Script console panel (REPL + output), errors shown with file and line, a script can never crash the app.
 - Bundled examples: outline filter, palette swap, mirror sprite, "export every tag as separate GIF", a custom spray tool.
 

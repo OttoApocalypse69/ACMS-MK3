@@ -4,40 +4,141 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phases 0 to 7 are done** (skeleton, drawing, layers, selections and shape tools, pro pixel
-features, animation, game-dev features, scripting). **Phase 8 (polish) is in progress.**
+**Phases 0 to 8 are done**: every phase of `PLAN.md`. What is left is the plan's "Later /
+optional" list, the items under "Deferred from the plan's description" below, and the things
+marked "not checked by me" in each phase.
 
 Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's default),
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directories 6, serde 1,
-serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4).
+serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4),
+aseprite-loader 0.4.
 
-## Phase 8 task list
+## Phase 8 task list (done)
 
 `PLAN.md` gives Phase 8 no "Done when"; it is done when every item below is.
 
 Performance (new target, 2026-10-14):
 
-- [ ] Measure a frame of the whole app while drawing on a 512 × 512 sprite with 20 layers; get it under 8.3 ms (120 fps) and keep a test that measures it
+- [x] Measure a frame of the whole app while drawing on a 512 × 512 sprite with 20 layers; get it under 8.3 ms (120 fps) and keep a test that measures it
 
 Settings:
 
-- [ ] Preferences file and dialog (theme, interface scale, pixel grid, history memory, autosave interval)
-- [ ] Keymap editor: see every command and its keys, rebind, clear, reset; saved to the keymap file
-- [ ] Layout presets, and the layout kept between runs
+- [x] Preferences file and dialog (theme, interface size, undo memory, autosave interval)
+- [x] Keymap editor: see every command and its keys, rebind, clear, reset; saved to the keymap file
+- [x] Layout presets, and the layout kept between runs
 
 Files:
 
-- [ ] Recent files (File → Open Recent)
-- [ ] Autosave to a recovery folder; offer recovery after a crash
-- [ ] Drag and drop a file onto the window to open it
-- [ ] Import `.aseprite` / `.ase` (evaluate existing crates first)
-- [ ] Timelapse export: the undo history replayed as a GIF
+- [x] Recent files (File → Open Recent)
+- [x] Autosave to a recovery folder; offer recovery after a crash
+- [x] Drag and drop a file onto the window to open it
+- [x] Import `.aseprite` / `.ase` (evaluated existing crates first)
+- [x] Timelapse export: the undo history replayed as a GIF
 
 Finish:
 
-- [ ] Hi-DPI check, light theme check, empty states, tooltips everywhere
-- [ ] Release profile, CI workflow building Windows and Linux, README with screenshots, scripting docs linked
-- [ ] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass; commits along the way
+- [x] Hi-DPI check, light theme check, empty states, tooltips everywhere
+- [x] Release profile, CI workflow building Windows and Linux, README with screenshots, scripting docs linked
+- [x] `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` pass (532 tests, 2 measurements); commits along the way
+
+### The 120 fps target
+
+Measured on this machine (12 logical cores) with the release build, on a 512 × 512 sprite
+with 20 layers that all cover the whole canvas: an opaque background and 19 translucent layers
+above it. One frame here is the whole app short of the GPU: UI, compositor, tessellation.
+
+| | Before | Now | Budget |
+|---|---|---|---|
+| A frame while drawing (mean / 99th percentile) | 0.8 / 1.7 ms | 0.8 / 1.3 ms | 8.3 ms |
+| An idle frame | 0.7 ms | 0.6 ms | 8.3 ms |
+| A frame that flattens the whole canvas again | 40 ms | 5.7 ms | 8.3 ms |
+| Showing a frame of the animation again | 40 ms | 2.1 ms | 8.3 ms |
+
+Drawing was already inside the budget, because only the changed rectangle is flattened and
+uploaded. What was not: anything that redraws the whole canvas (a frame change, hiding a layer,
+an undo of a large step) took 40 ms, five frames at 120 fps. Three changes:
+
+- **Flattening runs on up to 8 threads**, in bands of rows, when there is enough to do
+  (more than 200 000 pixel-layers; a stroke's damage is far below that and stays on one).
+- **Blending onto an opaque pixel needs no division** and works out red and blue together.
+  It gives exactly the same values: a test compares it with the general rule for every
+  alpha, source and (every third) backdrop value.
+- **The pictures of frames already shown are kept** while the sprite does not change, so
+  playing an animation flattens each frame once, not once per loop.
+
+The picture is identical bit for bit: the golden images pass unchanged, and a test compares 1,
+2, 3, 8, 64 and 1000 threads with each other and with a plain pixel-by-pixel reference.
+
+`frame_time_while_drawing_on_a_large_sprite` (ignored by default; the README says how to run
+it) enforces the budget in a release build. Not covered: the GPU side (texture upload and
+drawing), which a headless test cannot see; a sprite where nothing is opaque flattens in about
+8 ms rather than 4; and other machines.
+
+### How Phase 8 was checked
+
+- **Preferences**: set, clamped into range, written, read by the next start; a broken file and
+  a file from another version; the undo memory reaching open and new sprites; the interface
+  size reaching the window, with drawing still landing on the right pixel at 150 %.
+- **Keymap editor**: binding, clearing and resetting work at once and are in the keymap file
+  for the next start; the file holds only what differs from the defaults and reads back to the
+  same keymap (also bindings with arguments); the dialog takes the next key press, says which
+  command lost the key, and Escape cancels the waiting without closing the dialog.
+- **Layouts**: the two presets and the default, each saved and restored by a fresh start; a
+  panel the user closed stays closed; a saved layout without a canvas, or unreadable, is not
+  used and does not take the recent files with it.
+- **Recent files**: newest first, ten at most, no duplicates, remembered, cleared; a file
+  that failed to open is not listed.
+- **Autosave and recovery**: copies are written only for sprites with unsaved changes, follow
+  further changes, and go away on save, close and normal exit; the interval follows the
+  preferences and "off" is off; after a simulated crash the next start asks, Recover brings
+  both sprites back as unsaved with their own file names and leaves the files on disk alone,
+  Discard deletes the copies, Later keeps them; a damaged copy is reported and kept.
+- **Drag and drop**: a dropped `.acms` and a dropped `.aseprite` open; something else says so.
+- **Aseprite import**: seven files saved by Aseprite itself are imported and each frame is
+  compared pixel by pixel with the parser's own rendering; a hand-built file covers what those
+  lack (nested groups, hidden and locked layers, linked cels and a link to a link, cel opacity,
+  a cel reaching outside the canvas, tag directions, slices with 9-slice centre and pivot, a
+  tilemap layer). Every real file cut short at every 7th byte and with every 3rd byte flipped
+  gives an error or a sprite, never a crash. An imported sprite survives save and load.
+- **Timelapse**: the pictures in the GIF are the sprite after each undo step, with the right
+  delays; an undone step is left out; a long history is thinned evenly; a canvas that changed
+  size fits; the document, its history and its redo steps are exactly as before.
+- **In the real window**: the empty state, the light theme, the Preferences, Keyboard
+  Shortcuts and Recover dialogs, the interface at 150 %, the Animation and Drawing layouts, and
+  a layout written to a file and read back. The release build shows its window in under half a
+  second.
+- **Not checked by me**:
+  - **The Linux build.** The workflow in `.github/workflows/ci.yml` has never run (the
+    repository has no remote), and the list of Linux packages in it and in the README is from
+    the libraries' documentation, not from a build.
+  - A real high-DPI display (only the interface size setting at 150 % in a normal window).
+  - Dropping a file with a real mouse, the native file dialogs of Import and Timelapse, the
+    keymap editor and the Preferences dialog clicked by hand, the Open Recent submenu.
+  - A real crash: recovery was tested by dropping the app without closing it.
+  - An exported timelapse opened in a browser; an Aseprite file from a current Aseprite with
+    tilemaps or newer features.
+  - 120 fps on screen: the measurement stops before the GPU.
+
+### Known limits of Phase 8
+
+- **Autosave copies are found by any running copy of the app.** A second window started while
+  the first has unsaved work will offer to recover the first one's sprites.
+- **A recovered sprite has no undo history**, and neither has an imported one.
+- **Aseprite import** leaves out tilemap layers, user data and cel z-order; blend modes ACMS
+  does not have become Normal; a slice keeps only its first frame; tag colours from newer
+  files come out black. Each of these that applies is said in a message after importing. There
+  is no export to Aseprite.
+- **A timelapse covers the undo history**, which starts when the sprite was opened and is cut
+  by the undo memory limit. It shows one frame of an animation (the one on screen), at most
+  400 pictures, and has the limits of a GIF.
+- **The keymap editor** changes keys of commands that run without arguments. Bindings with
+  arguments (from the keymap file) are kept but not shown. It does not warn before a key is
+  taken from another command; it says so afterwards.
+- **The layout is saved when the app closes** and when a preset is chosen, not continuously.
+  There is no way to name and save a layout of one's own.
+- **The interface size applies from the next frame** and the canvas is not re-fitted.
+- **Opening a PNG as a sprite is still not possible** (only as a reference or a palette).
+- No installer and no application icon; the release is the bare executable.
 
 ## Phase 7 task list (done)
 
@@ -626,6 +727,23 @@ App (`acms-app`):
 - **Tile 0 is "no tile"**, tiles count from 1, and Tiled's global tile numbers follow directly.
 - **Slices are not per frame** and are stored in the sprite, undoable, saved in the file.
 - **`.acms` format version 5.** Versions 1 to 4 are upgraded when loaded.
+- **The compositor may use threads.** `acms-core` still has no UI and no file access; threads
+  are plain `std::thread::scope`, no new dependency.
+- **Aseprite files are read with `aseprite-loader`** (0.4, MIT OR Apache-2.0, updated in 2026,
+  no heavy dependencies). `asefile` was the alternative: older, and it pulls in the `image`
+  crate. Only its parser is used; turning chunks into a sprite is ours, because its own
+  loader refuses files with tilemap layers. The parser is called inside `catch_unwind`: it is
+  third-party code reading untrusted files.
+- **Settings are three small JSON files** next to the keymap (`preferences.json`,
+  `session.json`) rather than eframe's own persistence, so they can be read and edited, and
+  a broken one costs only itself.
+- **Commands cannot reach the keymap** (it is not part of the state they act on), so
+  `keymap.*` commands leave a request that the app carries out at the start of the next frame.
+  Reload Scripts works the same way.
+- **Autosave writes on a background thread**, from a clone of the sprite (which shares its
+  pictures), so that saving a large sprite never costs a frame.
+- **Recovery copies live in the local data folder**, not in the configuration folder: they
+  are large and belong to one machine.
 - **Scripts reach the app through one trait** (`acms_script::Host`): the editor, "run this
   command", "ask for a folder". The script crate never sees app types; the app wraps each
   script command as an ordinary registry command that asks for the script to be run.
@@ -743,6 +861,11 @@ are in the Tools panel. The Script Console (a tab at the bottom) shows what scri
 runs a line of Lua on Enter. Your own scripts go in the folder the console names when the app
 starts; `scripts/API.md` describes what a script can do.
 
+Settings: Edit → Preferences… (theme, interface size, undo memory, autosave) and Edit →
+Keyboard Shortcuts… (find a command, Change… and press the new keys). View has the three
+layouts. File → Open Recent lists the last ten files; a file dropped on the window is opened;
+File → Export Timelapse… replays the undo history as a GIF.
+
 Palette panel: click a swatch for the primary colour, right click for the secondary one. Ctrl
 click adds a swatch to the selection, Shift click selects a run; "Ramp" makes a ramp from the
 selected swatches in the order they were picked. Everything else about the palette is in the
@@ -767,8 +890,9 @@ Described in `PLAN.md` but not part of the "Done when" of a finished phase:
   typeface is still egui's bundled one and tools are text buttons; `assets/` does not exist yet.
 - **`log` crate wiring** (2). The Log panel shows lines written by commands; the `log` facade is
   not hooked up to it yet.
-- **Saved layouts** (5). The layout resets on restart.
 - The `assets/` folder is created when it first has content.
+- **Autosave "every N minutes"** (4.7) is done; **"layouts are saved and restorable"** (5) is
+  done as "kept between runs, plus three presets", without user-named layouts.
 
 ## Notes for later phases
 
@@ -809,12 +933,11 @@ Described in `PLAN.md` but not part of the "Done when" of a finished phase:
   exact in binary (multiples of 1/8 s): `10.1 - 10.05` is a hair under 50 ms.
 - Phase 6 will add tilemap layers: `Sprite::check_cel` is the gate for "has pixels", and the
   Timeline shows cels only for layers that pass `as_image()`.
-- Phase 8 (keymap editor): script commands are in the registry like any other and can be
-  listed and bound the same way; they disappear and come back on Reload Scripts.
-- Phase 8 (timelapse): `Document::begin_group` / `end_group` fold steps; replaying history
-  sees a script's work as one step.
-- Phase 8 (user docs for scripting): `scripts/API.md` is the reference, and its examples are
-  run by a test (`the_examples_in_the_api_description_run`).
+- A JSON file cannot hold an infinite number: `DockState` has some (the rectangles of panels
+  never shown), they are written as `null`, and `settings::mend` puts numbers back on load.
+- `ctx.set_zoom_factor` takes effect a frame later; tests have to run a frame or two.
+- Timing tests are `#[ignore]`d and only assert in release builds; run them with `--release`.
+- A commit chained after clippy with `;` goes through even when clippy fails; chain with `&&`.
 - `Editor::document_mut` abandons the stroke in progress; `document_mut_by_id` does not. Code
   that changes the document from inside a tool's own stroke must use the second.
 - Bash heredocs in this environment break on apostrophes; write scripts to files instead.
@@ -848,6 +971,12 @@ None known.
 - Convert an image layer to a tilemap; share a tileset from the dialog; reorder tiles.
 - Slice handles on the canvas, a slice list, per-frame slices.
 - Import a tileset picture or a Tiled map.
+- Open a PNG as a new sprite; export to Aseprite; import Aseprite tilemaps.
+- Named layouts of the user's own; a warning before a key is taken from another command.
+- A timelapse of all frames, or as a video; keep the undo history in the file so a timelapse
+  can span sessions.
+- An application icon and installers; the `log` crate wired to the Log panel; an icon set.
+- Autosave copies tied to the running process, so two windows do not see each other's.
 - Scripts: a button that opens the scripts folder; a history for the console line; filters
   with a parameter dialog and a live preview; script commands with arguments; tool options
   and a brush preview for script tools; `sprite` objects for sprites other than the active

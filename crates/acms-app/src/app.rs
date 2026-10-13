@@ -110,6 +110,8 @@ impl AcmsApp {
         state.log.extend(log);
         theme::install(ctx, state.theme);
 
+        theme::install(ctx, state.theme);
+
         Ok(Self {
             registry,
             keymap,

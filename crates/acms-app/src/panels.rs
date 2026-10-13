@@ -106,7 +106,7 @@ pub fn animation_layout() -> DockState<Panel> {
 
     let [main, _bottom] = tree.split_below(main, 0.6, vec![Timeline, Tileset, ScriptConsole, Log]);
     let [_canvas, tools] = tree.split_left(main, 0.17, vec![Tools]);
-    tree.split_below(tools, 0.8, vec![ToolOptions]);
+    tree.split_below(tools, 0.88, vec![ToolOptions]);
 
     dock
 }
@@ -262,6 +262,8 @@ fn tools(ui: &mut Ui, state: &mut AppState, registry: &Registry, keymap: &Keymap
         // Compact rows: the whole list should fit without scrolling in the default layout.
         ui.spacing_mut().item_spacing.y = 1.0;
         ui.spacing_mut().interact_size.y = 22.0;
+        // A name that does not fit is cut short rather than broken over two rows.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ui.spacing_mut().button_padding.y = 2.0;
         for (id, name) in tools {
             let command = format!("tool.{id}");
@@ -288,7 +290,27 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
     // A checkbox that runs a command with its new value.
     let toggle = |ui: &mut Ui, state: &mut AppState, on: bool, label: &str, id: &str, arg: &str| {
         let mut value = on;
-        if ui.checkbox(&mut value, label).changed() {
+        let tip = match id {
+            "tool.set_pixel_perfect" => {
+                "Leaves out the corner pixels of a freehand line, so it stays one pixel thin"
+            }
+            "tool.set_filled" => "Fill the shape instead of drawing its outline",
+            "tool.set_contiguous" => {
+                "Only the area connected to the pixel clicked, not every pixel of that colour"
+            }
+            "tool.set_dither" => {
+                "Blend the two colours with a pattern instead of in-between colours"
+            }
+            "tile.toggle_mode" => {
+                "Drawing on a tilemap changes the tile, and with it every place the tile is used. Off: only the Tile Stamp changes a tilemap"
+            }
+            _ => "",
+        };
+        let mut response = ui.checkbox(&mut value, label);
+        if !tip.is_empty() {
+            response = response.on_hover_text(tip);
+        }
+        if response.changed() {
             commands::run(registry, state, id, &Params::new().with(arg, value));
         }
     };
@@ -307,7 +329,10 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                         ui.label("Brush size");
                         let mut size = brush.size();
                         ui.spacing_mut().slider_width = slider_width(ui);
-                        if ui.add(Slider::new(&mut size, 1..=MAX_BRUSH_SIZE)).changed() {
+                        let slider = ui
+                            .add(Slider::new(&mut size, 1..=MAX_BRUSH_SIZE))
+                            .on_hover_text("How many pixels wide the brush is");
+                        if slider.changed() {
                             let params = Params::new().with("size", size);
                             commands::run(registry, state, "brush.set_size", &params);
                         }
@@ -321,7 +346,15 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                     ];
                     for (shape, label, value) in shapes {
                         let selected = !brush.is_custom() && brush.shape() == shape;
-                        if ui.selectable_label(selected, label).clicked() {
+                        let tip = match shape {
+                            BrushShape::Round => "A round brush",
+                            BrushShape::Square => "A square brush",
+                        };
+                        if ui
+                            .selectable_label(selected, label)
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
                             let params = Params::new().with("shape", value);
                             commands::run(registry, state, "brush.set_shape", &params);
                         }
@@ -332,8 +365,14 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                 ui.label("Ink");
                 ui.horizontal_wrapped(|ui| {
                     for ink in InkKind::ALL {
+                        let tip = match ink {
+                            InkKind::Simple => "Paints the colour",
+                            InkKind::Dither => "Paints a pattern of the primary and the secondary colour",
+                            InkKind::Shade => "Moves each pixel one step along its palette ramp: lighter with the primary button, darker with the secondary",
+                        };
                         if ui
                             .selectable_label(options.ink == ink, ink.name())
+                            .on_hover_text(tip)
                             .clicked()
                         {
                             let params = Params::new().with("ink", ink.id());
@@ -387,7 +426,10 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                 ui.label("Tolerance");
                 let mut tolerance = u32::from(options.tolerance);
                 ui.spacing_mut().slider_width = slider_width(ui);
-                if ui.add(Slider::new(&mut tolerance, 0..=255)).changed() {
+                let slider = ui
+                    .add(Slider::new(&mut tolerance, 0..=255))
+                    .on_hover_text("How different a colour may be and still count as the same. 0: only exactly the same");
+                if slider.changed() {
                     let params = Params::new().with("tolerance", tolerance);
                     commands::run(registry, state, "tool.set_tolerance", &params);
                 }
@@ -423,10 +465,18 @@ fn tool_options(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
                     Some(name) => {
                         ui.label(name);
                         ui.horizontal(|ui| {
-                            if ui.button("Edit\u{2026}").clicked() {
+                            if ui
+                                .button("Edit\u{2026}")
+                                .on_hover_text("Name, position, 9-slice centre and pivot")
+                                .clicked()
+                            {
                                 commands::run(registry, state, "slice.edit", &Params::new());
                             }
-                            if ui.button("Delete").clicked() {
+                            if ui
+                                .button("Delete")
+                                .on_hover_text("Delete this slice")
+                                .clicked()
+                            {
                                 commands::run(registry, state, "slice.delete", &Params::new());
                             }
                         });
@@ -492,7 +542,10 @@ fn pattern_picker(ui: &mut Ui, state: &mut AppState, registry: &Registry, option
         let mut density = u32::from(options.dither_density);
         ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(40.0);
         let slider = Slider::new(&mut density, 0..=u32::from(MAX_DENSITY)).suffix("%");
-        if ui.add(slider).changed() {
+        let slider = ui
+            .add(slider)
+            .on_hover_text("How much of the pattern is the primary colour");
+        if slider.changed() {
             let params = Params::new().with("density", density);
             commands::run(registry, state, "tool.set_density", &params);
         }
@@ -929,7 +982,15 @@ fn history(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
             } else {
                 RichText::new(name)
             };
-            if ui.selectable_label(steps == cursor, label).clicked() && steps != cursor {
+            let tip = match steps.cmp(&cursor) {
+                std::cmp::Ordering::Less => "Go back to the sprite as it was after this step",
+                std::cmp::Ordering::Equal => "The sprite as it is now",
+                std::cmp::Ordering::Greater => "Undone; click to do it again",
+            };
+            let row = ui
+                .selectable_label(steps == cursor, label)
+                .on_hover_text(tip);
+            if row.clicked() && steps != cursor {
                 let params = Params::new().with("steps", steps as i64);
                 commands::run(registry, state, "edit.history_jump", &params);
             }

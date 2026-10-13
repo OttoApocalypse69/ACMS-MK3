@@ -768,6 +768,26 @@ fn empty_state(
             }
             ui.add_space(4.0);
             ui.label(RichText::new(hint).weak());
+            ui.label(RichText::new("A file dropped on the window is opened").weak());
+
+            // The files worked on last, a click away.
+            let recent: Vec<_> = state.recent.iter().take(5).cloned().collect();
+            if !recent.is_empty() {
+                ui.add_space(12.0);
+                ui.label(RichText::new("Recent").weak());
+                for path in recent {
+                    let name = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                    let tip = path.display().to_string();
+                    if ui.link(name).on_hover_text(tip).clicked() {
+                        let path = path.to_string_lossy().into_owned();
+                        let params = Params::new().with("path", path);
+                        commands::run(registry, state, "file.open", &params);
+                    }
+                }
+            }
         });
     });
 }

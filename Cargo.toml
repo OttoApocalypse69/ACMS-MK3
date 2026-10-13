@@ -19,3 +19,9 @@ unsafe_code = "deny"
 # `cargo run` usable on large or many-layered sprites without slowing down rebuilds of the app.
 [profile.dev.package.acms-core]
 opt-level = 2
+
+# What is shipped: one pass over the whole program, and no debug symbols in the file.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

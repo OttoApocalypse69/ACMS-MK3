@@ -40,12 +40,16 @@ pub fn decode_png(bytes: &[u8]) -> Result<Image, IoError> {
     let rgba: Vec<u8> = match info.color_type {
         ColorType::Rgba => data.to_vec(),
         ColorType::Rgb => data
-            .chunks_exact(3)
-            .flat_map(|px| [px[0], px[1], px[2], 255])
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 255])
             .collect(),
         ColorType::GrayscaleAlpha => data
-            .chunks_exact(2)
-            .flat_map(|px| [px[0], px[0], px[0], px[1]])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|&[v, a]| [v, v, v, a])
             .collect(),
         ColorType::Grayscale => data.iter().flat_map(|&v| [v, v, v, 255]).collect(),
         // `normalize_to_color8` expands palettes, so this only happens for a broken decoder.

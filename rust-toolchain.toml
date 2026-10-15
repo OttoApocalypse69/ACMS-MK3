@@ -1,0 +1,5 @@
+# The Rust version the project is built and checked with, here and in CI. New Rust versions
+# bring new lints; moving to one is a change of its own.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

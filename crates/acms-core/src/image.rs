@@ -36,8 +36,10 @@ impl Image {
             return None;
         }
         let pixels = bytes
-            .chunks_exact(4)
-            .map(|px| Rgba8::new(px[0], px[1], px[2], px[3]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&[r, g, b, a]| Rgba8::new(r, g, b, a))
             .collect();
         Some(Self {
             width,

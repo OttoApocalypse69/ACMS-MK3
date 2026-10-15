@@ -3,8 +3,11 @@
 [![CI](https://github.com/OttoApocalypse69/ACMS-MK3/actions/workflows/ci.yml/badge.svg)](https://github.com/OttoApocalypse69/ACMS-MK3/actions/workflows/ci.yml)
 
 A pixel art editor written in Rust: drawing tools made for pixels, animation, tilemaps for
-game art, and Lua scripting. It is developed and tested on Windows; the Linux build is set up
-(see `.github/workflows/ci.yml`) but has not been tried on a real machine yet.
+game art, and Lua scripting. It is developed on Windows; on Linux it builds and passes its
+tests in CI, but has not yet been tried on a Linux desktop.
+
+Downloads for Windows and Linux are on the
+[releases page](https://github.com/OttoApocalypse69/ACMS-MK3/releases).
 
 ![The editor with an animation open](docs/screenshots/animation.png)
 

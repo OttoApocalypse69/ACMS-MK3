@@ -108,9 +108,9 @@ drawing), which a headless test cannot see; a sprite where nothing is opaque fla
   a layout written to a file and read back. The release build shows its window in under half a
   second.
 - **Not checked by me**:
-  - **The Linux build.** The workflow in `.github/workflows/ci.yml` has never run (the
-    repository has no remote), and the list of Linux packages in it and in the README is from
-    the libraries' documentation, not from a build.
+  - **The Linux app on a desktop.** Since 2026-10-15 the project is on GitHub
+    (OttoApocalypse69/ACMS-MK3) and CI builds and tests it on Linux and Windows, both green;
+    release 0.1.0 has both builds. Nobody has opened the Linux build on a real desktop yet.
   - A real high-DPI display (only the interface size setting at 150 % in a normal window).
   - Dropping a file with a real mouse, the native file dialogs of Import and Timelapse, the
     keymap editor and the Preferences dialog clicked by hand, the Open Recent submenu.
@@ -938,6 +938,11 @@ Described in `PLAN.md` but not part of the "Done when" of a finished phase:
 - `ctx.set_zoom_factor` takes effect a frame later; tests have to run a frame or two.
 - Timing tests are `#[ignore]`d and only assert in release builds; run them with `--release`.
 - A commit chained after clippy with `;` goes through even when clippy fails; chain with `&&`.
+- The Rust version is pinned in `rust-toolchain.toml` (1.97.1): CI's newer stable brought a
+  new clippy lint and failed. Moving to a newer Rust is a change of its own: bump the file, fix
+  the new lints.
+- Releases: tag `vX.Y.Z` on a green commit; the CI release job uploads both executables as
+  artifacts; `gh release create` with the zip / tar.gz made from them.
 - `Editor::document_mut` abandons the stroke in progress; `document_mut_by_id` does not. Code
   that changes the document from inside a tool's own stroke must use the second.
 - Bash heredocs in this environment break on apostrophes; write scripts to files instead.

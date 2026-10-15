@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ACMS mk3
+GenericName=Pixel Art Editor
+Comment=Draw and animate pixel art, tilesets and sprites
+Exec=acms-mk3 %F
+Icon=acms-mk3
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+Keywords=pixel;sprite;animation;tileset;aseprite;
+MimeType=application/x-acms-sprite;
+StartupWMClass=acms-mk3

@@ -1,3 +1,5 @@
+<img src="assets/icon/acms-128.png" width="96" align="right" alt="The ACMS icon">
+
 # ACMS mk3
 
 [![CI](https://github.com/OttoApocalypse69/ACMS-MK3/actions/workflows/ci.yml/badge.svg)](https://github.com/OttoApocalypse69/ACMS-MK3/actions/workflows/ci.yml)
@@ -6,8 +8,16 @@ A pixel art editor written in Rust: drawing tools made for pixels, animation, ti
 game art, and Lua scripting. It is developed on Windows; on Linux it builds and passes its
 tests in CI, but has not yet been tried on a Linux desktop.
 
-Downloads for Windows and Linux are on the
-[releases page](https://github.com/OttoApocalypse69/ACMS-MK3/releases).
+## Download
+
+From the [releases page](https://github.com/OttoApocalypse69/ACMS-MK3/releases):
+
+- **Windows:** `acms-mk3-setup-x86_64.exe` installs it (no administrator rights needed), or
+  `acms-mk3-windows-x86_64.zip` is the program on its own.
+- **Debian, Ubuntu:** the `.deb`, installed with `sudo apt install ./acms-mk3_*.deb`.
+- **Other Linux:** `acms-mk3-linux-x86_64.tar.gz`.
+
+The downloads are not signed, so Windows may warn the first time you run them.
 
 ![The editor with an animation open](docs/screenshots/animation.png)
 
@@ -57,7 +67,13 @@ cargo run --release -p acms-app
 ```
 
 The program is `target/release/acms-app` (`acms-app.exe` on Windows). It is a single file and
-needs nothing next to it.
+needs nothing next to it. Files named on the command line are opened.
+
+To make the installers yourself: the Windows one with [Inno Setup](https://jrsoftware.org/isinfo.php)
+6.3 or later, `iscc /DAppVersion=0.2.0 installer\windowscms-mk3.iss`; the Debian package
+with [cargo-deb](https://crates.io/crates/cargo-deb), `cargo deb -p acms-app`. CI does both for
+every tag `vX.Y.Z` and publishes the release, with `docs/releases/vX.Y.Z.md` as its notes.
+The icon is drawn by `assets/icon/make_icon.py`.
 
 ## First steps
 

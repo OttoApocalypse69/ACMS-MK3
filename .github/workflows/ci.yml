@@ -31,36 +31,104 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  release:
-    name: Release build (${{ matrix.os }})
+  windows:
+    name: Windows release
     needs: check
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            binary: acms-app
-            artifact: acms-mk3-linux-x86_64
-          - os: windows-latest
-            binary: acms-app.exe
-            artifact: acms-mk3-windows-x86_64
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
-      - name: Linux packages
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo build --release -p acms-app
       # How long flattening a large sprite takes here, for the record. The 120 fps budget
       # itself is checked on a developer's machine (see README): shared runners are too
       # uneven to hold a timing test to.
       - run: cargo test --release -p acms-core -- --ignored time_to_flatten --nocapture
+      - name: Installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object name -eq 'acms-app' | ForEach-Object version
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer\windows\acms-mk3.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist\acms-mk3 | Out-Null
+          Copy-Item target\release\acms-app.exe, README.md, LICENSE-MIT, LICENSE-APACHE dist\acms-mk3
+          Compress-Archive -Path dist\acms-mk3 -DestinationPath dist\acms-mk3-windows-x86_64.zip
+          Move-Item target\installer\acms-mk3-setup-x86_64.exe dist\
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: target/release/${{ matrix.binary }}
+          name: windows
+          path: |
+            dist/acms-mk3-setup-x86_64.exe
+            dist/acms-mk3-windows-x86_64.zip
           if-no-files-found: error
+
+  linux:
+    name: Linux release
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - run: cargo build --release -p acms-app
+      - run: cargo test --release -p acms-core -- --ignored time_to_flatten --nocapture
+      - name: Debian package
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p acms-app --no-build --output dist/
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+      - name: Archive
+        run: |
+          mkdir -p dist/acms-mk3
+          cp target/release/acms-app README.md LICENSE-MIT LICENSE-APACHE dist/acms-mk3/
+          cp installer/linux/acms-mk3.desktop installer/linux/acms-mk3.xml dist/acms-mk3/
+          cp assets/icon/acms-256.png dist/acms-mk3/acms-mk3.png
+          tar -C dist -czf dist/acms-mk3-linux-x86_64.tar.gz acms-mk3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.deb
+            dist/acms-mk3-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  # A tag `vX.Y.Z` publishes a release with everything above. The notes are
+  # docs/releases/vX.Y.Z.md if there is such a file.
+  publish:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches the version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "acms-app") | .version')
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, version $version"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="docs/releases/$GITHUB_REF_NAME.md"
+          if [ -f "$notes" ]; then how=(--notes-file "$notes"); else how=(--generate-notes); fi
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "ACMS mk3 ${GITHUB_REF_NAME#v}" "${how[@]}"
+          fi

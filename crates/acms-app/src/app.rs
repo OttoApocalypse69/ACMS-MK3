@@ -132,6 +132,15 @@ impl AcmsApp {
         commands::run(&self.registry, &mut self.state, id, params);
     }
 
+    /// Opens files given on the command line. A file that cannot be opened says why, as when
+    /// it is opened from the menu.
+    pub fn open_files(&mut self, files: &[std::path::PathBuf]) {
+        for path in files {
+            let params = Params::new().with("path", path.to_string_lossy().into_owned());
+            self.run_command("file.open", &params);
+        }
+    }
+
     /// Carries out the changes to the keymap that commands asked for, and writes the user's
     /// keymap file.
     fn apply_keymap_changes(&mut self) {
@@ -1554,6 +1563,28 @@ mod tests {
         // Escape now closes the dialog, and the new key works.
         h.press(Modifiers::NONE, Key::Escape);
         assert_eq!(h.app.state.dialog, None);
+    }
+
+    #[test]
+    fn files_named_on_the_command_line_are_opened() {
+        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples");
+        let mut h = Harness::new();
+        h.app.open_files(&[
+            samples.join("phase5-v4.acms"),
+            samples.join("aseprite/tags.aseprite"),
+        ]);
+        h.frame(vec![]);
+        assert_eq!(h.app.state.editor.documents().count(), 2);
+        assert_eq!(h.app.state.dialog, None);
+        h.app.open_files(&[samples.join("missing.acms")]);
+        assert!(matches!(h.app.state.dialog, Some(Dialog::Message { .. })));
+    }
+
+    #[test]
+    fn the_window_icon_is_there() {
+        let png = include_bytes!("../../../assets/icon/acms-64.png");
+        let icon = acms_io::png::decode_png(png).unwrap();
+        assert_eq!((icon.width(), icon.height()), (64, 64));
     }
 
     #[test]

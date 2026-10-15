@@ -1,10 +1,10 @@
 [package]
 name = "acms-io"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-acms-core = { version = "0.1.0", path = "../acms-core" }
+acms-core = { version = "0.2.0", path = "../acms-core" }
 aseprite-loader = "0.4.2"
 gif = "0.14.2"
 png = "0.18.1"

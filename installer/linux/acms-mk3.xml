@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Tells the desktop that .acms files are ACMS sprites, so they open in the app. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-acms-sprite">
+    <comment>ACMS sprite</comment>
+    <glob pattern="*.acms"/>
+    <icon name="acms-mk3"/>
+  </mime-type>
+</mime-info>

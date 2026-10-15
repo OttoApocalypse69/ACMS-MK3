@@ -29,21 +29,42 @@ mod theme;
 mod tile_commands;
 mod timeline;
 
+/// The icon of the window and the task bar, drawn by `assets/icon/make_icon.py`.
+fn window_icon() -> egui::IconData {
+    let png = include_bytes!("../../../assets/icon/acms-64.png");
+    match acms_io::png::decode_png(png) {
+        Ok(image) => egui::IconData {
+            rgba: image.to_rgba_bytes(),
+            width: image.width(),
+            height: image.height(),
+        },
+        // The file is part of the program and checked by a test; this cannot happen.
+        Err(_) => egui::IconData::default(),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ACMS mk3")
+            // What Linux desktops match the window to its desktop file by.
+            .with_app_id("acms-mk3")
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([640.0, 400.0]),
+            .with_min_inner_size([640.0, 400.0])
+            .with_icon(window_icon()),
         ..Default::default()
     };
     let paths = settings::Paths::user();
+    // Files named on the command line are opened, which is also how "Open with" and a double
+    // click on an .acms file reach the app.
+    let files: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
 
     eframe::run_native(
         "acms-mk3",
         options,
         Box::new(|cc| {
             let mut app = app::AcmsApp::new(&cc.egui_ctx, paths)?;
+            app.open_files(&files);
             app.use_system_clipboard();
             Ok(Box::new(app))
         }),

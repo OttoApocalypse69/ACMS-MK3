@@ -70,7 +70,7 @@ The program is `target/release/acms-app` (`acms-app.exe` on Windows). It is a si
 needs nothing next to it. Files named on the command line are opened.
 
 To make the installers yourself: the Windows one with [Inno Setup](https://jrsoftware.org/isinfo.php)
-6.3 or later, `iscc /DAppVersion=0.2.0 installer\windowscms-mk3.iss`; the Debian package
+6.3 or later, `iscc /DAppVersion=0.2.0 installerwindowscms-mk3.iss`; the Debian package
 with [cargo-deb](https://crates.io/crates/cargo-deb), `cargo deb -p acms-app`. CI does both for
 every tag `vX.Y.Z` and publishes the release, with `docs/releases/vX.Y.Z.md` as its notes.
 The icon is drawn by `assets/icon/make_icon.py`.

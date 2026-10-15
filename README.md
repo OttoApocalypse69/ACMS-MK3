@@ -1,5 +1,7 @@
 # ACMS mk3
 
+[![CI](https://github.com/OttoApocalypse69/ACMS-MK3/actions/workflows/ci.yml/badge.svg)](https://github.com/OttoApocalypse69/ACMS-MK3/actions/workflows/ci.yml)
+
 A pixel art editor written in Rust: drawing tools made for pixels, animation, tilemaps for
 game art, and Lua scripting. It is developed and tested on Windows; the Linux build is set up
 (see `.github/workflows/ci.yml`) but has not been tried on a real machine yet.
@@ -149,4 +151,5 @@ cargo test --release -p acms-app -- --ignored frame_time --nocapture
 
 ## Licence
 
-MIT or Apache-2.0, at your choice.
+MIT or Apache-2.0, at your choice: see [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).

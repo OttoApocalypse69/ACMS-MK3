@@ -69,16 +69,20 @@ Root: HKA; Subkey: "Software\Classes\ACMS.Sprite"; ValueType: string; ValueName:
 Root: HKA; Subkey: "Software\Classes\ACMS.Sprite\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#AppExe},0"
 Root: HKA; Subkey: "Software\Classes\ACMS.Sprite\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
 ; .acms files open in the app if the user wants that, and it is offered for them either way.
-Root: HKA; Subkey: "Software\Classes\.acms"; ValueType: string; ValueName: ""; ValueData: "ACMS.Sprite"; Flags: uninsdeletevalue; Tasks: associate
-Root: HKA; Subkey: "Software\Classes\.acms\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue
+; Keys that were made only for these values go with them; keys other programs use stay.
+Root: HKA; Subkey: "Software\Classes\.acms"; ValueType: string; ValueName: ""; ValueData: "ACMS.Sprite"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: associate
+Root: HKA; Subkey: "Software\Classes\.acms"; Flags: uninsdeletekeyifempty
+Root: HKA; Subkey: "Software\Classes\.acms\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
 ; "Open with" lists the app for Aseprite files too, without taking them over.
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}\SupportedTypes"; ValueType: string; ValueName: ".acms"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}\SupportedTypes"; ValueType: string; ValueName: ".aseprite"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}\SupportedTypes"; ValueType: string; ValueName: ".ase"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
-Root: HKA; Subkey: "Software\Classes\.aseprite\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKA; Subkey: "Software\Classes\.ase\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.aseprite"; Flags: uninsdeletekeyifempty
+Root: HKA; Subkey: "Software\Classes\.aseprite\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
+Root: HKA; Subkey: "Software\Classes\.ase"; Flags: uninsdeletekeyifempty
+Root: HKA; Subkey: "Software\Classes\.ase\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent

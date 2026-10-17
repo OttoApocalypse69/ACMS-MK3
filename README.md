@@ -5,8 +5,8 @@
 [![CI](https://github.com/OttoApocalypse69/ACMS-MK3/actions/workflows/ci.yml/badge.svg)](https://github.com/OttoApocalypse69/ACMS-MK3/actions/workflows/ci.yml)
 
 A pixel art editor written in Rust: drawing tools made for pixels, animation, tilemaps for
-game art, and Lua scripting. It is developed on Windows; on Linux it builds and passes its
-tests in CI, but has not yet been tried on a Linux desktop.
+game art, and Lua scripting. It is developed on Windows. On Linux it builds and passes its
+tests in CI, and runs on Ubuntu 24.04 (tried under WSL's Wayland desktop).
 
 ## Download
 
@@ -15,7 +15,8 @@ From the [releases page](https://github.com/OttoApocalypse69/ACMS-MK3/releases):
 - **Windows:** `acms-mk3-setup-x86_64.exe` installs it (no administrator rights needed), or
   `acms-mk3-windows-x86_64.zip` is the program on its own.
 - **Debian, Ubuntu:** the `.deb`, installed with `sudo apt install ./acms-mk3_*.deb`.
-- **Other Linux:** `acms-mk3-linux-x86_64.tar.gz`.
+- **Other Linux:** `acms-mk3-linux-x86_64.tar.gz`. It needs `libxkbcommon`, and on X11
+  also `libxkbcommon-x11`; desktops nearly always have them.
 
 The downloads are not signed, so Windows may warn the first time you run them.
 

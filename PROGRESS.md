@@ -13,6 +13,47 @@ egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directorie
 serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4),
 aseprite-loader 0.4.
 
+## Icon and installers (2026-10-15, asked for after Phase 8)
+
+- [x] An icon: pixel art drawn at 16 × 16 by `assets/icon/make_icon.py`, enlarged to every size;
+  the window's and the task bar's, embedded in the Windows executable with version
+  information (`winresource`, a build dependency), and the desktop entry's on Linux
+- [x] Windows installer (Inno Setup, `installer/windows/acms-mk3.iss`): per user without
+  administrator rights or for everyone, Start menu entry, optional desktop shortcut, `.acms`
+  file type (optional), "Open with" for Aseprite files, uninstaller
+- [x] Debian package (cargo-deb): menu entry, icons, the `.acms` MIME type
+- [x] Files named on the command line are opened
+- [x] CI builds the installer, the package and both archives; a tag `vX.Y.Z` publishes the
+  release, with `docs/releases/vX.Y.Z.md` as notes, after checking the tag is the version
+- [x] Version 0.2.0
+
+### How it was checked
+
+- The installer CI built was run silently for this user into a temporary folder: the files,
+  the Start menu entry, the uninstall entry with its icon and version, and the `.acms` file
+  type were there; double-clicking a sample `.acms` file opened it in the installed app. The
+  silent uninstall removed the folder, the shortcut, the uninstall entry and the file type,
+  but left three empty registry keys (`.acms`, `.aseprite`, `.ase`); the script now removes
+  keys it leaves empty. The empty keys and a session file the test run wrote were cleaned up
+  by hand.
+- The executable's icon and version information were read back from the built file.
+- The `.deb` and the archive CI built were unpacked in WSL: the same executable in both, the
+  files in the right places, no library missing for the executable itself. Run under WSL's
+  Wayland desktop with an Aseprite file named on the command line, the app opened it and
+  showed the import message. On X11 it stopped because `libxkbcommon-x11` was missing: the
+  package now depends on it and the libraries it loads while running.
+- Tests: the window icon decodes, and files named on the command line are opened (and a
+  missing one is reported).
+- **Not checked**: the installer's wizard clicked through by hand, installing for all users,
+  SmartScreen's warning, installing the `.deb` with apt (it needs root), the menu entry and
+  the file type on a Linux desktop.
+
+### Known limits
+
+- Nothing is code-signed: Windows SmartScreen warns on the first run.
+- No macOS build, no Flatpak, AppImage, Snap or RPM.
+- The installer does not offer to start with the user's own file, and is English only.
+
 ## Phase 8 task list (done)
 
 `PLAN.md` gives Phase 8 no "Done when"; it is done when every item below is.
@@ -108,9 +149,10 @@ drawing), which a headless test cannot see; a sprite where nothing is opaque fla
   a layout written to a file and read back. The release build shows its window in under half a
   second.
 - **Not checked by me**:
-  - **The Linux app on a desktop.** Since 2026-10-15 the project is on GitHub
-    (OttoApocalypse69/ACMS-MK3) and CI builds and tests it on Linux and Windows, both green;
-    release 0.1.0 has both builds. Nobody has opened the Linux build on a real desktop yet.
+  - **Linux on real hardware.** CI builds and tests on Linux. The CI-built package was run on
+    Ubuntu 24.04 under WSL's Wayland desktop (2026-10-17): it starts, opens a file given on
+    the command line and draws normally. Not tried: a native Linux machine, an X11 session
+    with all its libraries installed, a desktop menu entry used by hand.
   - A real high-DPI display (only the interface size setting at 150 % in a normal window).
   - Dropping a file with a real mouse, the native file dialogs of Import and Timelapse, the
     keymap editor and the Preferences dialog clicked by hand, the Open Recent submenu.
@@ -138,7 +180,7 @@ drawing), which a headless test cannot see; a sprite where nothing is opaque fla
   There is no way to name and save a layout of one's own.
 - **The interface size applies from the next frame** and the canvas is not re-fitted.
 - **Opening a PNG as a sprite is still not possible** (only as a reference or a palette).
-- No installer and no application icon; the release is the bare executable.
+- (Icon and installers: added afterwards, see "Icon and installers" above.)
 
 ## Phase 7 task list (done)
 
@@ -980,7 +1022,7 @@ None known.
 - Named layouts of the user's own; a warning before a key is taken from another command.
 - A timelapse of all frames, or as a video; keep the undo history in the file so a timelapse
   can span sessions.
-- An application icon and installers; the `log` crate wired to the Log panel; an icon set.
+- Code signing; a macOS build; Flatpak or AppImage; the `log` crate wired to the Log panel; an icon set for the tools.
 - Autosave copies tied to the running process, so two windows do not see each other's.
 - Scripts: a button that opens the scripts folder; a history for the console line; filters
   with a parameter dialog and a live preview; script commands with arguments; tool options

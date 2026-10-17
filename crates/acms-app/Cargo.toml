@@ -35,7 +35,8 @@ maintainer = "ACMS mk3 <https://github.com/OttoApocalypse69/ACMS-MK3>"
 copyright = "MIT OR Apache-2.0"
 extended-description = "A pixel art editor: pro drawing tools, animation, tilemaps for game art, and Lua scripting."
 section = "graphics"
-depends = "$auto"
+# The windowing and graphics libraries are loaded while running, so `$auto` cannot see them.
+depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1 | libvulkan1"
 assets = [
     ["target/release/acms-app", "usr/bin/acms-mk3", "755"],
     ["../../installer/linux/acms-mk3.desktop", "usr/share/applications/acms-mk3.desktop", "644"],

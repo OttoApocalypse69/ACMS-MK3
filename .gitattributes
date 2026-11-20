@@ -1,0 +1,2 @@
+# Test samples are compared byte for byte: keep them exactly as they are on every system.
+tests/samples/** -text

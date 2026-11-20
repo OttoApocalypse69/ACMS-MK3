@@ -13,6 +13,42 @@ egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directorie
 serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4),
 aseprite-loader 0.4.
 
+## Netpbm images (2026-11-20, asked for)
+
+- [x] `acms-io::netpbm`: read PBM, PGM and PPM in their plain (text, `P1`–`P3`) and raw
+  (binary, `P4`–`P6`) forms, any maximum value up to 65535 (16-bit samples too), and PAM
+  (`P7`) of every standard kind; comments anywhere in a header; several pictures in one file
+  become frames
+- [x] Write raw PBM, PGM, PPM and PAM with a maximum of 255; the kind is chosen by the file's
+  extension (`.pnm` is written as PPM)
+- [x] File → Import / Export PBM / PGM / PPM / PAM Image…; the files open with File → Open,
+  drag and drop and the command line; the Windows installer lists ACMS under "Open with"
+
+### Decisions
+
+- **Only PAM keeps transparency.** For the others the picture is put on white first, PGM then
+  takes how light each colour looks (the BT.601 weights Netpbm uses), and PBM makes darker than
+  middle grey black. The export says how many pixels that changed, and that PAM would keep
+  them.
+- **PBM's 1 is black and PAM's is white**, as the two specifications say.
+- **Pictures of a different size from the first** in a many-picture file are left out, and so
+  is anything after the last good picture; the import says so.
+- **The palette of an imported image** is the colours of its first picture (up to 256), or
+  the default palette if it has more.
+
+### How it was checked
+
+- Pillow, an implementation independent of ACMS, wrote PPM, PGM (8- and 16-bit) and PBM
+  samples (`tests/samples/netpbm/make_samples.py`) with a PNG of each picture: ACMS reads each
+  as exactly that picture, and writes PBM, PGM and PPM byte for byte as Pillow does.
+- Pillow read back the PBM, PGM and PPM files ACMS writes from a picture with colour and
+  transparency: each is exactly the picture expected. Pillow cannot read PAM, so PAM is
+  checked only against the specification and ACMS's own reader.
+- Plain formats with comments and digits with and without spaces, a maximum below 255,
+  16-bit samples, PBM rows that end mid-byte, every PAM kind and an unknown one, several
+  pictures and mixed kinds in one file, and seventeen kinds of broken file; every sample cut
+  short at every byte and with every byte changed gives an error or a picture, never a crash.
+
 ## CMG character images (2026-11-20, asked for)
 
 [CMG_raylib](https://www.cem.pp.ua/Akumarin/CMG_raylib) (MIT) turns a text file into a picture:

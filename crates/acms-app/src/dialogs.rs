@@ -1034,6 +1034,29 @@ pub fn resolve_file_request(
     let text = |path: PathBuf| path.to_string_lossy().into_owned();
 
     let (command, params) = match request {
+        FileRequest::ImportNetpbm => {
+            let picked = dialog
+                .add_filter("Netpbm image", &["pbm", "pgm", "ppm", "pnm", "pam"])
+                .pick_file();
+            let Some(path) = picked else { return };
+            ("file.import_netpbm", Params::new().with("path", text(path)))
+        }
+        FileRequest::ExportNetpbm => {
+            let picked = dialog
+                .add_filter("PPM colour image", &["ppm"])
+                .add_filter("PAM image, with transparency", &["pam"])
+                .add_filter("PGM grey image", &["pgm"])
+                .add_filter("PBM black and white image", &["pbm"])
+                .set_file_name(format!("{stem}.ppm"))
+                .save_file();
+            let Some(path) = picked else { return };
+            // Without one of the four extensions there is no saying which kind is meant.
+            let path = match acms_io::netpbm::NetpbmKind::from_path(&path) {
+                Some(_) => path,
+                None => path.with_extension("ppm"),
+            };
+            ("file.export_netpbm", Params::new().with("path", text(path)))
+        }
         FileRequest::ImportCmg => {
             // The format has no extension of its own; the files may be called anything.
             let picked = dialog
@@ -1055,7 +1078,12 @@ pub fn resolve_file_request(
         }
         FileRequest::Open => {
             let picked = dialog
-                .add_filter("Sprites", &["acms", "aseprite", "ase", "cmg"])
+                .add_filter(
+                    "Sprites",
+                    &[
+                        "acms", "aseprite", "ase", "cmg", "pbm", "pgm", "ppm", "pnm", "pam",
+                    ],
+                )
                 .add_filter("ACMS sprite", &["acms"])
                 .pick_file();
             let Some(path) = picked else { return };

@@ -335,6 +335,9 @@ pub enum FileRequest {
     ReferenceImage,
     ImportAseprite,
     ImportCmg,
+    ImportNetpbm,
+    /// Asks where to save a Netpbm image; the extension chosen picks the kind.
+    ExportNetpbm,
     /// Asks where to save, then runs `command` with `params` and the path.
     Export {
         command: &'static str,

@@ -4,6 +4,7 @@ pub mod acms;
 pub mod aseprite;
 pub mod cmg;
 pub mod export;
+pub mod netpbm;
 pub mod palette;
 pub mod png;
 pub mod tiled;

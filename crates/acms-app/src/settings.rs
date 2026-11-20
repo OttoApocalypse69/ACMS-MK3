@@ -759,6 +759,64 @@ mod tests {
     }
 
     #[test]
+    fn netpbm_images_are_opened_imported_and_exported() {
+        let dir = TempDir::new("netpbm");
+        let mut f = Fixture::new();
+        f.run("file.import_netpbm");
+        assert_eq!(f.state.file_request.take(), Some(FileRequest::ImportNetpbm));
+        assert!(!f.is_enabled("file.export_netpbm"));
+
+        // Each of the kinds opens by File > Open; several pictures become frames.
+        let ppm = dir.path().join("two.ppm");
+        let mut bytes = b"P6\n2 1\n255\n".to_vec();
+        bytes.extend([255, 0, 0, 0, 0, 255]);
+        bytes.extend(b"P6 2 1 255\n");
+        bytes.extend([0, 255, 0, 255, 255, 255]);
+        std::fs::write(&ppm, &bytes).unwrap();
+        f.run_with(
+            "file.open",
+            Params::new().with("path", ppm.to_string_lossy().into_owned()),
+        );
+        assert_eq!(f.state.dialog, None);
+        assert_eq!(f.document().sprite().frames().len(), 2);
+        assert_eq!(f.state.file_path, None);
+
+        // Written back as PPM, the frame being shown is the same file again.
+        f.run("file.export_netpbm");
+        assert_eq!(f.state.file_request.take(), Some(FileRequest::ExportNetpbm));
+        let out = dir.path().join("out.ppm");
+        f.run_with(
+            "file.export_netpbm",
+            Params::new().with("path", out.to_string_lossy().into_owned()),
+        );
+        assert_eq!(f.state.dialog, None);
+        assert_eq!(std::fs::read(&out).unwrap(), bytes[..17].to_vec());
+
+        // As PBM the colours are lost, and the user is told.
+        let pbm = dir.path().join("out.pbm");
+        f.run_with(
+            "file.export_netpbm",
+            Params::new().with("path", pbm.to_string_lossy().into_owned()),
+        );
+        let Some(Dialog::Message { text, .. }) = f.state.dialog.take() else {
+            panic!("no message");
+        };
+        assert!(text.contains("black or white"), "{text}");
+        assert_eq!(std::fs::read(&pbm).unwrap(), b"P4\n2 1\n\xC0".to_vec());
+
+        // A name without one of the four extensions cannot say which kind is meant.
+        let other = dir.path().join("out.img");
+        f.run_with(
+            "file.export_netpbm",
+            Params::new().with("path", other.to_string_lossy().into_owned()),
+        );
+        assert!(
+            matches!(&f.state.dialog, Some(Dialog::Message { text, .. }) if text.contains(".pbm"))
+        );
+        assert!(!other.exists());
+    }
+
+    #[test]
     fn cmg_images_are_opened_imported_and_exported() {
         let dir = TempDir::new("cmg");
         let mut f = Fixture::new();

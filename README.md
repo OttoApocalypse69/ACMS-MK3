@@ -111,6 +111,9 @@ All of them can be changed in **Edit → Keyboard Shortcuts…**.
   [CMG_raylib](https://www.cem.pp.ua/Akumarin/CMG_raylib), can be opened and written (File →
   Import CMG Image…, Export CMG Image…). Each character is one pixel in one of 94 fixed
   colours; colours CMG does not have are written as the nearest one, and the editor says so.
+- **Netpbm** images (`.pbm`, `.pgm`, `.ppm`, `.pnm`, `.pam`) can be opened, in their text and
+  binary forms, and written (File → Export PBM / PGM / PPM / PAM Image…, the kind by the file
+  name). A file holding several pictures opens as frames. Only PAM keeps transparency.
 - **`.aseprite` / `.ase`** files can be opened (File → Open, File → Import Aseprite File…, or
   drop one on the window). Layers, groups, frames, linked cels, tags and slices come across;
   the editor says what did not.

@@ -281,6 +281,7 @@ Work through the phases in order. The app must build and run at the end of every
 - Release builds for Windows and Linux; README with screenshots; user docs for the scripting API.
 - An application icon, a Windows installer and a Debian package (added 2026-10-15).
 - Reading and writing CMG character images from CMG_raylib (added 2026-11-20).
+- Reading and writing Netpbm images: PBM, PGM, PPM and PAM (added 2026-11-20).
 
 ### Later / optional
 True indexed colour mode with palette-based colour cycling, more blend modes, command-line batch export (`acms export in.acms --sheet out.png`), plugin packages, macOS build.

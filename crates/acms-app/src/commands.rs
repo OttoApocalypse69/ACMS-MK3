@@ -117,6 +117,9 @@ fn file_open(state: &mut AppState, params: &Params) -> CommandResult {
     if acms_io::cmg::is_cmg_path(&path) {
         return import_cmg(state, &path);
     }
+    if acms_io::netpbm::is_netpbm_path(&path) {
+        return import_netpbm(state, &path);
+    }
     let sprite = load_acms(&path)
         .map_err(|err| CommandError::failed(format!("Could not open {}: {err}", path.display())))?;
     state.log.push(format!("Opened {}", path.display()));
@@ -164,6 +167,66 @@ fn file_import_aseprite(state: &mut AppState, params: &Params) -> CommandResult 
             Ok(())
         }
     }
+}
+
+fn import_netpbm(state: &mut AppState, path: &Path) -> CommandResult {
+    open_imported(state, path, acms_io::netpbm::import_netpbm_from_path(path))
+}
+
+fn file_import_netpbm(state: &mut AppState, params: &Params) -> CommandResult {
+    match params.text("path") {
+        Some(path) => import_netpbm(state, Path::new(path)),
+        None => {
+            state.file_request = Some(FileRequest::ImportNetpbm);
+            Ok(())
+        }
+    }
+}
+
+/// Writes the frame being shown as a PBM, PGM, PPM or PAM image, by the file name.
+fn file_export_netpbm(state: &mut AppState, params: &Params) -> CommandResult {
+    let Some(path) = params.text("path").map(PathBuf::from) else {
+        state.file_request = Some(FileRequest::ExportNetpbm);
+        return Ok(());
+    };
+    let document = state.editor.document().ok_or_else(no_document)?;
+    let report =
+        acms_io::netpbm::export_netpbm_to_path(document.sprite(), document.active_frame(), &path)
+            .map_err(|err| {
+            CommandError::failed(format!(
+                "Could not export {}: {}",
+                path.display(),
+                sentence(err)
+            ))
+        })?;
+    state.log.push(format!("Exported {}", path.display()));
+
+    let mut notes = Vec::new();
+    if report.on_white > 0 {
+        notes.push(format!(
+            "{} pixels were transparent or partly so; this kind of file has no transparency, so \
+             they are on white. PAM keeps transparency.",
+            report.on_white
+        ));
+    }
+    if report.changed > 0 {
+        let what = match acms_io::netpbm::NetpbmKind::from_path(&path) {
+            Some(acms_io::netpbm::NetpbmKind::Pbm) => "black or white",
+            _ => "grey",
+        };
+        notes.push(format!(
+            "{} pixels had colours and are {what} now.",
+            report.changed
+        ));
+    }
+    if !notes.is_empty() {
+        state.log.extend(notes.iter().cloned());
+        state.dialog = Some(Dialog::Message {
+            title: "Exported with Changes".to_owned(),
+            text: notes.join("\n"),
+        });
+    }
+    Ok(())
 }
 
 fn file_import_cmg(state: &mut AppState, params: &Params) -> CommandResult {
@@ -442,6 +505,23 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
             file_import_aseprite,
         )
         .optional_param("path", Text),
+    )?;
+    registry.register(
+        Command::new(
+            "file.import_netpbm",
+            "Import PBM / PGM / PPM / PAM Image…",
+            file_import_netpbm,
+        )
+        .optional_param("path", Text),
+    )?;
+    registry.register(
+        Command::new(
+            "file.export_netpbm",
+            "Export PBM / PGM / PPM / PAM Image…",
+            file_export_netpbm,
+        )
+        .optional_param("path", Text)
+        .enabled_when(has_document),
     )?;
     registry.register(
         Command::new("file.import_cmg", "Import CMG Image…", file_import_cmg)

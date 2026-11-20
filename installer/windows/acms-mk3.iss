@@ -73,16 +73,19 @@ Root: HKA; Subkey: "Software\Classes\ACMS.Sprite\shell\open\command"; ValueType:
 Root: HKA; Subkey: "Software\Classes\.acms"; ValueType: string; ValueName: ""; ValueData: "ACMS.Sprite"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: associate
 Root: HKA; Subkey: "Software\Classes\.acms"; Flags: uninsdeletekeyifempty
 Root: HKA; Subkey: "Software\Classes\.acms\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
-; "Open with" lists the app for Aseprite files too, without taking them over.
+; "Open with" lists the app for Aseprite and CMG files too, without taking them over.
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}\SupportedTypes"; ValueType: string; ValueName: ".acms"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}\SupportedTypes"; ValueType: string; ValueName: ".aseprite"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}\SupportedTypes"; ValueType: string; ValueName: ".ase"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}\SupportedTypes"; ValueType: string; ValueName: ".cmg"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\.aseprite"; Flags: uninsdeletekeyifempty
 Root: HKA; Subkey: "Software\Classes\.aseprite\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
 Root: HKA; Subkey: "Software\Classes\.ase"; Flags: uninsdeletekeyifempty
 Root: HKA; Subkey: "Software\Classes\.ase\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
+Root: HKA; Subkey: "Software\Classes\.cmg"; Flags: uninsdeletekeyifempty
+Root: HKA; Subkey: "Software\Classes\.cmg\OpenWithProgids"; ValueType: string; ValueName: "ACMS.Sprite"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent

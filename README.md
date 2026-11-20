@@ -107,6 +107,10 @@ All of them can be changed in **Edit → Keyboard Shortcuts…**.
 
 - **`.acms`** is the editor's own format: a zip archive with a readable `manifest.json` and
   one PNG per picture. Older versions of the format are upgraded when opened.
+- **`.cmg`** files, the "character imagery" text format of
+  [CMG_raylib](https://www.cem.pp.ua/Akumarin/CMG_raylib), can be opened and written (File →
+  Import CMG Image…, Export CMG Image…). Each character is one pixel in one of 94 fixed
+  colours; colours CMG does not have are written as the nearest one, and the editor says so.
 - **`.aseprite` / `.ase`** files can be opened (File → Open, File → Import Aseprite File…, or
   drop one on the window). Layers, groups, frames, linked cels, tags and slices come across;
   the editor says what did not.

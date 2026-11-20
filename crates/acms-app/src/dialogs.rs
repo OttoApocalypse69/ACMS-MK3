@@ -1034,6 +1034,15 @@ pub fn resolve_file_request(
     let text = |path: PathBuf| path.to_string_lossy().into_owned();
 
     let (command, params) = match request {
+        FileRequest::ImportCmg => {
+            // The format has no extension of its own; the files may be called anything.
+            let picked = dialog
+                .add_filter("CMG character image", &["cmg", "txt"])
+                .add_filter("All files", &["*"])
+                .pick_file();
+            let Some(path) = picked else { return };
+            ("file.import_cmg", Params::new().with("path", text(path)))
+        }
         FileRequest::ImportAseprite => {
             let picked = dialog
                 .add_filter("Aseprite file", &["aseprite", "ase"])
@@ -1046,7 +1055,7 @@ pub fn resolve_file_request(
         }
         FileRequest::Open => {
             let picked = dialog
-                .add_filter("Sprites", &["acms", "aseprite", "ase"])
+                .add_filter("Sprites", &["acms", "aseprite", "ase", "cmg"])
                 .add_filter("ACMS sprite", &["acms"])
                 .pick_file();
             let Some(path) = picked else { return };

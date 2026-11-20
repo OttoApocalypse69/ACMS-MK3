@@ -334,6 +334,7 @@ pub enum FileRequest {
     ExportPalette,
     ReferenceImage,
     ImportAseprite,
+    ImportCmg,
     /// Asks where to save, then runs `command` with `params` and the path.
     Export {
         command: &'static str,

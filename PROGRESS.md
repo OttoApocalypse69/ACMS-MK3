@@ -13,6 +13,52 @@ egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directorie
 serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4),
 aseprite-loader 0.4.
 
+## CMG character images (2026-11-20, asked for)
+
+[CMG_raylib](https://www.cem.pp.ua/Akumarin/CMG_raylib) (MIT) turns a text file into a picture:
+each character is one pixel, each of the 94 printable ASCII characters other than space has a
+fixed colour, and a newline ends a row. It has no specification and no file extension, so the
+format here is what its `main.c` does.
+
+- [x] `acms-io::cmg`: read and write; the colour table was taken out of `main.c` by a script,
+  not typed, and is the same in every version of `main.c` so far
+- [x] File → Import CMG Image… and Export CMG Image… (the frame being shown, flattened); `.cmg`
+  files open with File → Open, drag and drop and the command line
+- [x] The Windows installer lists ACMS under "Open with" for `.cmg` files
+
+### Decisions
+
+- **`.cmg` is the extension ACMS uses**; CMG_raylib takes any file name. The import dialog
+  also offers `.txt` and all files.
+- **Where ACMS reads a file differently from CMG_raylib**, it is on purpose:
+  - a character without a colour (space, tab, anything outside ASCII) is transparent, where
+    CMG_raylib paints its light grey background;
+  - the last line counts even without a newline after it (CMG_raylib cuts it off);
+  - `\r\n` ends a row (CMG_raylib draws the `\r` as one more empty pixel);
+  - the whole file is read, where CMG_raylib stops after 10 239 bytes; the import says so.
+- **Writing** makes a file CMG_raylib shows exactly: every row ends with a newline and has the
+  full width (transparent pixels are spaces), mostly transparent pixels are spaces, and a
+  colour CMG does not have becomes the nearest of its 94 (by the same measure as "reduce to
+  palette"). The export says how many pixels changed, and when the file is longer than
+  CMG_raylib reads.
+- **An imported image gets CMG's 94 colours as its palette**, so what is drawn can be written
+  back exactly.
+
+### How it was checked
+
+- `tests/samples/cmg` holds CMG_raylib's own `main.c` (commit `bf1dc260d2`) and the picture
+  CMG_raylib made of its first 10 239 bytes (`main.c.png`, from its repository). ACMS reads the
+  same bytes and the picture is compared pixel for pixel, at 5 pixels a character, with
+  CMG_raylib's background where ACMS has nothing. They are identical.
+- The table: every printable character but space, each once, no two the same colour.
+- Rows, ragged rows, empty rows, `\r\n`, a last line without a newline, characters without a
+  colour (each byte one pixel, as CMG_raylib reads them), files too large or empty, files
+  longer than CMG_raylib reads.
+- Writing: an image read from a file is written back byte for byte; nearest colours,
+  partly transparent pixels and too-long files are counted and reported.
+- In the app: open, import, export, the export's message; and in the real window, the sample
+  opened from the command line.
+
 ## Icon and installers (2026-10-15, asked for after Phase 8)
 
 - [x] An icon: pixel art drawn at 16 × 16 by `assets/icon/make_icon.py`, enlarged to every size;

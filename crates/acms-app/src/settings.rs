@@ -759,6 +759,64 @@ mod tests {
     }
 
     #[test]
+    fn cmg_images_are_opened_imported_and_exported() {
+        let dir = TempDir::new("cmg");
+        let mut f = Fixture::new();
+        f.run("file.import_cmg");
+        assert_eq!(f.state.file_request.take(), Some(FileRequest::ImportCmg));
+        assert!(!f.is_enabled("file.export_cmg"), "export needs a sprite");
+
+        // A .cmg file opens like any sprite, by Open, by drag and drop or from the command line.
+        let file = dir.path().join("face.cmg");
+        std::fs::write(&file, "  RR  \n R``R \nRRRRRR\n").unwrap();
+        f.run_with(
+            "file.open",
+            Params::new().with("path", file.to_string_lossy().into_owned()),
+        );
+        assert_eq!(f.state.dialog, None);
+        let sprite = f.document().sprite();
+        assert_eq!((sprite.width(), sprite.height()), (6, 3));
+        assert_eq!(sprite.palette().len(), 94);
+        assert_eq!(f.state.file_path, None);
+        assert!(!f.state.has_unsaved_changes());
+
+        // Exported as it came, it is the same file.
+        let out = dir.path().join("out.cmg");
+        let path = out.to_string_lossy().into_owned();
+        f.run("file.export_cmg");
+        assert!(matches!(
+            f.state.file_request.take(),
+            Some(FileRequest::Export {
+                command: "file.export_cmg",
+                ..
+            })
+        ));
+        f.run_with("file.export_cmg", Params::new().with("path", path.clone()));
+        assert_eq!(f.state.dialog, None);
+        assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&file).unwrap());
+
+        // A colour CMG does not have is changed, and the user is told.
+        f.draw_line(1);
+        f.run_with("file.export_cmg", Params::new().with("path", path));
+        let Some(Dialog::Message { title, text }) = f.state.dialog.take() else {
+            panic!("no message");
+        };
+        assert_eq!(title, "Exported with Changes");
+        assert!(text.contains("nearest of its 94 colours"), "{text}");
+
+        // Something that is not a picture says so.
+        let empty = dir.path().join("empty.cmg");
+        std::fs::write(&empty, "\n\n").unwrap();
+        f.run_with(
+            "file.import_cmg",
+            Params::new().with("path", empty.to_string_lossy().into_owned()),
+        );
+        assert!(
+            matches!(&f.state.dialog, Some(Dialog::Message { text, .. }) if text.contains("Could not import"))
+        );
+    }
+
+    #[test]
     fn a_timelapse_is_exported_from_the_undo_history() {
         let dir = TempDir::new("timelapse");
         let mut f = Fixture::with_sprite();

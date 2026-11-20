@@ -2,6 +2,7 @@
 
 pub mod acms;
 pub mod aseprite;
+pub mod cmg;
 pub mod export;
 pub mod palette;
 pub mod png;

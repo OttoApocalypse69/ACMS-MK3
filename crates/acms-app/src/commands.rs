@@ -114,6 +114,9 @@ fn file_open(state: &mut AppState, params: &Params) -> CommandResult {
     if acms_io::aseprite::is_aseprite_path(&path) {
         return import_aseprite(state, &path);
     }
+    if acms_io::cmg::is_cmg_path(&path) {
+        return import_cmg(state, &path);
+    }
     let sprite = load_acms(&path)
         .map_err(|err| CommandError::failed(format!("Could not open {}: {err}", path.display())))?;
     state.log.push(format!("Opened {}", path.display()));
@@ -123,7 +126,22 @@ fn file_open(state: &mut AppState, params: &Params) -> CommandResult {
 }
 
 fn import_aseprite(state: &mut AppState, path: &Path) -> CommandResult {
-    let imported = acms_io::aseprite::import_aseprite_from_path(path).map_err(|err| {
+    let imported = acms_io::aseprite::import_aseprite_from_path(path);
+    open_imported(state, path, imported)
+}
+
+fn import_cmg(state: &mut AppState, path: &Path) -> CommandResult {
+    open_imported(state, path, acms_io::cmg::import_cmg_from_path(path))
+}
+
+/// Opens a sprite read from another program's file as a new, untitled sprite, and says what
+/// did not come across as it was.
+fn open_imported(
+    state: &mut AppState,
+    path: &Path,
+    imported: Result<acms_io::aseprite::Imported, acms_io::IoError>,
+) -> CommandResult {
+    let imported = imported.map_err(|err| {
         CommandError::failed(format!("Could not import {}: {err}", path.display()))
     })?;
     state.log.push(format!("Imported {}", path.display()));
@@ -146,6 +164,66 @@ fn file_import_aseprite(state: &mut AppState, params: &Params) -> CommandResult 
             Ok(())
         }
     }
+}
+
+fn file_import_cmg(state: &mut AppState, params: &Params) -> CommandResult {
+    match params.text("path") {
+        Some(path) => import_cmg(state, Path::new(path)),
+        None => {
+            state.file_request = Some(FileRequest::ImportCmg);
+            Ok(())
+        }
+    }
+}
+
+/// Writes the frame being shown as a CMG character image.
+fn file_export_cmg(state: &mut AppState, params: &Params) -> CommandResult {
+    let Some(path) = params.text("path").map(PathBuf::from) else {
+        state.file_request = Some(FileRequest::Export {
+            command: "file.export_cmg",
+            params: params.clone(),
+            file_type: ("CMG character image", "cmg"),
+        });
+        return Ok(());
+    };
+    let document = state.editor.document().ok_or_else(no_document)?;
+    let report =
+        acms_io::cmg::export_cmg_to_path(document.sprite(), document.active_frame(), &path)
+            .map_err(|err| {
+                CommandError::failed(format!("Could not export {}: {err}", path.display()))
+            })?;
+    state.log.push(format!("Exported {}", path.display()));
+
+    // CMG has 94 colours and no transparency in between: say what that changed.
+    let mut notes = Vec::new();
+    if report.approximated > 0 {
+        notes.push(format!(
+            "{} pixels have colours CMG does not have; they are the nearest of its 94 colours.",
+            report.approximated
+        ));
+    }
+    if report.translucent > 0 {
+        notes.push(format!(
+            "{} pixels were partly transparent; CMG has no such thing, so the mostly opaque \
+             ones are solid and the rest are empty.",
+            report.translucent
+        ));
+    }
+    if report.too_long {
+        notes.push(format!(
+            "The file is longer than the {} bytes CMG_raylib reads, so it will show only the \
+             top of the picture.",
+            acms_io::cmg::TOOL_READ_LIMIT
+        ));
+    }
+    if !notes.is_empty() {
+        state.log.extend(notes.iter().cloned());
+        state.dialog = Some(Dialog::Message {
+            title: "Exported with Changes".to_owned(),
+            text: notes.join("\n"),
+        });
+    }
+    Ok(())
 }
 
 /// Replays the undo history of the active sprite into a GIF.
@@ -364,6 +442,15 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
             file_import_aseprite,
         )
         .optional_param("path", Text),
+    )?;
+    registry.register(
+        Command::new("file.import_cmg", "Import CMG Image…", file_import_cmg)
+            .optional_param("path", Text),
+    )?;
+    registry.register(
+        Command::new("file.export_cmg", "Export CMG Image…", file_export_cmg)
+            .optional_param("path", Text)
+            .enabled_when(has_document),
     )?;
     registry.register(
         Command::new(

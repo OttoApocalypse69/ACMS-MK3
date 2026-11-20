@@ -529,7 +529,10 @@ fn keymap_editor(
                 .num_columns(5)
                 .striped(true)
                 .show(ui, |ui| {
-                    for command in registry.iter().filter(|c| c.runs_without_params()) {
+                    let listed = |c: &&acms_core::command::Command<AppState>| {
+                        c.runs_without_params() && !c.is_hidden()
+                    };
+                    for command in registry.iter().filter(listed) {
                         let id = command.id();
                         if !command.name().to_lowercase().contains(&wanted) {
                             continue;

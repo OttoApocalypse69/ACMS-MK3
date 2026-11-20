@@ -13,6 +13,37 @@ egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directorie
 serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4),
 aseprite-loader 0.4.
 
+## Flappy Pencil, a hidden minigame (2026-11-20, asked for)
+
+The Konami code (↑ ↑ ↓ ↓ ← → ← → B A), typed anywhere outside a text field, opens a
+Flappy Bird-like game. Space, ↑ or a click flaps; Escape closes it. It is deliberately left out
+of the README, the menus and the command palette.
+
+- [x] `flappy.rs`: the game as plain arithmetic on a 144 × 256 world, stepped 120 times a
+  second whatever the frame rate, so it plays the same everywhere; drawn enlarged by a whole
+  number so it stays crisp
+- [x] If a sprite of at most 64 × 64 is open, the bird is that sprite (the frame on screen);
+  otherwise a built-in pixel bird, whose wing flaps
+- [x] The best score is kept while the app runs
+- [x] Hidden commands: `Command::hidden()` keeps a command out of the command palette and the
+  keyboard shortcut editor; `fun.flappy` is one, so opening the game is still a command
+
+### How it was checked
+
+- The game: nothing moves before the first flap; a flap lifts, falling ends on the ground,
+  the ceiling stops the bird without ending the game, a pipe ends it, the best score is kept,
+  the same seed makes the same pipes, a long pause is not a long fall.
+- It can be played: an autopilot that flaps near the bottom of each opening flies 30 seconds
+  through more than 15 pipes without crashing.
+- In the app: the code opens it (with the keys as egui reports them, held keys included);
+  nine of the ten keys do not; while it is open, shortcuts and the palette do nothing; Escape
+  closes it and the best score is there next time; the palette does not find it; a small
+  sprite becomes the bird, and playing changes nothing in the sprite or its history.
+- In the real window: the code typed into the running app opened the game, Space started it,
+  and the pipes and the game over screen were drawn.
+- **Not checked by me**: how it feels to play with a real keyboard; scores are not saved
+  between runs.
+
 ## Netpbm images (2026-11-20, asked for)
 
 - [x] `acms-io::netpbm`: read PBM, PGM and PPM in their plain (text, `P1`–`P3`) and raw

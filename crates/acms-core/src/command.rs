@@ -210,6 +210,7 @@ pub struct Command<C> {
     params: Vec<ParamSpec>,
     enabled: Option<EnabledFn<C>>,
     run: RunFn<C>,
+    hidden: bool,
 }
 
 impl<C> Command<C> {
@@ -225,7 +226,19 @@ impl<C> Command<C> {
             params: Vec::new(),
             enabled: None,
             run: Box::new(run),
+            hidden: false,
         }
+    }
+
+    /// Keeps the command out of lists of commands, such as the command palette: it runs only
+    /// when something asks for it by id. For easter eggs.
+    pub fn hidden(mut self) -> Self {
+        self.hidden = true;
+        self
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
     }
 
     /// Declares a parameter the command cannot run without.

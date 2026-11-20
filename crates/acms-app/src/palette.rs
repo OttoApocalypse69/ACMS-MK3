@@ -43,7 +43,7 @@ impl PaletteState {
 fn matching<'a, C>(registry: &'a CommandRegistry<C>, query: &str) -> Vec<&'a Command<C>> {
     let mut scored: Vec<(i32, &Command<C>)> = registry
         .iter()
-        .filter(|command| command.runs_without_params())
+        .filter(|command| command.runs_without_params() && !command.is_hidden())
         .filter_map(|command| {
             let by_name = fuzzy::score(query, command.name());
             let by_id = fuzzy::score(query, command.id());

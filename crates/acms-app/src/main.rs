@@ -11,6 +11,7 @@ mod commands;
 mod config;
 mod dialogs;
 mod edit_commands;
+mod flappy;
 mod fuzzy;
 mod keymap;
 mod layer_commands;

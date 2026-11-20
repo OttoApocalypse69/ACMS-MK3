@@ -404,6 +404,10 @@ pub struct AppState {
     /// Changes to the keymap that commands asked for; the app carries them out.
     pub keymap_changes: Vec<crate::settings::KeymapChange>,
     pub recovery: crate::recovery::RecoveryState,
+    /// The hidden minigame, while it is open.
+    pub flappy: Option<crate::flappy::Game>,
+    /// The best score of the minigame since the app started.
+    pub flappy_best: u32,
     /// Set by `app.quit`; the app closes the window at the end of the frame.
     pub quit_requested: bool,
 }
@@ -440,6 +444,8 @@ impl Default for AppState {
             recent: Vec::new(),
             keymap_changes: Vec::new(),
             recovery: crate::recovery::RecoveryState::default(),
+            flappy: None,
+            flappy_best: 0,
             quit_requested: false,
         }
     }

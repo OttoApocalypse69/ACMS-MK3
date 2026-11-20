@@ -496,6 +496,24 @@ pub fn register_builtin(registry: &mut CommandRegistry<AppState>) -> Result<(), 
         ))?;
     }
     crate::scripting::register_commands(registry)?;
+    registry.register(
+        Command::new("fun.flappy", "Flappy Pencil", |state: &mut AppState, _| {
+            match state.flappy.take() {
+                Some(game) => state.flappy_best = state.flappy_best.max(game.best),
+                None => {
+                    let seed = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(1, |time| time.subsec_nanos());
+                    let mut game =
+                        crate::flappy::Game::new(seed, crate::flappy::sprite_bird(state));
+                    game.best = state.flappy_best;
+                    state.flappy = Some(game);
+                }
+            }
+            Ok(())
+        })
+        .hidden(),
+    )?;
     crate::settings::register_commands(registry)?;
     crate::recovery::register_commands(registry)?;
     registry.register(

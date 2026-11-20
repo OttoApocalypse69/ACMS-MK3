@@ -31,6 +31,8 @@ pub struct AcmsApp {
     closing: bool,
     /// See [`adapt_clipboard_keys`].
     paste_seen: bool,
+    /// Listens for the code that opens the hidden minigame.
+    konami: crate::flappy::Konami,
 }
 
 /// Makes Ctrl+X / C / V reach the keymap like any other chord.
@@ -120,6 +122,7 @@ impl AcmsApp {
             panels: PanelsUi::default(),
             closing: false,
             paste_seen: false,
+            konami: crate::flappy::Konami::default(),
         })
     }
 
@@ -217,8 +220,29 @@ impl AcmsApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(u64::from(wait)));
         }
 
+        // The hidden minigame takes the keyboard while it is open.
+        if self.state.flappy.is_none() && self.state.dialog.is_none() && !ctx.text_edit_focused() {
+            let pressed: Vec<egui::Key> = ctx.input(|input| {
+                let events = input.events.iter();
+                events
+                    .filter_map(|event| match event {
+                        // A key held down repeats; that is still the key.
+                        egui::Event::Key {
+                            key, pressed: true, ..
+                        } => Some(*key),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for key in pressed {
+                if self.konami.press(key) {
+                    self.run_command("fun.flappy", &Params::new());
+                }
+            }
+        }
+
         // A dialog is modal: shortcuts wait until it is closed.
-        if self.state.dialog.is_none() {
+        if self.state.dialog.is_none() && self.state.flappy.is_none() {
             if !ctx.text_edit_focused() {
                 adapt_clipboard_keys(&ctx, &mut self.paste_seen);
             }
@@ -285,6 +309,12 @@ impl AcmsApp {
         }
 
         dialogs::show(&ctx, &mut self.state, &self.registry, &self.keymap);
+
+        if let Some(game) = &mut self.state.flappy
+            && let crate::flappy::Action::Close = crate::flappy::show(&ctx, game, "Best")
+        {
+            self.run_command("fun.flappy", &Params::new());
+        }
 
         // Say so while a file is held over the window.
         if ctx.input(|input| !input.raw.hovered_files.is_empty()) {
@@ -1698,6 +1728,85 @@ mod tests {
         again.frame(vec![]);
         assert_ne!(again.pixel(2, 3), Rgba8::TRANSPARENT);
         assert!(again.app.state.has_unsaved_changes());
+    }
+
+    fn konami(h: &mut Harness) {
+        for key in crate::flappy::KONAMI {
+            h.press(Modifiers::NONE, key);
+        }
+    }
+
+    #[test]
+    fn the_konami_code_opens_the_hidden_game() {
+        let mut h = Harness::new();
+        konami(&mut h);
+        let game = h.app.state.flappy.as_ref().expect("the game did not open");
+        assert_eq!(game.phase, crate::flappy::Phase::Ready);
+        // With no sprite open, the built-in bird flies.
+        assert!(game.bird.is_none());
+
+        // Space starts it; while it is open, keys belong to the game, not to shortcuts.
+        h.press(Modifiers::NONE, Key::Space);
+        assert_eq!(
+            h.app.state.flappy.as_ref().map(|game| game.phase),
+            Some(crate::flappy::Phase::Playing)
+        );
+        h.press(Modifiers::NONE, Key::E);
+        assert_eq!(h.app.state.editor.active_tool(), "pencil");
+        h.press(CTRL.plus(Modifiers::SHIFT), Key::P);
+        assert!(!h.app.state.palette.is_open());
+
+        // Escape closes it; the best score is kept for next time.
+        if let Some(game) = &mut h.app.state.flappy {
+            game.best = 7;
+        }
+        h.press(Modifiers::NONE, Key::Escape);
+        assert!(h.app.state.flappy.is_none());
+        assert_eq!(h.app.state.flappy_best, 7);
+        konami(&mut h);
+        assert_eq!(h.app.state.flappy.as_ref().map(|game| game.best), Some(7));
+    }
+
+    #[test]
+    fn the_hidden_game_is_not_listed_anywhere() {
+        let mut h = Harness::new();
+        let command = h.app.registry.get("fun.flappy").unwrap();
+        assert!(command.is_hidden());
+        // The palette does not find it.
+        h.press(CTRL.plus(Modifiers::SHIFT), Key::P);
+        h.type_text("flappy");
+        h.press(Modifiers::NONE, Key::Enter);
+        assert!(h.app.state.flappy.is_none());
+        // A near miss of the code does nothing, and typing the code into a text field does
+        // not count either.
+        h.press(Modifiers::NONE, Key::Escape);
+        for key in &crate::flappy::KONAMI[..9] {
+            h.press(Modifiers::NONE, *key);
+        }
+        h.press(Modifiers::NONE, Key::B);
+        assert!(h.app.state.flappy.is_none());
+    }
+
+    #[test]
+    fn a_small_open_sprite_is_the_bird() {
+        let mut h = Harness::with_sprite();
+        h.drag_pixels(PointerButton::Primary, &[(2, 2), (8, 8)]);
+        konami(&mut h);
+        let game = h.app.state.flappy.as_ref().unwrap();
+        let bird = game.bird.as_ref().expect("the sprite is not the bird");
+        assert_eq!((bird.width(), bird.height()), (16, 16));
+        assert_ne!(bird.get(5, 5), Rgba8::TRANSPARENT);
+        // The game draws for a while without trouble, and drawing it changed nothing.
+        let before = h.app.state.editor.document().unwrap().sprite().clone();
+        for _ in 0..30 {
+            h.frame(vec![]);
+        }
+        h.press(Modifiers::NONE, Key::Space);
+        for _ in 0..30 {
+            h.frame(vec![]);
+        }
+        assert_eq!(*h.app.state.editor.document().unwrap().sprite(), before);
+        assert_eq!(h.history(), ["Pencil"]);
     }
 
     /// The time one frame may take at 120 frames a second.

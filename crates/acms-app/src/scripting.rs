@@ -83,6 +83,18 @@ const SCRIPT_COMMANDS: [&str; 26] = [
     "view.zoom_fit",
 ];
 
+/// Most sprites that may be open for a script to open another.
+const MAX_DOCUMENTS_FOR_SCRIPTS: usize = 16;
+
+/// The commands that open a sprite.
+const OPENING: [&str; 5] = [
+    "file.new",
+    "file.open",
+    "file.import_aseprite",
+    "file.import_cmg",
+    "file.import_netpbm",
+];
+
 /// Whether a script may run a command of the app. Refused are the ones that reach past the
 /// sprite: saving over the file without a path, the clipboard, preferences and shortcuts,
 /// other scripts, recovery, closing and quitting.
@@ -226,6 +238,14 @@ impl Host for AppHost<'_> {
         let known = self.registry.get(id).is_some();
         if known && (a_script_command || !script_may_run(id)) {
             return Err(format!("scripts cannot run the command `{id}`"));
+        }
+        // Every sprite has its own pictures and history: a script opening sprites without
+        // end would fill the memory.
+        let open = self.state.editor.documents().count();
+        if OPENING.contains(&id) && open >= MAX_DOCUMENTS_FOR_SCRIPTS {
+            return Err(format!(
+                "{open} sprites are open; a script may not open more"
+            ));
         }
         let result = self.registry.run(id, self.state, params);
         self.state.sync_active_document();
@@ -678,6 +698,24 @@ mod tests {
         let mut f = Fixture::with_sprite();
         reload(&mut f.registry, &mut f.state);
         f
+    }
+
+    #[test]
+    fn a_script_cannot_open_sprites_without_end() {
+        let mut f = scripted();
+        lua(
+            &mut f,
+            "for i = 1, 100 do app.command('file.new', { width = 8, height = 8 }) end",
+        );
+        assert_eq!(
+            f.state.editor.documents().count(),
+            MAX_DOCUMENTS_FOR_SCRIPTS
+        );
+        assert!(
+            errors(&f)[0].contains("may not open more"),
+            "{:?}",
+            errors(&f)
+        );
     }
 
     #[test]

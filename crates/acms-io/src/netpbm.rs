@@ -412,7 +412,7 @@ pub fn import_netpbm(bytes: &[u8]) -> Result<Imported, IoError> {
     let mut decoded = 0;
     let mut skipped = 0;
     loop {
-        if images.len() == MAX_IMAGES || decoded > MAX_DECODED_BYTES {
+        if images.len() + skipped >= MAX_IMAGES || decoded > MAX_DECODED_BYTES {
             notes.push(format!(
                 "The file holds more pictures than ACMS opens; the first {} were read.",
                 images.len()
@@ -432,12 +432,11 @@ pub fn import_netpbm(bytes: &[u8]) -> Result<Imported, IoError> {
                 break;
             }
         };
+        // A picture left out was read all the same: it counts.
+        decoded += image.byte_size();
         match images.first() {
             Some(first) if first.bounds() != image.bounds() => skipped += 1,
-            _ => {
-                decoded += image.byte_size();
-                images.push(image);
-            }
+            _ => images.push(image),
         }
         if reader.at_end() {
             break;

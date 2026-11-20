@@ -48,9 +48,11 @@ libraries. They do not have `os`, `io`, `debug`, `package`, `require`, `load`, `
 - **Memory:** a script that uses more than 256 MB is stopped. Pictures a script holds
   (`cel:image()`, `image:clone()`) may take 512 MB together; let go of the ones you no
   longer need.
-- **Patterns:** `string.find`, `match`, `gmatch` and `gsub` refuse a pattern with so many
-  repeats (`*`, `+`, `-`, `?`) for text so long that matching could take minutes, since
-  matching cannot be stopped halfway.
+- **Patterns:** matching cannot be stopped halfway, so `string.find`, `match`, `gmatch` and
+  `gsub` first estimate how much work a call can be (the length of the text, the length of
+  the pattern, and its repeats `*`, `+`, `-`, `?` and `%b`) and refuse one that could hold
+  the application up. Plain searches count too. Short text is never a problem.
+- **Sprites:** a script may not open a sprite while 16 are open.
 - **Printing:** what a script prints in one run is cut off after 1 MB.
 - **Tables of the API:** their metatables are locked, `rawset` is not there, and a metatable
   with `__gc` is refused.

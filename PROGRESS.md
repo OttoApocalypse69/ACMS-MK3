@@ -78,6 +78,26 @@ An outside audit of 0.3.0 listed 19 findings (VULN-01 to VULN-19). All of them a
 - [x] **VULN-19, CI**: `permissions: contents: read` at the top (write only for publishing),
   actions pinned to commit SHAs, Inno Setup 6.7.1 and cargo-deb 3.8.0 pinned.
 
+### Second round, after the verification report
+
+A review of the fixes (`verification_report1.md`) found five gaps, now closed:
+
+- [x] **VULN-10**: the Aseprite look-over counted the frames the header claims; the parser
+  reads every frame in the file. Now the frames are counted to the end of the file. Netpbm
+  pictures of another size count toward the picture and memory limits too.
+- [x] **VULN-08**: tilemap cels become canvas-sized pictures when a file is loaded; each is
+  now charged to the file's 1 GB budget first. `load_acms` takes ordinary files of at most
+  256 MB; archives of more than 2 M entries, more than 4096 layers, colours, ramps, tags or
+  slices are refused; tileset ids must be 1 – 2³⁰ and different. The Tileset panel does not
+  make a texture over 8192 on a side and draws only the tiles in view.
+- [x] **VULN-05**: every pattern call is estimated, plain searches and patterns without
+  repeats included; `%b` counts as a repeat; the limit is 10⁸ steps, about a tenth of a
+  second.
+- [x] **VULN-06**: a script cannot open a sprite while 16 are open; the undo history counts
+  reference pictures inside groups, and frames, links, tags, tiles and tile grids.
+- [x] **VULN-01**: a path is only walked past where nothing is there at all; a link that leads
+  nowhere, or anything that cannot be looked at, is refused.
+
 ### How it was checked
 
 - New tests for each: paths (the folder itself, links out on Unix, stale folders, tools),

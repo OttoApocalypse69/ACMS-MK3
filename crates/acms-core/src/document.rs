@@ -164,10 +164,15 @@ impl Op {
         match self {
             Self::Pixels { before, after, .. } => before.byte_size() + after.byte_size(),
             Self::Insert(placement) | Self::Remove(placement) => {
-                let reference = match &placement.layer.kind {
-                    LayerKind::Reference(reference) => reference.image.byte_size(),
-                    _ => 0,
-                };
+                // Reference pictures anywhere in the layer, inside groups too.
+                let mut reference = 0;
+                let mut stack = vec![&placement.layer];
+                while let Some(layer) = stack.pop() {
+                    if let LayerKind::Reference(picture) = &layer.kind {
+                        reference += picture.image.byte_size();
+                    }
+                    stack.extend(layer.children());
+                }
                 let cels: usize = placement
                     .cels
                     .iter()
@@ -181,9 +186,33 @@ impl Op {
                 (before.len() + after.len()) * std::mem::size_of::<Slice>()
             }
             // The pictures are shared with the sprite; only the bookkeeping is extra.
-            Self::Frames { before, after } => {
-                (before.cels.len() + after.cels.len()) * std::mem::size_of::<Cel>()
-            }
+            Self::Frames { before, after } => [before, after]
+                .into_iter()
+                .map(|state| {
+                    let tiles: usize = state
+                        .tilesets
+                        .iter()
+                        .map(|set| {
+                            set.len() * set.tile_width() as usize * set.tile_height() as usize * 4
+                        })
+                        .sum();
+                    let grids: usize = state
+                        .grids
+                        .values()
+                        .map(|grid| grid.cells().len() * 4)
+                        .sum();
+                    state.cels.len() * std::mem::size_of::<Cel>()
+                        + state.frames.len() * std::mem::size_of::<Frame>()
+                        + state.links.len() * std::mem::size_of::<((LayerId, usize), u32)>()
+                        + state
+                            .tags
+                            .iter()
+                            .map(|tag| std::mem::size_of::<Tag>() + tag.name.len())
+                            .sum::<usize>()
+                        + tiles
+                        + grids
+                })
+                .sum(),
             Self::Palette { before, after } => {
                 (before.len() + after.len()) * std::mem::size_of::<crate::color::Rgba8>()
             }

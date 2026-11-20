@@ -1087,12 +1087,18 @@ fn catching_the_timeout_does_not_keep_a_script_running() {
 #[test]
 fn a_pattern_that_would_take_for_ever_is_refused() {
     let (mut engine, mut host) = setup();
-    let code = "local s = ('a'):rep(20000) return s:find('.-.-.-.-.-.-b')";
-    let message = eval_error(&mut engine, &mut host, code);
-    assert!(message.contains("too many repeats"), "{message}");
-    let code = "return string.match(('a'):rep(5000), '(.*)(.*)(.*)(.*)b')";
-    let message = eval_error(&mut engine, &mut host, code);
-    assert!(message.contains("too many repeats"), "{message}");
+    for code in [
+        "local s = ('a'):rep(20000) return s:find('.-.-.-.-.-.-b')",
+        "return string.match(('a'):rep(5000), '(.*)(.*)(.*)(.*)b')",
+        // No repeats, but compared at every place of a long text.
+        "return (('a'):rep(1e7)):find(('a'):rep(1000) .. 'b', 1, true)",
+        "return (('a'):rep(1e7)):find(('.'):rep(1000) .. 'b')",
+        // Balanced delimiters scan to the end from every start.
+        "return (('('):rep(1e5)):find('%b()')",
+    ] {
+        let message = eval_error(&mut engine, &mut host, code);
+        assert!(message.contains("too costly"), "{code}: {message}");
+    }
     // Ordinary matching is untouched.
     assert_eq!(
         eval(

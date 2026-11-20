@@ -638,6 +638,11 @@ const MAX_FRAMES: usize = 10_000;
 const MAX_CELS: usize = 1 << 20;
 const MAX_TILESETS: usize = 1024;
 const MAX_TILES: usize = 65_536;
+const MAX_LAYERS: usize = 4096;
+const MAX_LISTED: usize = 4096;
+
+/// Most entries the archive may list.
+const MAX_ENTRIES: usize = 1 << 21;
 
 /// Reads one entry of the archive, refusing one that unpacks to more than `limit` bytes:
 /// a small archive can claim to hold a huge file.
@@ -669,13 +674,19 @@ struct Budget(usize);
 
 impl Budget {
     fn take(&mut self, image: Image) -> Result<Image, IoError> {
-        self.0 = self.0.saturating_add(image.byte_size());
+        self.charge(image.byte_size())?;
+        Ok(image)
+    }
+
+    /// Counts memory that will be used for pictures made later, from what is read now.
+    fn charge(&mut self, bytes: usize) -> Result<(), IoError> {
+        self.0 = self.0.saturating_add(bytes);
         if self.0 > MAX_DECODED_BYTES {
             return Err(IoError::Unsupported(
                 "the pictures in the file take more memory than ACMS can give them".to_owned(),
             ));
         }
-        Ok(image)
+        Ok(())
     }
 }
 
@@ -686,6 +697,9 @@ fn too_many(what: &str) -> IoError {
 /// Reads a sprite from an `.acms` archive.
 pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
     let mut zip = ZipArchive::new(reader)?;
+    if zip.len() > MAX_ENTRIES {
+        return Err(too_many("entries"));
+    }
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&read_entry_limited(&mut zip, MANIFEST, MAX_MANIFEST_BYTES)?)?;
@@ -694,6 +708,21 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| IoError::Invalid("the manifest has no format version".to_owned()))?;
     let manifest: Manifest = serde_json::from_value(migrate(manifest, version)?)?;
+    if manifest.links.len() > MAX_CELS {
+        return Err(too_many("linked cels"));
+    }
+    if manifest.palette.len() > MAX_LISTED || manifest.ramps.len() > MAX_LISTED {
+        return Err(too_many("colours"));
+    }
+    if manifest.ramps.iter().any(|ramp| ramp.len() > MAX_LISTED) {
+        return Err(too_many("colours in a ramp"));
+    }
+    if manifest.tags.len() > MAX_LISTED {
+        return Err(too_many("tags"));
+    }
+    if manifest.slices.len() > MAX_LISTED {
+        return Err(too_many("slices"));
+    }
 
     let color = |text: &str| {
         Rgba8::from_hex(text).ok_or_else(|| IoError::Invalid(format!("`{text}` is not a colour")))
@@ -781,6 +810,9 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
         frames,
         cels,
     )?;
+    if sprite.walk().len() > MAX_LAYERS {
+        return Err(too_many("layers"));
+    }
     let tags = manifest
         .tags
         .into_iter()
@@ -822,7 +854,7 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
             if set.count > MAX_TILES {
                 return Err(too_many("tiles in a tileset"));
             }
-            if set.id > MAX_LAYER_ID {
+            if !(1..=MAX_LAYER_ID).contains(&set.id) {
                 return Err(IoError::Invalid(format!(
                     "tileset id {} is not allowed",
                     set.id
@@ -847,6 +879,11 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
             Ok(empty.from_atlas(&atlas, set.count, columns))
         })
         .collect::<Result<Vec<_>, IoError>>()?;
+    let mut ids: Vec<u32> = tilesets.iter().map(|set| set.id.0).collect();
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(IoError::Invalid("two tilesets have the same id".to_owned()));
+    }
     for entry in sprite.walk() {
         if let Some(tilemap) = entry.layer.as_tilemap()
             && !tilesets.iter().any(|set| set.id == tilemap.tileset)
@@ -865,6 +902,12 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
                 TileGrid::from_cells(grid.width, grid.height, grid.cells).ok_or_else(|| {
                     IoError::Invalid("a tilemap has the wrong number of cells".to_owned())
                 })?;
+            // The tiles of every tilemap cel become a picture as large as the canvas, at
+            // most: that is counted now, before any is made.
+            if !cells.is_empty() {
+                let canvas = sprite.width() as usize * sprite.height() as usize;
+                budget.charge(canvas * 4)?;
+            }
             Ok((LayerId(grid.layer), grid.frame, cells))
         })
         .collect::<Result<Vec<_>, IoError>>()?;
@@ -894,9 +937,20 @@ pub fn save_acms(sprite: &Sprite, path: &Path) -> Result<(), IoError> {
     write_atomically(path, |writer| write_acms(sprite, writer))
 }
 
-/// Loads a sprite from a file.
+/// Loads a sprite from a file: an ordinary file of at most [`crate::MAX_FILE_BYTES`].
 pub fn load_acms(path: &Path) -> Result<Sprite, IoError> {
-    read_acms(BufReader::new(File::open(path)?))
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(IoError::Unsupported("this is not a file".to_owned()));
+    }
+    if metadata.len() > crate::MAX_FILE_BYTES {
+        return Err(IoError::Unsupported(format!(
+            "the file is larger than {} MB, the most ACMS opens",
+            crate::MAX_FILE_BYTES / (1024 * 1024)
+        )));
+    }
+    read_acms(BufReader::new(file))
 }
 
 #[cfg(test)]
@@ -1653,6 +1707,54 @@ mod tests {
         // Tiles the set does not have are not drawn from.
         let loaded = read(&|m| m["grids"][0]["cells"][0] = u32::MAX.into()).unwrap();
         assert!(loaded.grid(LayerId(2), 0).is_none());
+    }
+
+    #[test]
+    fn tilemap_cels_are_counted_before_their_pictures_are_made() {
+        // A 4096 × 4096 canvas, and many tilemap cels of one tile each: every one would be
+        // drawn as a picture of the whole canvas.
+        let sprite = tiled_sprite();
+        let mut good = manifest_json(&sprite);
+        let mut zip = ZipArchive::new(Cursor::new(archive(&sprite))).unwrap();
+        let parts: Vec<(String, Vec<u8>)> = ["cels/1.png", "tiles/1.png", "tiles/2.png"]
+            .iter()
+            .map(|name| ((*name).to_owned(), read_entry(&mut zip, name).unwrap()))
+            .collect();
+        good["width"] = 4096.into();
+        good["height"] = 4096.into();
+        let grid = good["grids"][0].clone();
+        let mut grids = Vec::new();
+        // 17 cels of 64 MB each pass the 1 GB all pictures of a file may take.
+        for frame in 0..17 {
+            let mut one = grid.clone();
+            one["width"] = 1024.into();
+            one["height"] = 1024.into();
+            let mut cells = vec![0_u32; 1024 * 1024];
+            cells[0] = 1;
+            one["cells"] = cells.into();
+            one["frame"] = frame.into();
+            grids.push(one);
+        }
+        good["grids"] = grids.into();
+        good["frames"] = vec![serde_json::json!({ "duration_ms": 100 }); 17].into();
+        good["slices"] = serde_json::json!([]);
+        let manifest = good.to_string();
+        let mut files: Vec<(&str, &[u8])> = vec![(MANIFEST, manifest.as_bytes())];
+        files.extend(
+            parts
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), &bytes[..])),
+        );
+        let result = read_acms(Cursor::new(archive_with(&files)));
+        assert!(matches!(result, Err(IoError::Unsupported(_))), "{result:?}");
+    }
+
+    #[test]
+    fn only_ordinary_files_of_a_sensible_size_are_opened() {
+        assert!(matches!(
+            load_acms(&std::env::temp_dir()),
+            Err(IoError::Unsupported(_) | IoError::Io(_))
+        ));
     }
 
     #[test]

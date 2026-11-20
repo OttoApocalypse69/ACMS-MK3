@@ -463,13 +463,22 @@ pub(crate) fn allowed(path: &Path, granted: &[PathBuf]) -> bool {
     let real = loop {
         match std::fs::canonicalize(existing) {
             Ok(real) => break real,
-            Err(_) => match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    rest.push(name.to_owned());
-                    existing = parent;
+            Err(_) => {
+                // Only a name with nothing at all behind it is walked past. A link that leads
+                // nowhere (or somewhere unreadable), or anything that cannot be looked at, is
+                // refused.
+                match std::fs::symlink_metadata(existing) {
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return false,
                 }
-                _ => return false,
-            },
+                match (existing.parent(), existing.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        rest.push(name.to_owned());
+                        existing = parent;
+                    }
+                    _ => return false,
+                }
+            }
         }
     };
     let mut real = real;
@@ -928,6 +937,10 @@ mod tests {
         let granted = vec![grant(&folder.0).unwrap()];
         assert!(!allowed(&folder.0.join("door").join("a.png"), &granted));
         assert!(!allowed(&folder.0.join("file"), &granted));
+        // A link to nothing, outside: it would be made there.
+        std::os::unix::fs::symlink(outside.0.join("none"), folder.0.join("dangling")).unwrap();
+        assert!(!allowed(&folder.0.join("dangling"), &granted));
+        assert!(!allowed(&folder.0.join("dangling").join("a.png"), &granted));
         assert!(allowed(&folder.0.join("a.png"), &granted));
     }
 

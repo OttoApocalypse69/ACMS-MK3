@@ -859,6 +859,9 @@ fn palette(ui: &mut Ui, state: &mut AppState, registry: &Registry) {
 /// Side of one tile in the Tileset panel, in points.
 const TILE_SWATCH: f32 = 36.0;
 
+/// Largest side of the texture a tileset is shown with; graphics cards take no larger.
+const MAX_ATLAS_SIDE: u64 = 8192;
+
 /// The Tileset panel's picture of the tiles, and the generation, revision and tileset it was
 /// made for.
 #[derive(Default)]
@@ -881,6 +884,14 @@ fn tileset(ui: &mut Ui, state: &mut AppState, registry: &Registry, me: &mut Tile
     };
     let (count, columns) = (set.len() as u32, set.atlas_columns());
     let (tile_w, tile_h) = (set.tile_width() as f32, set.tile_height() as f32);
+    // Shown as one texture: one too large for the graphics card is not made.
+    let atlas_w = u64::from(columns) * u64::from(set.tile_width());
+    let atlas_h = u64::from(count.div_ceil(columns)) * u64::from(set.tile_height());
+    if atlas_w > MAX_ATLAS_SIDE || atlas_h > MAX_ATLAS_SIDE {
+        let text = format!("{}: {count} tiles, too many to show here.", set.name);
+        ui.label(RichText::new(text).weak());
+        return;
+    }
     let key = (state.editor.generation(), document.revision(), set.id.0);
     if me
         .texture
@@ -931,6 +942,10 @@ fn tileset(ui: &mut Ui, state: &mut AppState, registry: &Registry, me: &mut Tile
         // Tile 0 is "no tile": the eraser of the stamp.
         for tile in 0..=count {
             let (rect, response) = ui.allocate_exact_size(swatch, Sense::click());
+            // Of a large set, only the tiles in view are drawn.
+            if !ui.is_rect_visible(rect) {
+                continue;
+            }
             let painter = ui.painter_at(rect);
             color_picker::show_color_at(&painter, Color32::TRANSPARENT, rect);
             if tile > 0 {

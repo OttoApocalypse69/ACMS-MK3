@@ -51,7 +51,9 @@ const MAX_CEL_SLOTS: u64 = 1 << 20;
 const MAX_DECODED_BYTES: u64 = 1 << 30;
 
 /// Looks at how many frames and layers a file has before it is handed to the parser, which
-/// would make room for all of them at once. The parser checks everything else.
+/// would make room for all of them at once. The parser reads every frame in the file,
+/// whatever the header says, so the frames are counted to the end. The parser checks
+/// everything else.
 fn prescan(bytes: &[u8]) -> Result<(), IoError> {
     let u16_at = |at: usize| {
         let b = bytes.get(at..at.checked_add(2)?)?;
@@ -65,18 +67,20 @@ fn prescan(bytes: &[u8]) -> Result<(), IoError> {
     const FRAME_HEADER: usize = 16;
     const CHUNK_HEADER: usize = 6;
     const LAYER_CHUNK: u16 = 0x2004;
-    let Some(frames) = u16_at(6) else {
+    let Some(claimed) = u16_at(6) else {
         return Ok(());
     };
     let mut layers: u64 = 0;
+    let mut found: u64 = 0;
     let mut at = HEADER;
-    for _ in 0..frames {
+    while at < bytes.len() {
         let Some(size) = u32_at(at).map(|size| size as usize) else {
             break;
         };
         if size < FRAME_HEADER {
             break;
         }
+        found += 1;
         let end = at.saturating_add(size).min(bytes.len());
         let mut chunk = at + FRAME_HEADER;
         while chunk.saturating_add(CHUNK_HEADER) <= end {
@@ -93,7 +97,8 @@ fn prescan(bytes: &[u8]) -> Result<(), IoError> {
         }
         at = at.saturating_add(size);
     }
-    if u64::from(frames) * layers > MAX_CEL_SLOTS {
+    let frames = found.max(u64::from(claimed));
+    if frames.saturating_mul(layers) > MAX_CEL_SLOTS {
         return Err(IoError::Unsupported(format!(
             "the file has {frames} frames of {layers} layers, more than ACMS can open"
         )));
@@ -967,6 +972,17 @@ mod tests {
         assert!(matches!(
             import_aseprite(&bytes),
             Err(IoError::Unsupported(message)) if message.contains("65535 frames")
+        ));
+        // The header saying 0 frames does not hide the frames that follow: the parser reads
+        // them all. Here 60 000 small frames, each listing its own 20 layers.
+        bytes[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        let frame = bytes[128..].to_vec();
+        for _ in 0..60_000 {
+            bytes.extend_from_slice(&frame);
+        }
+        assert!(matches!(
+            import_aseprite(&bytes),
+            Err(IoError::Unsupported(message)) if message.contains("frames of")
         ));
         // And garbage is still only an error.
         assert!(prescan(&[0xFF; 3]).is_ok());

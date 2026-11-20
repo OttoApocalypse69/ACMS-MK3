@@ -389,43 +389,57 @@ local function safe_setmetatable(t, mt)
   return setmetatable(t, mt)
 end
 
--- Matching runs inside Lua's C code, where the time limit cannot stop it. A pattern with many
--- repeats can take very long on long text, so how much work it can be is estimated first.
-local MATCH_WORK = 1e9
+-- Matching runs inside Lua's C code, where the time limit cannot stop it. So how much work a
+-- call can be is estimated first, and a call that could hold the application up for more than
+-- a moment is refused. Every call is counted: a plain search too, since it compares the
+-- pattern at every place in the text.
+local MATCH_WORK = 1e8
 
-local function check_match(subject, pattern, init, plain, level)
-  if plain or type(pattern) ~= "string" then
-    return
+local function check_match(subject, pattern, plain, level)
+  if type(pattern) == "number" then
+    pattern = tostring(pattern)
   end
   if type(subject) == "number" then
     subject = tostring(subject)
   end
-  if type(subject) ~= "string" then
-    return
+  if type(subject) ~= "string" or type(pattern) ~= "string" then
+    return -- the original function says what is wrong
   end
-  local repeats, i, n = 0, 1, #pattern
-  while i <= n do
-    local c = byte(pattern, i)
-    if c == 37 then -- `%x`
-      i = i + 2
-    else
-      if c == 42 or c == 43 or c == 45 or c == 63 then -- `*`, `+`, `-`, `?`
-        repeats = repeats + 1
+  local length, n = #subject, #pattern
+  local repeats = 0
+  if not plain then
+    local i = 1
+    while i <= n do
+      local c = byte(pattern, i)
+      if c == 37 then -- `%x`
+        -- `%bxy` scans to the end of the text from where it starts: as costly as a repeat.
+        if byte(pattern, i + 1) == 98 then
+          repeats = repeats + 1
+          i = i + 4
+        else
+          i = i + 2
+        end
+      else
+        if c == 42 or c == 43 or c == 45 or c == 63 then -- `*`, `+`, `-`, `?`
+          repeats = repeats + 1
+        end
+        i = i + 1
       end
-      i = i + 1
     end
   end
-  if repeats == 0 then
-    return
-  end
-  local length = #subject
-  -- Ways the repeats can share out the text, times the places a match can start.
-  local work = sub(pattern, 1, 1) == "^" and 1 or length
+  local anchored = not plain and byte(pattern, 1) == 94 -- `^`
+  -- The places a match can start, the pattern compared at each, and the ways the repeats
+  -- can share out the text.
+  local work = (anchored and 1 or length + 1) * (n + 1)
   for k = 1, repeats do
     work = work * (length + k) / k
     if work > MATCH_WORK then
-      error("this pattern has too many repeats for text this long", level)
+      break
     end
+  end
+  if work > MATCH_WORK then
+    error("this pattern is too costly for text this long; use a simpler pattern or shorter text",
+      level)
   end
 end
 
@@ -440,7 +454,7 @@ for _, name in ipairs({ "find", "match", "gmatch", "gsub" }) do
   local plain_at = name == "find" and 4 or nil
   local guarded = function(subject, pattern, ...)
     local plain = plain_at and select(2, ...)
-    check_match(subject, pattern, nil, plain, 3)
+    check_match(subject, pattern, plain, 3)
     return original(subject, pattern, ...)
   end
   string[name] = guarded

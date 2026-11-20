@@ -245,8 +245,11 @@ fn palette_new_ramp(state: &mut AppState, params: &Params) -> CommandResult {
         .filter_map(|&index| palette.entries().get(index))
         .map(|entry| entry.color)
         .collect();
-    let with = palette::with_ramp(palette, &colors).ok_or_else(|| {
-        CommandError::failed("A ramp needs at least two different colours: select them first.")
+    let with = palette::with_ramp(palette, &colors).map_err(|err| match err {
+        palette::RampError::TooFewColors => {
+            CommandError::failed("A ramp needs at least two different colours: select them first.")
+        }
+        other => CommandError::failed(crate::commands::sentence(other)),
     })?;
     set_palette(state, "New Ramp", with)
 }
@@ -271,8 +274,11 @@ fn palette_generate_ramp(state: &mut AppState, params: &Params) -> CommandResult
     };
     let steps = steps.clamp(2, MAX_RAMP_STEPS as i64) as usize;
     let colors = palette::ramp_between(state.editor.primary, state.editor.secondary, steps);
-    let with = palette::with_ramp(palette, &colors).ok_or_else(|| {
-        CommandError::failed("The primary and the secondary colour are the same.")
+    let with = palette::with_ramp(palette, &colors).map_err(|err| match err {
+        palette::RampError::TooFewColors => {
+            CommandError::failed("The primary and the secondary colour are the same.")
+        }
+        other => CommandError::failed(crate::commands::sentence(other)),
     })?;
     set_palette(state, "Generate Ramp", with)
 }

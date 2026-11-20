@@ -13,6 +13,20 @@ pub const MAX_PALETTE_COLORS: usize = 256;
 /// Most colours a generated ramp can have.
 pub const MAX_RAMP_STEPS: usize = 32;
 
+/// Most ramps a palette can have.
+pub const MAX_RAMPS: usize = 256;
+
+/// Why a ramp could not be added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RampError {
+    #[error("a ramp needs at least two different colours")]
+    TooFewColors,
+    #[error("the palette would have more than {MAX_PALETTE_COLORS} colours")]
+    TooManyColors,
+    #[error("a palette can have at most {MAX_RAMPS} ramps")]
+    TooManyRamps,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortKey {
     /// Greys first, then around the colour wheel; within a hue from dark to light.
@@ -122,9 +136,9 @@ pub fn without_entries(palette: &Palette, indices: &[usize]) -> Palette {
 }
 
 /// The palette with one more ramp. Colours of the ramp that the palette does not have yet
-/// are added to it; a colour is only kept once in a ramp. `None` if that leaves fewer than
-/// two colours.
-pub fn with_ramp(palette: &Palette, colors: &[Rgba8]) -> Option<Palette> {
+/// are added to it; a colour is only kept once in a ramp. Refused if that leaves fewer than
+/// two colours, or the palette would have too many colours or ramps.
+pub fn with_ramp(palette: &Palette, colors: &[Rgba8]) -> Result<Palette, RampError> {
     let mut ramp: Ramp = Vec::with_capacity(colors.len());
     for color in colors.iter().map(|color| color.normalized()) {
         if !ramp.contains(&color) {
@@ -132,17 +146,23 @@ pub fn with_ramp(palette: &Palette, colors: &[Rgba8]) -> Option<Palette> {
         }
     }
     if ramp.len() < 2 {
-        return None;
+        return Err(RampError::TooFewColors);
+    }
+    if palette.ramps().len() >= MAX_RAMPS {
+        return Err(RampError::TooManyRamps);
     }
     let mut entries = palette.entries().to_vec();
     for &color in &ramp {
         if !entries.iter().any(|entry| entry.color == color) {
+            if entries.len() >= MAX_PALETTE_COLORS {
+                return Err(RampError::TooManyColors);
+            }
             entries.push(PaletteEntry { color, name: None });
         }
     }
     let mut ramps = palette.ramps().to_vec();
     ramps.push(ramp);
-    Some(Palette::new(entries).with_ramps(ramps))
+    Ok(Palette::new(entries).with_ramps(ramps))
 }
 
 /// The palette without the ramp at `index`. Its colours stay.
@@ -320,7 +340,10 @@ mod tests {
         let with = with_ramp(&palette, &[RED, GREEN, GREEN, BLUE]).unwrap();
         assert_eq!(colors(&with), [RED, GREEN, BLUE]);
         assert_eq!(with.ramps(), [vec![RED, GREEN, BLUE]]);
-        assert_eq!(with_ramp(&palette, &[RED, RED]), None);
+        assert_eq!(
+            with_ramp(&palette, &[RED, RED]),
+            Err(RampError::TooFewColors)
+        );
 
         let without = without_ramp(&with, 0);
         assert!(without.ramps().is_empty());
@@ -379,5 +402,25 @@ mod tests {
         let (palette, more) = from_image(&image);
         assert_eq!(palette.len(), MAX_PALETTE_COLORS);
         assert!(more);
+    }
+
+    #[test]
+    fn ramps_stop_at_the_limits_of_a_palette() {
+        let full = Palette::from_colors(
+            (0..MAX_PALETTE_COLORS).map(|i| Rgba8::rgb((i % 256) as u8, (i / 256) as u8, 7)),
+        );
+        assert_eq!(
+            with_ramp(&full, &[Rgba8::rgb(1, 2, 3), Rgba8::rgb(4, 5, 6)]),
+            Err(RampError::TooManyColors)
+        );
+        // Colours it has already make a ramp all the same.
+        let known = [full.entries()[0].color, full.entries()[1].color];
+        assert!(with_ramp(&full, &known).is_ok());
+
+        let mut many = Palette::from_colors([RED, BLUE]);
+        for _ in 0..MAX_RAMPS {
+            many = with_ramp(&many, &[RED, BLUE]).unwrap();
+        }
+        assert_eq!(with_ramp(&many, &[RED, BLUE]), Err(RampError::TooManyRamps));
     }
 }

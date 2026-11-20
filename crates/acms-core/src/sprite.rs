@@ -876,6 +876,15 @@ pub struct CelSource {
 /// A cel together with the layer and frame it belongs to.
 pub(crate) type PlacedCel = (LayerId, usize, Cel);
 
+/// A cel's picture where it is placed, the picture shared with whatever else uses it.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedCel {
+    pub layer: LayerId,
+    pub frame: usize,
+    pub origin: Point,
+    pub image: Arc<Image>,
+}
+
 /// How many layers there are in `layers`, those inside groups included. Works without
 /// recursion.
 pub(crate) fn tree_count(layers: &[Layer]) -> usize {
@@ -1235,19 +1244,21 @@ impl Sprite {
     }
 
     /// Every cel as a full image positioned on the canvas, to rebuild them for another size.
-    pub(crate) fn cel_sources(&self) -> Vec<CelSource> {
-        let mut sources: Vec<CelSource> = self
+    /// Every cel as layer, frame, origin and picture, in order. The pictures are the ones the
+    /// cels share, not copies: linked and copied frames cost nothing more here.
+    pub(crate) fn shared_cels(&self) -> Vec<SharedCel> {
+        let mut cels: Vec<SharedCel> = self
             .cels
             .iter()
-            .map(|(&(layer, frame), cel)| CelSource {
+            .map(|(&(layer, frame), cel)| SharedCel {
                 layer,
                 frame,
                 origin: cel.origin,
-                image: (*cel.image).clone(),
+                image: cel.image.clone(),
             })
             .collect();
-        sources.sort_by_key(|cel| (cel.layer, cel.frame));
-        sources
+        cels.sort_by_key(|cel| (cel.layer, cel.frame));
+        cels
     }
 
     /// Replaces the canvas size and every cel. The cels are clipped and cropped as usual;
@@ -1256,7 +1267,7 @@ impl Sprite {
         &mut self,
         width: u32,
         height: u32,
-        cels: Vec<CelSource>,
+        cels: Vec<SharedCel>,
         place: impl Fn(Rect) -> Rect,
     ) {
         let mut state = self.canvas_state();
@@ -1268,9 +1279,22 @@ impl Sprite {
         state.cels.clear();
         state.selection = None;
         self.set_canvas_state(state);
+        // Cels that shared a picture at the same place still share one afterwards: it is
+        // clipped and cropped once. That keeps linked cels linked as well, since every cel of
+        // a link is in the list with the same picture.
+        let mut made: HashMap<(*const Image, Point), Option<Cel>> = HashMap::new();
         for cel in cels {
+            let key = (Arc::as_ptr(&cel.image), cel.origin);
+            if let Some(result) = made.get(&key) {
+                match result {
+                    Some(done) => self.cels.insert((cel.layer, cel.frame), done.clone()),
+                    None => self.cels.remove(&(cel.layer, cel.frame)),
+                };
+                continue;
+            }
             let rect = cel.image.bounds().translated(cel.origin.x, cel.origin.y);
-            self.write_region(cel.layer, cel.frame, rect, &cel.image);
+            self.write_cel(cel.layer, cel.frame, rect, &cel.image);
+            made.insert(key, self.cels.get(&(cel.layer, cel.frame)).cloned());
         }
     }
 

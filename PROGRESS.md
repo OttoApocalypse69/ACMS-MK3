@@ -49,8 +49,24 @@ P2-10. All are fixed:
   (`Tileset::atlas_size`), Tiled maps no longer draw it just to know its size, and saving or
   exporting a tileset whose picture would be too large is refused.
 
+### Follow-up, after a review of these fixes
+
+- [x] **P2-05**: resizing the canvas and scaling the sprite no longer copy every cel's
+  picture first: they work on the pictures cels share, cut or scale each shared picture
+  once, and the cels still share the result (linked and copied frames stay as cheap as they
+  were). Resizing counts toward the 1 GB of one change too, and so does every pixel write,
+  so replacing or reducing colours over many frames stops there. The history counts a
+  picture shared by many cels once.
+- [x] **P2-10**: a ramp cannot take the palette past 256 colours, and a palette has at most
+  256 ramps (`MAX_RAMPS`, also the limit for files); `with_ramp` says which limit it hit.
+- [x] Moving a layer no longer counts as adding one, so a sprite with all 4096 layers can
+  still have them rearranged.
+
 ### How it was checked
 
+- New tests: 51 frames sharing one picture still share it after a resize and a scale, and
+  the change holds it once; a sprite of 4096 layers can move one but not add one; ramps stop
+  at full palettes and at 256 ramps. All 615 tests pass.
 - New tests: user data nested 200 000 deep imports as if it were not there; scripts cannot
   take a built-in id and calls reach the app; doubling a group stops at the layer limit;
   frames and tilesets stop at theirs; copies count all their layers; GIF and timelapse at

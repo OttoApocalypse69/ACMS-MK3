@@ -712,8 +712,11 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
     if manifest.links.len() > MAX_CELS {
         return Err(too_many("linked cels"));
     }
-    if manifest.palette.len() > MAX_LISTED || manifest.ramps.len() > MAX_LISTED {
+    if manifest.palette.len() > MAX_LISTED {
         return Err(too_many("colours"));
+    }
+    if manifest.ramps.len() > acms_core::palette::MAX_RAMPS {
+        return Err(too_many("ramps"));
     }
     if manifest.ramps.iter().any(|ramp| ramp.len() > MAX_LISTED) {
         return Err(too_many("colours in a ramp"));

@@ -11,9 +11,9 @@ use crate::geom::{Point, Rect};
 use crate::image::Image;
 use crate::selection::Mask;
 use crate::sprite::{
-    CanvasState, Cel, CelSource, DEFAULT_FRAME_MS, Frame, FrameState, Layer, LayerId, LayerKind,
-    LayerProps, MAX_FRAME_MS, MAX_FRAMES, MAX_GROUP_DEPTH, MAX_LAYERS, MAX_SLICES, MAX_SPRITE_SIZE,
-    MAX_TAGS, MAX_TILESETS, Palette, PlacedCel, Slot, Sprite, SpriteError, Symmetry, Tag,
+    CanvasState, Cel, DEFAULT_FRAME_MS, Frame, FrameState, Layer, LayerId, LayerKind, LayerProps,
+    MAX_FRAME_MS, MAX_FRAMES, MAX_GROUP_DEPTH, MAX_LAYERS, MAX_SLICES, MAX_SPRITE_SIZE, MAX_TAGS,
+    MAX_TILESETS, Palette, PlacedCel, SharedCel, Slot, Sprite, SpriteError, Symmetry, Tag,
     tree_count, tree_depth,
 };
 use crate::tiles::{MAX_TILE_SIZE, Slice, Tileset, TilesetId};
@@ -250,11 +250,16 @@ impl Op {
                 .sum(),
             // Cels the resize did not have to rebuild are shared, but counting them all is
             // the safe side to err on.
-            Self::Canvas { before, after } => [before, after]
-                .into_iter()
-                .flat_map(|state| state.cels.values())
-                .map(|cel| cel.image().byte_size())
-                .sum(),
+            // A picture shared by several cels is counted once.
+            Self::Canvas { before, after } => {
+                let mut seen = std::collections::HashSet::new();
+                [before, after]
+                    .into_iter()
+                    .flat_map(|state| state.cels.values())
+                    .filter(|cel| seen.insert(std::ptr::from_ref(cel.image())))
+                    .map(|cel| std::mem::size_of::<Cel>() + cel.image().byte_size())
+                    .sum()
+            }
         }
     }
 }
@@ -332,9 +337,6 @@ impl Transaction<'_> {
     /// that slot's siblings now and will be taken out first, which leaves one place fewer.
     fn check_slot(&self, slot: Slot, already_there: bool) -> Result<(), SpriteError> {
         self.check_depth(slot.parent, 0)?;
-        if !already_there {
-            self.check_layer_count(1)?;
-        }
         let siblings = self.sprite.siblings(slot.parent)?.len();
         let room = siblings - usize::from(already_there);
         if slot.index > room {
@@ -398,7 +400,9 @@ impl Transaction<'_> {
             before: before.crop(changed),
             after: after.crop(changed),
         });
-        Ok(())
+        // However many cels one change writes (recolouring every frame, say), it stops at
+        // what one change may hold.
+        self.check_budget(0)
     }
 
     /// Replaces the selection. `None`, or a mask with nothing in it, selects nothing, which
@@ -452,6 +456,7 @@ impl Transaction<'_> {
         tileset: TilesetId,
     ) -> Result<LayerId, SpriteError> {
         self.check_slot(slot, false)?;
+        self.check_layer_count(1)?;
         if self.sprite.tileset(tileset).is_none() {
             return Err(SpriteError::UnknownTileset(tileset.0));
         }
@@ -795,7 +800,7 @@ impl Transaction<'_> {
         &mut self,
         width: u32,
         height: u32,
-        cels: Vec<CelSource>,
+        cels: Vec<SharedCel>,
         place: impl Fn(Rect) -> Rect,
     ) -> Result<(), SpriteError> {
         let valid = 1..=MAX_SPRITE_SIZE;
@@ -822,9 +827,20 @@ impl Transaction<'_> {
         dy: i32,
     ) -> Result<(), SpriteError> {
         self.check_no_tilemaps()?;
-        let mut cels = self.sprite.cel_sources();
+        let mut cels = self.sprite.shared_cels();
+        // Each picture is cut to the new canvas once, however many cels share it; what that
+        // makes is no more than the pictures themselves.
+        let mut seen = std::collections::HashSet::new();
+        let mut kept = 0_usize;
         for cel in &mut cels {
-            cel.origin = Point::new(cel.origin.x + dx, cel.origin.y + dy);
+            if seen.insert(Arc::as_ptr(&cel.image)) {
+                kept = kept.saturating_add(cel.image.byte_size());
+                self.check_budget(kept)?;
+            }
+            cel.origin = Point::new(
+                cel.origin.x.saturating_add(dx),
+                cel.origin.y.saturating_add(dy),
+            );
         }
         self.rebuild_canvas(width, height, cels, |rect| rect.translated(dx, dy))
     }
@@ -840,19 +856,31 @@ impl Transaction<'_> {
         let bounds = self.sprite.bounds();
         // One cel at a time, each cut down to what is in it before the next is made; and no
         // more than one change may hold.
+        // A picture shared by several cels at the same place is scaled once, and the result
+        // shared again.
         let mut cels = Vec::new();
         let mut kept = 0_usize;
-        for cel in self.sprite.cel_sources() {
-            // Scale the cel as it sits on the canvas, so its position scales with it.
-            let mut canvas = Image::new(bounds.w, bounds.h);
-            canvas.blit(&cel.image, cel.origin);
-            let scaled = canvas.scaled_to(width, height);
-            let content = scaled.content_bounds();
-            let image = scaled.crop(content);
-            kept = kept.saturating_add(image.byte_size());
-            self.check_budget(kept)?;
-            cels.push(CelSource {
-                origin: Point::new(content.x, content.y),
+        let mut scaled_once: HashMap<(*const Image, Point), (Point, Arc<Image>)> = HashMap::new();
+        for cel in self.sprite.shared_cels() {
+            let key = (Arc::as_ptr(&cel.image), cel.origin);
+            let (origin, image) = match scaled_once.get(&key) {
+                Some(done) => done.clone(),
+                None => {
+                    // Scale the cel as it sits on the canvas, so its position scales with it.
+                    let mut canvas = Image::new(bounds.w, bounds.h);
+                    canvas.blit(&cel.image, cel.origin);
+                    let scaled = canvas.scaled_to(width, height);
+                    let content = scaled.content_bounds();
+                    let image = Arc::new(scaled.crop(content));
+                    kept = kept.saturating_add(image.byte_size());
+                    self.check_budget(kept)?;
+                    let done = (Point::new(content.x, content.y), image);
+                    scaled_once.insert(key, done.clone());
+                    done
+                }
+            };
+            cels.push(SharedCel {
+                origin,
                 image,
                 ..cel
             });
@@ -879,6 +907,7 @@ impl Transaction<'_> {
         image: Image,
     ) -> Result<LayerId, SpriteError> {
         self.check_slot(slot, false)?;
+        self.check_layer_count(1)?;
         if image.is_empty() {
             return Err(SpriteError::EmptyImage);
         }
@@ -900,6 +929,7 @@ impl Transaction<'_> {
         group: bool,
     ) -> Result<LayerId, SpriteError> {
         self.check_slot(slot, false)?;
+        self.check_layer_count(1)?;
         let id = self.new_layer_id();
         let layer = if group {
             Layer::group(id, name, Vec::new())
@@ -3284,5 +3314,78 @@ mod canvas_tests {
             .unwrap();
         // 51 layers came in with the copy, each with its name.
         assert!(doc.history_bytes() - before > 51 * std::mem::size_of::<Layer>());
+    }
+
+    /// A sprite whose 51 frames all show one shared picture: the first drawn, the rest copies.
+    fn copied_frames() -> Document {
+        let mut doc = Document::new(Sprite::new(64, 64).unwrap());
+        doc.transact("Draw", |tx| {
+            let block = Image::from_pixels(32, 32, vec![Rgba8::WHITE; 32 * 32]).unwrap();
+            tx.set_pixels(L1, 0, Rect::new(8, 8, 32, 32), &block)?;
+            for at in 1..=50 {
+                tx.add_frame(at, Some(0))?;
+            }
+            Ok::<_, SpriteError>(())
+        })
+        .unwrap();
+        doc
+    }
+
+    fn shared_everywhere(doc: &Document) -> bool {
+        let first = doc.sprite().cel(L1, 0).unwrap();
+        (1..=50).all(|frame| {
+            let cel = doc.sprite().cel(L1, frame).unwrap();
+            std::ptr::eq(cel.image(), first.image())
+        })
+    }
+
+    #[test]
+    fn resizing_and_scaling_keep_shared_pictures_shared() {
+        let mut doc = copied_frames();
+        assert!(shared_everywhere(&doc));
+        let before = doc.history_bytes();
+        doc.transact("Canvas", |tx| tx.resize_canvas(48, 48, -4, -4))
+            .unwrap();
+        assert!(shared_everywhere(&doc));
+        // The change holds the picture once before and once after, not 51 times.
+        let picture = 32 * 32 * 4;
+        assert!(doc.history_bytes() - before < 4 * picture);
+
+        doc.transact("Scale", |tx| tx.scale_sprite(96, 96)).unwrap();
+        assert!(shared_everywhere(&doc));
+        // The block, at (4, 4) after the resize, is twice as large and twice as far in.
+        assert_eq!(
+            doc.sprite().cel(L1, 50).unwrap().rect(),
+            Rect::new(8, 8, 64, 64)
+        );
+    }
+
+    #[test]
+    fn a_layer_can_still_be_moved_when_the_sprite_has_all_it_can() {
+        let mut layers: Vec<Layer> = (1..MAX_LAYERS as u32)
+            .map(|id| Layer::image(LayerId(id), "L"))
+            .collect();
+        layers.push(Layer::group(LayerId(MAX_LAYERS as u32), "G", Vec::new()));
+        let sprite = Sprite::from_parts(
+            4,
+            4,
+            Palette::default_palette(),
+            layers,
+            vec![Frame { duration_ms: 100 }],
+            Vec::new(),
+        )
+        .unwrap();
+        let mut doc = Document::new(sprite);
+        let group = LayerId(MAX_LAYERS as u32);
+        doc.transact("Move", |tx| {
+            tx.move_layer(LayerId(1), Slot::new(Some(group), 0))
+        })
+        .unwrap();
+        // Adding is what the limit stops.
+        let added = doc.transact("Add", |tx| tx.add_layer(Slot::new(None, 0), "X", false));
+        assert!(matches!(
+            added,
+            Err(SpriteError::TooMany { what: "layers", .. })
+        ));
     }
 }

@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "acms-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "acms-core",
  "acms-io",
@@ -155,14 +155,14 @@ dependencies = [
 
 [[package]]
 name = "acms-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "acms-io"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "acms-core",
  "aseprite-loader",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "acms-script"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "acms-core",
  "acms-io",

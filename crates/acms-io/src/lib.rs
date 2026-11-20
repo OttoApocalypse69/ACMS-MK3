@@ -393,7 +393,7 @@ pub(crate) mod test_util {
                     &block(5, 3, Rgba8::rgb(40, 60, 120)),
                 )?;
 
-                let ground_set = tx.add_tileset("Ground", 4, 4);
+                let ground_set = tx.add_tileset("Ground", 4, 4)?;
                 let ground = tx.add_tilemap_layer(Slot::new(None, 1), "Ground", ground_set)?;
                 // Drawn cell by cell, so the tiles are numbered in this order.
                 for (cell, color) in [(0, grass), (1, earth), (2, earth), (3, grass)] {
@@ -401,7 +401,7 @@ pub(crate) mod test_util {
                 }
                 tx.set_pixels(ground, 0, Rect::new(8, 4, 4, 2), &block(4, 2, grass))?;
 
-                let props_set = tx.add_tileset("Props", 4, 4);
+                let props_set = tx.add_tileset("Props", 4, 4)?;
                 let props = tx.add_tilemap_layer(Slot::new(None, 2), "Props", props_set)?;
                 tx.set_pixels(
                     props,

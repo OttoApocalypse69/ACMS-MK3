@@ -51,8 +51,13 @@ pub fn export_gif<W: Write>(
 ) -> Result<(), IoError> {
     check_frames(sprite, frames)?;
     check_scale(scale)?;
+    crate::png::check_export_size(
+        u64::from(sprite.width()) * u64::from(scale),
+        u64::from(sprite.height()) * u64::from(scale),
+    )?;
     let side = |pixels: u32| {
-        u16::try_from(pixels * scale).map_err(|_| unsupported("the picture is too large for a GIF"))
+        u16::try_from(u64::from(pixels) * u64::from(scale))
+            .map_err(|_| unsupported("the picture is too large for a GIF"))
     };
     let (width, height) = (side(sprite.width())?, side(sprite.height())?);
 
@@ -137,8 +142,12 @@ pub fn export_timelapse<W: Write>(
         width = sprite.width().max(width);
         height = sprite.height().max(height);
     });
+    crate::png::check_export_size(
+        u64::from(width) * u64::from(options.scale),
+        u64::from(height) * u64::from(options.scale),
+    )?;
     let side = |pixels: u32| {
-        u16::try_from(pixels * options.scale)
+        u16::try_from(u64::from(pixels) * u64::from(options.scale))
             .map_err(|_| unsupported("the picture is too large for a GIF"))
     };
     let (gif_width, gif_height) = (side(width)?, side(height)?);
@@ -307,6 +316,14 @@ pub struct Sheet {
     pub frames: Vec<SheetFrame>,
 }
 
+fn too_large_sheet() -> IoError {
+    unsupported(format!(
+        "the sheet would have more than {} million pixels, the most ACMS writes; trim the \
+         frames, or export fewer at a time",
+        crate::png::MAX_IMAGE_PIXELS / 1_000_000
+    ))
+}
+
 /// Lays `frames` out on one picture.
 pub fn build_sheet(
     sprite: &Sprite,
@@ -322,25 +339,36 @@ pub fn build_sheet(
     // Fits: at most `MAX_SHEET_SIZE`. Sums below saturate, and a sheet that large is refused.
     let pad = options.padding as i32;
 
-    // The picture of each frame and the part of the canvas it shows.
-    let cut: Vec<(usize, Rect, Image)> = frames
-        .iter()
-        .map(|&frame| {
-            let flat = compositor::compose(sprite, frame);
-            let source = if options.trim {
-                let content = flat.content_bounds();
-                // An empty frame still needs a place on the sheet: one clear pixel.
-                if content.is_empty() {
-                    Rect::new(0, 0, 1, 1)
-                } else {
-                    content
-                }
+    // Untrimmed, every picture is the whole canvas: whether they fit is known at once.
+    if !options.trim {
+        let pixels = frames.len() as u64 * u64::from(sprite.width()) * u64::from(sprite.height());
+        if pixels > crate::png::MAX_IMAGE_PIXELS {
+            return Err(too_large_sheet());
+        }
+    }
+    // The picture of each frame and the part of the canvas it shows. The sheet holds them
+    // all, so together they may not be more than a picture may be.
+    let mut cut: Vec<(usize, Rect, Image)> = Vec::new();
+    let mut pixels = 0_u64;
+    for &frame in frames {
+        let flat = compositor::compose(sprite, frame);
+        let source = if options.trim {
+            let content = flat.content_bounds();
+            // An empty frame still needs a place on the sheet: one clear pixel.
+            if content.is_empty() {
+                Rect::new(0, 0, 1, 1)
             } else {
-                flat.bounds()
-            };
-            (frame, source, flat.crop(source))
-        })
-        .collect();
+                content
+            }
+        } else {
+            flat.bounds()
+        };
+        pixels += source.area() as u64;
+        if pixels > crate::png::MAX_IMAGE_PIXELS {
+            return Err(too_large_sheet());
+        }
+        cut.push((frame, source, flat.crop(source)));
+    }
 
     // Top-left corner of each picture, in the order of `cut`.
     let mut corners = vec![Point::new(0, 0); cut.len()];
@@ -412,6 +440,9 @@ pub fn build_sheet(
     }
 
     let (width, height) = (width.max(1) as u32, height.max(1) as u32);
+    if !crate::png::image_size_allowed(u64::from(width), u64::from(height)) {
+        return Err(too_large_sheet());
+    }
     if width > MAX_SHEET_SIZE || height > MAX_SHEET_SIZE {
         return Err(unsupported(format!(
             "the sheet would be {width} × {height} pixels; the limit is {MAX_SHEET_SIZE} on a \
@@ -1233,6 +1264,54 @@ mod tests {
         assert!(matches!(
             export_png_sequence(&sprite, &[0], 64, target.path()),
             Err(IoError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn gifs_and_timelapses_are_held_to_the_size_of_any_export() {
+        let sprite = Sprite::new(4096, 4096).unwrap();
+        // 4096 × 15 still fits a GIF's 16-bit sides, but not the memory.
+        assert!(matches!(
+            export_gif(&sprite, &[0], 15, Vec::new()),
+            Err(IoError::Unsupported(_))
+        ));
+        let mut document = Document::new(sprite);
+        document
+            .transact("Dot", |tx| {
+                let dot = Image::from_pixels(1, 1, vec![Rgba8::WHITE]).unwrap();
+                tx.set_pixels(
+                    acms_core::sprite::LayerId(1),
+                    0,
+                    Rect::new(0, 0, 1, 1),
+                    &dot,
+                )
+            })
+            .unwrap();
+        let options = TimelapseOptions {
+            scale: 15,
+            ..TimelapseOptions::default()
+        };
+        assert!(matches!(
+            export_timelapse(&mut document, options, Vec::new()),
+            Err(IoError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn a_sheet_too_large_is_refused_before_its_frames_are_drawn() {
+        let mut document = Document::new(Sprite::new(4096, 4096).unwrap());
+        document
+            .transact("Frames", |tx| {
+                for _ in 0..10 {
+                    tx.add_frame(0, None)?;
+                }
+                Ok::<_, acms_core::sprite::SpriteError>(())
+            })
+            .unwrap();
+        let frames: Vec<usize> = (0..11).collect();
+        assert!(matches!(
+            build_sheet(document.sprite(), &frames, &SheetOptions::default()),
+            Err(IoError::Unsupported(message)) if message.contains("million pixels")
         ));
     }
 }

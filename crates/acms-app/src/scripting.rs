@@ -431,9 +431,15 @@ fn register(registry: &mut Registry, state: &mut AppState) {
         ));
         match added {
             Ok(()) => state.scripts.commands.push(command),
-            Err(err) => state
-                .scripts
-                .say(LineKind::Error, format!("Not added: {err}")),
+            Err(err) => {
+                state
+                    .scripts
+                    .say(LineKind::Error, format!("Not added: {err}"));
+                // The script must not answer to that id in place of whatever has it.
+                if let Some(engine) = &mut state.scripts.engine {
+                    let _ = engine.forget_command(&command.id);
+                }
+            }
         }
     }
     for tool in tools {
@@ -476,7 +482,15 @@ pub fn reload(registry: &mut Registry, state: &mut AppState) {
         state.dialog = None;
     }
     state.scripts.engine = match Engine::new() {
-        Ok(engine) => Some(engine),
+        // Only the app's own commands are in the registry now: scripts may not take their ids.
+        Ok(mut engine) => match engine.reserve_commands(registry.iter().map(|c| c.id())) {
+            Ok(()) => Some(engine),
+            Err(err) => {
+                let text = format!("Scripting could not be started: {err}");
+                state.scripts.say(LineKind::Error, text);
+                None
+            }
+        },
         Err(err) => {
             let text = format!("Scripting could not be started: {err}");
             state.scripts.say(LineKind::Error, text);
@@ -1374,20 +1388,28 @@ mod tests {
     #[test]
     fn scripts_cannot_take_the_ids_of_built_in_commands_or_tools() {
         let folder = TempDir::new("clash");
+        // The id of a command of the app is refused while the script loads: the script
+        // fails, and nothing it registered stays.
         folder.write(
             "clash.lua",
-            "register_command{ id = 'file.new', name = 'Mine', run = function() end }
-             register_tool{ id = 'pencil', name = 'Mine' }
+            "register_command{ id = 'my.gone', run = function() end }
+             register_command{ id = 'file.new', name = 'Mine', run = function() end }",
+        );
+        // A tool's id is only found taken once the tools join the editor.
+        folder.write(
+            "tools.lua",
+            "register_tool{ id = 'pencil', name = 'Mine' }
              register_command{ id = 'my.fine', run = function() end }",
         );
         let f = with_scripts(&folder);
         assert_eq!(
             errors(&f),
             [
-                "Not added: command `file.new` is already registered",
+                "clash.lua:2: register_command: `file.new` is a command of the application",
                 "Not added: there is a tool `pencil` already"
             ]
         );
+        assert!(f.registry.get("my.gone").is_none());
         assert_eq!(
             f.registry.get("file.new").map(Command::name),
             Some("New Sprite…")

@@ -9,7 +9,7 @@
 local error, pcall, xpcall, select, type, tostring = error, pcall, xpcall, select, type, tostring
 local setmetatable, getmetatable, ipairs, pairs = setmetatable, getmetatable, ipairs, pairs
 local rawget = rawget
-local concat = table.concat
+local concat, remove = table.concat, table.remove
 local format, byte, sub = string.format, string.byte, string.sub
 local yield, isyieldable, resume = coroutine.yield, coroutine.isyieldable, coroutine.resume
 
@@ -144,6 +144,9 @@ local sprite = setmetatable({}, {
 
 local commands, commands_by_id = {}, {}
 local tools, tools_by_id = {}, {}
+-- The ids of the application's own commands: no script may take one, so that
+-- `app.command` with such an id always means the application's command.
+local reserved = {}
 
 local function check_definition(def, what, taken)
   if type(def) ~= "table" then
@@ -157,6 +160,9 @@ local function check_definition(def, what, taken)
   end
   if taken[def.id] then
     error(what .. ": `" .. def.id .. "` is registered already", 3)
+  end
+  if taken == commands_by_id and reserved[def.id] then
+    error(what .. ": `" .. def.id .. "` is a command of the application", 3)
   end
 end
 
@@ -174,7 +180,7 @@ function app_functions.command(id, params)
   if type(id) ~= "string" then
     error("app.command needs the id of a command", 2)
   end
-  local own = commands_by_id[id]
+  local own = not reserved[id] and commands_by_id[id]
   if own then
     own.run()
     return
@@ -500,6 +506,22 @@ end
 
 function internal.set_host(fn)
   current = fn
+end
+
+function internal.reserve(id)
+  reserved[id] = true
+end
+
+-- Takes back a command the application could not add, so that it is not run in its place.
+function internal.forget_command(id)
+  if commands_by_id[id] then
+    commands_by_id[id] = nil
+    for i = #commands, 1, -1 do
+      if commands[i].id == id then
+        remove(commands, i)
+      end
+    end
+  end
 end
 
 function internal.run_command(id)

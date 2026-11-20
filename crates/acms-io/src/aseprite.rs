@@ -14,7 +14,8 @@ use acms_core::image::Image;
 use acms_core::palette::MAX_PALETTE_COLORS;
 use acms_core::sprite::{
     BlendMode, CelSource, Direction, Frame, ImageLayer, Layer, LayerId, LayerKind, MAX_FRAME_MS,
-    MAX_GROUP_DEPTH, MAX_SPRITE_SIZE, Palette, Sprite, Tag,
+    MAX_FRAMES, MAX_GROUP_DEPTH, MAX_LAYERS, MAX_SLICES, MAX_SPRITE_SIZE, MAX_TAGS, Palette,
+    Sprite, Tag,
 };
 use acms_core::tiles::Slice;
 use aseprite_loader::binary::blend_mode::BlendMode as AseBlend;
@@ -50,11 +51,15 @@ const MAX_CEL_SLOTS: u64 = 1 << 20;
 /// Most bytes the pixels of all cels may unpack to together.
 const MAX_DECODED_BYTES: u64 = 1 << 30;
 
-/// Looks at how many frames and layers a file has before it is handed to the parser, which
-/// would make room for all of them at once. The parser reads every frame in the file,
-/// whatever the header says, so the frames are counted to the end. The parser checks
-/// everything else.
-fn prescan(bytes: &[u8]) -> Result<(), IoError> {
+/// Looks a file over before it is handed to the parser, which would make room for every cel
+/// of every frame at once. The parser reads every frame in the file, whatever the header
+/// says, so the frames are counted to the end; so are layers, tags and slices.
+///
+/// User data chunks are made unreadable to the parser: ACMS has no use for them, and the
+/// parser reads the properties in them by calling itself with no end, which a crafted file
+/// turns into a stack overflow. It skips a chunk of a type it does not know. Returns the
+/// bytes to parse.
+fn prescan(bytes: &[u8]) -> Result<Cow<'_, [u8]>, IoError> {
     let u16_at = |at: usize| {
         let b = bytes.get(at..at.checked_add(2)?)?;
         Some(u16::from_le_bytes([b[0], b[1]]))
@@ -67,10 +72,17 @@ fn prescan(bytes: &[u8]) -> Result<(), IoError> {
     const FRAME_HEADER: usize = 16;
     const CHUNK_HEADER: usize = 6;
     const LAYER_CHUNK: u16 = 0x2004;
+    const TAGS_CHUNK: u16 = 0x2018;
+    const USER_DATA_CHUNK: u16 = 0x2020;
+    const SLICE_CHUNK: u16 = 0x2022;
+    /// A chunk type Aseprite does not use, which the parser skips.
+    const SKIPPED: u16 = 0x7FFF;
     let Some(claimed) = u16_at(6) else {
-        return Ok(());
+        return Ok(Cow::Borrowed(bytes));
     };
     let mut layers: u64 = 0;
+    let (mut tags, mut slices): (u64, u64) = (0, 0);
+    let mut user_data = Vec::new();
     let mut found: u64 = 0;
     let mut at = HEADER;
     while at < bytes.len() {
@@ -87,8 +99,12 @@ fn prescan(bytes: &[u8]) -> Result<(), IoError> {
             let (Some(chunk_size), Some(kind)) = (u32_at(chunk), u16_at(chunk + 4)) else {
                 break;
             };
-            if kind == LAYER_CHUNK {
-                layers += 1;
+            match kind {
+                LAYER_CHUNK => layers += 1,
+                TAGS_CHUNK => tags += u64::from(u16_at(chunk + 6).unwrap_or(0)),
+                SLICE_CHUNK => slices += 1,
+                USER_DATA_CHUNK => user_data.push(chunk + 4),
+                _ => {}
             }
             if (chunk_size as usize) < CHUNK_HEADER {
                 break;
@@ -98,12 +114,33 @@ fn prescan(bytes: &[u8]) -> Result<(), IoError> {
         at = at.saturating_add(size);
     }
     let frames = found.max(u64::from(claimed));
-    if frames.saturating_mul(layers) > MAX_CEL_SLOTS {
+    // Each on its own, and frames × layers together (a file without layers gets one).
+    let too_many = |count: u64, limit: usize, what: &str| {
+        if count > limit as u64 {
+            Err(IoError::Unsupported(format!(
+                "the file has {count} {what}; ACMS opens at most {limit}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    too_many(frames, MAX_FRAMES, "frames")?;
+    too_many(layers, MAX_LAYERS, "layers")?;
+    too_many(tags, MAX_TAGS, "tags")?;
+    too_many(slices, MAX_SLICES, "slices")?;
+    if frames.saturating_mul(layers.max(1)) > MAX_CEL_SLOTS {
         return Err(IoError::Unsupported(format!(
             "the file has {frames} frames of {layers} layers, more than ACMS can open"
         )));
     }
-    Ok(())
+    if user_data.is_empty() {
+        return Ok(Cow::Borrowed(bytes));
+    }
+    let mut rewritten = bytes.to_vec();
+    for at in user_data {
+        rewritten[at..at + 2].copy_from_slice(&SKIPPED.to_le_bytes());
+    }
+    Ok(Cow::Owned(rewritten))
 }
 
 /// Whether a file name looks like an Aseprite file.
@@ -293,7 +330,8 @@ fn palette_of(cels: &[CelSource]) -> Palette {
 /// and slices come across. Indexed and greyscale files become RGBA. What does not come
 /// across is named in [`Imported::notes`].
 pub fn import_aseprite(bytes: &[u8]) -> Result<Imported, IoError> {
-    prescan(bytes)?;
+    let bytes = prescan(bytes)?;
+    let bytes: &[u8] = &bytes;
     // The parser is somebody else's code reading somebody else's file: a mistake in either
     // must not take the app down.
     let parsed = std::panic::catch_unwind(|| parse_file(bytes).map_err(|err| err.to_string()));
@@ -982,11 +1020,93 @@ mod tests {
         }
         assert!(matches!(
             import_aseprite(&bytes),
+            Err(IoError::Unsupported(message)) if message.contains("60001 frames")
+        ));
+        // Frames and layers each within their limits, but too many cels together:
+        // 1000 frames claimed, and one frame listing 2000 layers.
+        let mut slots = bytes[..128].to_vec();
+        slots[6..8].copy_from_slice(&1000_u16.to_le_bytes());
+        let layers = 2000;
+        slots.extend_from_slice(&((16 + layers * 6) as u32).to_le_bytes());
+        slots.extend_from_slice(&0xF1FA_u16.to_le_bytes());
+        slots.extend_from_slice(&[0; 10]);
+        for _ in 0..layers {
+            slots.extend_from_slice(&6_u32.to_le_bytes());
+            slots.extend_from_slice(&0x2004_u16.to_le_bytes());
+        }
+        assert!(matches!(
+            import_aseprite(&slots),
             Err(IoError::Unsupported(message)) if message.contains("frames of")
         ));
         // And garbage is still only an error.
         assert!(prescan(&[0xFF; 3]).is_ok());
+
+        // A file without layers is not a way round: one layer is made for it.
+        let mut many = vec![0_u8; 128];
+        many[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        for _ in 0..20_000 {
+            many.extend_from_slice(&16_u32.to_le_bytes());
+            many.extend_from_slice(&0xF1FA_u16.to_le_bytes());
+            many.extend_from_slice(&[0; 10]);
+        }
+        assert!(matches!(
+            import_aseprite(&many),
+            Err(IoError::Unsupported(message)) if message.contains("20000 frames")
+        ));
         assert!(import_aseprite(&[0xFF; 200]).is_err());
+    }
+
+    #[test]
+    fn user_data_is_hidden_from_the_parser() {
+        // A real file, with a user data chunk of properties nested far deeper than any stack
+        // takes put into its first frame.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/samples/aseprite/default.aseprite");
+        let original = std::fs::read(path).unwrap();
+        let mut map = Vec::new();
+        map.extend_from_slice(&0_u32.to_le_bytes()); // its key
+        map.extend_from_slice(&1_u32.to_le_bytes()); // one property
+        map.extend_from_slice(&1_u16.to_le_bytes()); // a name of one byte
+        map.push(b'v');
+        map.extend_from_slice(&0x0011_u16.to_le_bytes()); // the property is a vector
+        for _ in 0..200_000 {
+            // ...of one element, itself a vector...
+            map.extend_from_slice(&1_u32.to_le_bytes());
+            map.extend_from_slice(&0x0011_u16.to_le_bytes());
+        }
+        // ...and the last one empty.
+        map.extend_from_slice(&0_u32.to_le_bytes());
+        map.extend_from_slice(&0x0011_u16.to_le_bytes());
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&0x2020_u16.to_le_bytes());
+        chunk.extend_from_slice(&4_u32.to_le_bytes()); // flags: has properties
+        chunk.extend_from_slice(&((map.len() + 8) as u32).to_le_bytes()); // size of the maps
+        chunk.extend_from_slice(&1_u32.to_le_bytes()); // one map
+        chunk.extend_from_slice(&map);
+        let mut sized = ((chunk.len() + 4) as u32).to_le_bytes().to_vec();
+        sized.extend_from_slice(&chunk);
+
+        // Put after the first frame's header, with the frame's size and chunk count raised.
+        let mut bytes = original[..128 + 16].to_vec();
+        bytes.extend_from_slice(&sized);
+        bytes.extend_from_slice(&original[128 + 16..]);
+        let frame_size = u32::from_le_bytes(bytes[128..132].try_into().unwrap());
+        let frame_size = frame_size + sized.len() as u32;
+        bytes[128..132].copy_from_slice(&frame_size.to_le_bytes());
+        let old = u16::from_le_bytes(bytes[134..136].try_into().unwrap());
+        bytes[134..136].copy_from_slice(&(old + 1).to_le_bytes());
+        let new = u32::from_le_bytes(bytes[140..144].try_into().unwrap());
+        if new != 0 {
+            bytes[140..144].copy_from_slice(&(new + 1).to_le_bytes());
+        }
+        let total = bytes.len() as u32;
+        bytes[0..4].copy_from_slice(&total.to_le_bytes());
+
+        // Without the look-over the parser overflows its stack on this (checked by hand:
+        // STATUS_STACK_OVERFLOW).
+        let imported = import_aseprite(&bytes).unwrap();
+        let expected = import_aseprite(&original).unwrap();
+        assert_eq!(imported.sprite, expected.sprite);
     }
 
     #[test]

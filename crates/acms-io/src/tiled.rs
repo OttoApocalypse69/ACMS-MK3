@@ -49,8 +49,15 @@ pub fn tileset_image(tileset: &Tileset) -> (Image, u32) {
     (tileset.atlas(columns), columns)
 }
 
+/// Refuses a tileset whose picture would be larger than a picture ACMS writes.
+pub(crate) fn check_atlas(tileset: &Tileset) -> Result<(), IoError> {
+    let (width, height) = tileset.atlas_size(tileset.atlas_columns());
+    crate::png::check_export_size(u64::from(width), u64::from(height))
+}
+
 /// Writes a tileset's picture to a PNG file.
 pub fn export_tileset(tileset: &Tileset, path: &Path) -> Result<(), IoError> {
+    check_atlas(tileset)?;
     let (image, _) = tileset_image(tileset);
     write_atomically(path, |writer| encode_png(&image, writer))
 }
@@ -156,13 +163,15 @@ pub fn tiled_map(
     let tileset_values: Vec<serde_json::Value> = first_gids
         .iter()
         .map(|(set, first)| {
-            let (image, columns) = tileset_image(set);
+            // Only the size of the picture is needed here, not the picture.
+            let columns = set.atlas_columns();
+            let (image_width, image_height) = set.atlas_size(columns);
             json!({
                 "firstgid": first,
                 "name": set.name,
                 "image": image_of(set),
-                "imagewidth": image.width(),
-                "imageheight": image.height(),
+                "imagewidth": image_width,
+                "imageheight": image_height,
                 "tilewidth": set.tile_width(),
                 "tileheight": set.tile_height(),
                 "tilecount": set.len(),
@@ -198,6 +207,12 @@ pub fn tiled_map(
 pub fn export_tiled(sprite: &Sprite, frame: usize, path: &Path) -> Result<Vec<PathBuf>, IoError> {
     let stem = stem(path);
     let image_name = |set: &Tileset| format!("{stem}_{}_{}.png", file_part(&set.name), set.id.0);
+    let layers = tilemap_layers(sprite);
+    for set in sprite.tilesets() {
+        if layers.iter().any(|(_, used)| used.id == set.id) {
+            check_atlas(set)?;
+        }
+    }
     let map = tiled_map(sprite, frame, &image_name)?;
     write_atomically(path, |writer| Ok(writer.write_all(map.as_bytes())?))?;
 

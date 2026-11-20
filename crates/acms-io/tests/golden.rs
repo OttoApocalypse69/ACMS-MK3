@@ -733,7 +733,7 @@ fn tile_stamp_and_auto_mode() {
     let document = editor.document_mut().expect("a document is open");
     let map = document
         .transact("Tilemap", |tx| {
-            let tileset = tx.add_tileset("Tiles", 8, 8);
+            let tileset = tx.add_tileset("Tiles", 8, 8)?;
             tx.add_tilemap_layer(Slot::new(None, 1), "Map", tileset)
         })
         .unwrap();

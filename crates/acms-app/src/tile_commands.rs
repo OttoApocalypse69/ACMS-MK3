@@ -80,7 +80,7 @@ fn new_tilemap(state: &mut AppState, params: &Params) -> CommandResult {
     let layer = transact(state, "New Tilemap Layer", |tx| {
         let tileset = match existing {
             Some(id) => id,
-            None => tx.add_tileset(&format!("Tileset {number}"), width, height),
+            None => tx.add_tileset(&format!("Tileset {number}"), width, height)?,
         };
         tx.add_tilemap_layer(top, &format!("Tilemap {number}"), tileset)
     })?;

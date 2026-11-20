@@ -23,7 +23,7 @@ fn document() -> (Document, LayerId) {
     let mut doc = Document::new(Sprite::new(16, 8).unwrap());
     let map = doc
         .transact("Tilemap", |tx| {
-            let tileset = tx.add_tileset("Ground", 4, 4);
+            let tileset = tx.add_tileset("Ground", 4, 4)?;
             tx.add_tilemap_layer(Slot::new(None, 1), "Map", tileset)
         })
         .unwrap();

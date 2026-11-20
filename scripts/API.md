@@ -53,6 +53,8 @@ libraries. They do not have `os`, `io`, `debug`, `package`, `require`, `load`, `
   the pattern, and its repeats `*`, `+`, `-`, `?` and `%b`) and refuse one that could hold
   the application up. Plain searches count too. Short text is never a problem.
 - **Sprites:** a script may not open a sprite while 16 are open.
+- **Ids:** a script cannot register a command with the id of one of the application's own
+  commands; a script that tries does not load.
 - **Printing:** what a script prints in one run is cut off after 1 MB.
 - **Tables of the API:** their metatables are locked, `rawset` is not there, and a metatable
   with `__gc` is refused.

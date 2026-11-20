@@ -13,7 +13,7 @@ use crate::color::Rgba8;
 use crate::geom::{Point, Rect};
 use crate::image::Image;
 use crate::selection::Mask;
-use crate::tiles::{Slice, TileGrid, Tileset, TilesetId};
+use crate::tiles::{MAX_TILES, Slice, TileGrid, Tileset, TilesetId};
 
 /// Largest width or height of a sprite. The canvas is shown as a single texture, and this is
 /// a size every GPU the app targets can hold.
@@ -24,6 +24,14 @@ pub const DEFAULT_FRAME_MS: u32 = 100;
 
 /// Most groups a layer can be inside of, one in another.
 pub const MAX_GROUP_DEPTH: usize = 64;
+
+/// Most layers (groups included), frames, tags, slices and tilesets a sprite can have. Files
+/// are refused beyond these, and edits that would go past them too.
+pub const MAX_LAYERS: usize = 4096;
+pub const MAX_FRAMES: usize = 10_000;
+pub const MAX_TAGS: usize = 4096;
+pub const MAX_SLICES: usize = 4096;
+pub const MAX_TILESETS: usize = 1024;
 
 /// Largest layer id a sprite read from a file may use. Ids above it are kept free, so that
 /// new layers always get one.
@@ -89,6 +97,12 @@ pub enum SpriteError {
     TooDeep,
     #[error("layer id {0} is not allowed")]
     InvalidLayerId(u32),
+    #[error("a sprite can have at most {limit} {what}")]
+    TooMany { what: &'static str, limit: usize },
+    #[error(
+        "that would take more memory than one change may use; try it on fewer frames or a smaller sprite"
+    )]
+    TooLarge,
     #[error("there is no image layer directly below to merge into")]
     NothingBelow,
     #[error("pixel data is {got_w}×{got_h} but the area to fill is {want_w}×{want_h}")]
@@ -664,7 +678,12 @@ impl FrameState {
                     for (x, y, color) in changes {
                         picture.set(x, y, color);
                     }
-                    let tile = set.find(&picture).unwrap_or_else(|| set.push(picture));
+                    // A full set takes no new tiles: the cell stays empty.
+                    let tile = match set.find(&picture) {
+                        Some(tile) => tile,
+                        None if set.len() < MAX_TILES => set.push(picture),
+                        None => continue,
+                    };
                     grid.set(cx as u32, cy as u32, tile);
                 }
             }
@@ -857,6 +876,23 @@ pub struct CelSource {
 /// A cel together with the layer and frame it belongs to.
 pub(crate) type PlacedCel = (LayerId, usize, Cel);
 
+/// How many layers there are in `layers`, those inside groups included. Works without
+/// recursion.
+pub(crate) fn tree_count(layers: &[Layer]) -> usize {
+    let mut count = 0;
+    let mut stack: Vec<&[Layer]> = vec![layers];
+    while let Some(list) = stack.pop() {
+        count += list.len();
+        for layer in list {
+            let children = layer.children();
+            if !children.is_empty() {
+                stack.push(children);
+            }
+        }
+    }
+    count
+}
+
 /// How deep the deepest layer in `layers` is, the layers themselves being at depth 0.
 /// Works without recursion, so that any tree can be measured.
 pub(crate) fn tree_depth(layers: &[Layer]) -> usize {
@@ -983,6 +1019,18 @@ impl Sprite {
         // Checked before anything walks the tree, which recurses.
         if tree_depth(&layers) > MAX_GROUP_DEPTH {
             return Err(SpriteError::TooDeep);
+        }
+        if tree_count(&layers) > MAX_LAYERS {
+            return Err(SpriteError::TooMany {
+                what: "layers",
+                limit: MAX_LAYERS,
+            });
+        }
+        if frames.len() > MAX_FRAMES {
+            return Err(SpriteError::TooMany {
+                what: "frames",
+                limit: MAX_FRAMES,
+            });
         }
         let frames = frames
             .into_iter()

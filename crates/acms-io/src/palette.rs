@@ -62,6 +62,25 @@ fn rgb_line(line: &str) -> Option<(Rgba8, &str)> {
 
 /// Reads a palette from the text of a palette file. More than [`MAX_PALETTE_COLORS`] colours
 /// is an error rather than a silent cut.
+/// Most bytes a palette file in text may have: far more than 256 colours ever take.
+const MAX_PALETTE_FILE_BYTES: u64 = 1024 * 1024;
+
+fn too_many_colors() -> IoError {
+    IoError::Unsupported(format!(
+        "the palette has more than {MAX_PALETTE_COLORS} colours; at most \
+         {MAX_PALETTE_COLORS} can be imported"
+    ))
+}
+
+/// Adds a colour, refusing the first one more than a palette can hold.
+fn add(entries: &mut Vec<PaletteEntry>, entry: PaletteEntry) -> Result<(), IoError> {
+    if entries.len() >= MAX_PALETTE_COLORS {
+        return Err(too_many_colors());
+    }
+    entries.push(entry);
+    Ok(())
+}
+
 pub fn parse_palette(text: &str, format: PaletteFormat) -> Result<Palette, IoError> {
     let text = text.trim_start_matches('\u{feff}');
     let lines = text.lines().map(str::trim).enumerate();
@@ -86,7 +105,7 @@ pub fn parse_palette(text: &str, format: PaletteFormat) -> Result<Palette, IoErr
                 let (color, name) =
                     rgb_line(line).ok_or_else(|| invalid(index + 1, "expected `R G B name`"))?;
                 let name = (!name.is_empty() && name != "Untitled").then(|| name.to_owned());
-                entries.push(PaletteEntry { color, name });
+                add(&mut entries, PaletteEntry { color, name })?;
             }
         }
         PaletteFormat::Hex => {
@@ -96,7 +115,7 @@ pub fn parse_palette(text: &str, format: PaletteFormat) -> Result<Palette, IoErr
                 }
                 let color = Rgba8::from_hex(line)
                     .ok_or_else(|| invalid(index + 1, "expected a colour like `FF8800`"))?;
-                entries.push(PaletteEntry { color, name: None });
+                add(&mut entries, PaletteEntry { color, name: None })?;
             }
         }
         PaletteFormat::Pal => {
@@ -111,6 +130,9 @@ pub fn parse_palette(text: &str, format: PaletteFormat) -> Result<Palette, IoErr
                         let count: usize = line
                             .parse()
                             .map_err(|_| invalid(3, "expected the number of colours"))?;
+                        if count > MAX_PALETTE_COLORS {
+                            return Err(too_many_colors());
+                        }
                         expected = Some(count);
                         continue;
                     }
@@ -119,7 +141,7 @@ pub fn parse_palette(text: &str, format: PaletteFormat) -> Result<Palette, IoErr
                 }
                 let (color, _) =
                     rgb_line(line).ok_or_else(|| invalid(index + 1, "expected `R G B`"))?;
-                entries.push(PaletteEntry { color, name: None });
+                add(&mut entries, PaletteEntry { color, name: None })?;
             }
             match expected {
                 Some(count) if count == entries.len() => {}
@@ -203,7 +225,7 @@ pub fn load_palette(path: &Path) -> Result<LoadedPalette, IoError> {
     let format = PaletteFormat::from_path(path).ok_or_else(|| {
         IoError::Unsupported("palettes are read from .gpl, .hex, .pal and .png files".to_owned())
     })?;
-    let bytes = crate::read_file(path)?;
+    let bytes = crate::read_file_limited(path, MAX_PALETTE_FILE_BYTES)?;
     let text = String::from_utf8_lossy(&bytes);
     Ok(LoadedPalette {
         palette: parse_palette(&text, format)?,
@@ -375,6 +397,33 @@ mod tests {
         assert!(matches!(
             load_palette(target.path()),
             Err(IoError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_palette_with_more_colours_than_can_be_used_stops_at_the_first_too_many() {
+        let hex = "ff0000\n".repeat(MAX_PALETTE_COLORS + 1);
+        assert!(matches!(
+            parse_palette(&hex, PaletteFormat::Hex),
+            Err(IoError::Unsupported(_))
+        ));
+        let hex = "ff0000\n".repeat(MAX_PALETTE_COLORS);
+        assert!(parse_palette(&hex, PaletteFormat::Hex).is_ok());
+        // A JASC header promising too many is refused at once.
+        let pal = "JASC-PAL\n0100\n100000\n255 0 0\n";
+        assert!(matches!(
+            parse_palette(pal, PaletteFormat::Pal),
+            Err(IoError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn palette_files_are_read_only_up_to_a_size_no_palette_needs() {
+        let target = TempPath::new("huge.hex");
+        std::fs::write(target.path(), vec![b'\n'; 2 * 1024 * 1024]).unwrap();
+        assert!(matches!(
+            load_palette(target.path()),
+            Err(IoError::Unsupported(_))
         ));
     }
 }

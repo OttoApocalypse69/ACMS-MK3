@@ -225,6 +225,27 @@ impl Engine {
         })
     }
 
+    /// Keeps these ids (the application's own commands) from being registered by scripts.
+    /// Called before scripts are loaded.
+    pub fn reserve_commands<'a>(
+        &mut self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), ScriptError> {
+        let reserve: Function = self.internal.get("reserve")?;
+        for id in ids {
+            reserve.call::<()>(id)?;
+        }
+        Ok(())
+    }
+
+    /// Takes back a command a script registered that the application could not add.
+    pub fn forget_command(&mut self, id: &str) -> Result<(), ScriptError> {
+        self.internal
+            .get::<Function>("forget_command")?
+            .call::<()>(id)?;
+        Ok(())
+    }
+
     /// Changes how long a script may run before it is stopped.
     pub fn set_time_limit(&mut self, limit: Duration) {
         self.time_limit = limit;

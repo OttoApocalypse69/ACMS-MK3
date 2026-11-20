@@ -13,6 +13,9 @@ use crate::image::Image;
 /// Largest side of a tile.
 pub const MAX_TILE_SIZE: u32 = 256;
 
+/// Most tiles a tileset can have.
+pub const MAX_TILES: usize = 65_536;
+
 /// Identifies a tileset for as long as the sprite exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TilesetId(pub u32);
@@ -114,6 +117,22 @@ impl Tileset {
     }
 
     /// How many tiles are in a row of an atlas that is about square.
+    /// The size of [`Tileset::atlas`] with `columns` tiles to a row, without making it.
+    /// Saturates: a size that large is refused by whoever would make it.
+    pub fn atlas_size(&self, columns: u32) -> (u32, u32) {
+        let columns = columns.max(1);
+        let rows = (self.tiles.len() as u64)
+            .div_ceil(u64::from(columns))
+            .max(1);
+        let side = |count: u64, tile: u32| {
+            u32::try_from(count.saturating_mul(u64::from(tile))).unwrap_or(u32::MAX)
+        };
+        (
+            side(u64::from(columns), self.tile_width),
+            side(rows, self.tile_height),
+        )
+    }
+
     pub fn atlas_columns(&self) -> u32 {
         ((self.tiles.len() as f64).sqrt().ceil() as u32).max(1)
     }
@@ -121,9 +140,9 @@ impl Tileset {
     /// All tiles in one picture, `columns` to a row, in order. A set without tiles gives a
     /// picture of one empty tile.
     pub fn atlas(&self, columns: u32) -> Image {
+        let (width, height) = self.atlas_size(columns);
         let columns = columns.max(1);
-        let rows = (self.tiles.len() as u32).div_ceil(columns).max(1);
-        let mut image = Image::new(columns * self.tile_width, rows * self.tile_height);
+        let mut image = Image::new(width, height);
         for (index, tile) in self.tiles.iter().enumerate() {
             let x = (index as u32 % columns * self.tile_width) as i32;
             let y = (index as u32 / columns * self.tile_height) as i32;

@@ -84,7 +84,8 @@ pub fn ramp_between(from: Rgba8, to: Rgba8, steps: usize) -> Ramp {
 /// The palette with `color` added at the end, unless it is already in it.
 pub fn with_color(palette: &Palette, color: Rgba8) -> Palette {
     let mut entries = palette.entries().to_vec();
-    if !palette.contains(color) {
+    // A full palette takes no more.
+    if !palette.contains(color) && entries.len() < MAX_PALETTE_COLORS {
         entries.push(PaletteEntry { color, name: None });
     }
     Palette::new(entries).with_ramps(palette.ramps().to_vec())

@@ -12,8 +12,9 @@ use crate::image::Image;
 use crate::selection::Mask;
 use crate::sprite::{
     CanvasState, Cel, CelSource, DEFAULT_FRAME_MS, Frame, FrameState, Layer, LayerId, LayerKind,
-    LayerProps, MAX_FRAME_MS, MAX_GROUP_DEPTH, MAX_SPRITE_SIZE, Palette, PlacedCel, Slot, Sprite,
-    SpriteError, Symmetry, Tag, tree_depth,
+    LayerProps, MAX_FRAME_MS, MAX_FRAMES, MAX_GROUP_DEPTH, MAX_LAYERS, MAX_SLICES, MAX_SPRITE_SIZE,
+    MAX_TAGS, MAX_TILESETS, Palette, PlacedCel, Slot, Sprite, SpriteError, Symmetry, Tag,
+    tree_count, tree_depth,
 };
 use crate::tiles::{MAX_TILE_SIZE, Slice, Tileset, TilesetId};
 
@@ -47,6 +48,10 @@ impl Placement {
 /// One reversible change.
 /// What every change in the history costs on top of the data it holds.
 const OP_OVERHEAD: usize = std::mem::size_of::<Op>();
+
+/// Most memory the changes of one transaction may hold. Edits of every frame at once (scaling
+/// the sprite, merging, flattening) are refused beyond it rather than run out of memory.
+pub const MAX_TRANSACTION_BYTES: usize = 1 << 30;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Op {
@@ -164,27 +169,30 @@ impl Op {
         match self {
             Self::Pixels { before, after, .. } => before.byte_size() + after.byte_size(),
             Self::Insert(placement) | Self::Remove(placement) => {
-                // Reference pictures anywhere in the layer, inside groups too.
-                let mut reference = 0;
+                // Every layer in it, inside groups too, with its name and any picture.
+                let mut layers = 0;
                 let mut stack = vec![&placement.layer];
                 while let Some(layer) = stack.pop() {
+                    layers += std::mem::size_of::<Layer>() + layer.name.len();
                     if let LayerKind::Reference(picture) = &layer.kind {
-                        reference += picture.image.byte_size();
+                        layers += picture.image.byte_size();
                     }
                     stack.extend(layer.children());
                 }
                 let cels: usize = placement
                     .cels
                     .iter()
-                    .map(|(_, _, cel)| cel.image().byte_size())
+                    .map(|(_, _, cel)| std::mem::size_of::<PlacedCel>() + cel.image().byte_size())
                     .sum();
-                reference + cels + placement.layer.name.len()
+                layers + cels
             }
             Self::Move { .. } => 0,
             Self::Props { before, after, .. } => before.name.len() + after.name.len(),
-            Self::Slices { before, after } => {
-                (before.len() + after.len()) * std::mem::size_of::<Slice>()
-            }
+            Self::Slices { before, after } => before
+                .iter()
+                .chain(after.iter())
+                .map(|slice| std::mem::size_of::<Slice>() + slice.name.len())
+                .sum(),
             // The pictures are shared with the sprite; only the bookkeeping is extra.
             Self::Frames { before, after } => [before, after]
                 .into_iter()
@@ -213,9 +221,28 @@ impl Op {
                         + grids
                 })
                 .sum(),
-            Self::Palette { before, after } => {
-                (before.len() + after.len()) * std::mem::size_of::<crate::color::Rgba8>()
-            }
+            Self::Palette { before, after } => [before, after]
+                .into_iter()
+                .map(|palette| {
+                    let entries: usize = palette
+                        .entries()
+                        .iter()
+                        .map(|entry| {
+                            std::mem::size_of::<crate::sprite::PaletteEntry>()
+                                + entry.name.as_ref().map_or(0, String::len)
+                        })
+                        .sum();
+                    let ramps: usize = palette
+                        .ramps()
+                        .iter()
+                        .map(|ramp| {
+                            std::mem::size_of::<Vec<crate::color::Rgba8>>()
+                                + ramp.len() * std::mem::size_of::<crate::color::Rgba8>()
+                        })
+                        .sum();
+                    entries + ramps
+                })
+                .sum(),
             Self::Selection { before, after } => [before, after]
                 .into_iter()
                 .flatten()
@@ -237,6 +264,8 @@ pub struct Transaction<'a> {
     sprite: &'a mut Sprite,
     next_layer_id: &'a mut u32,
     ops: Vec<Op>,
+    /// Memory the changes so far hold.
+    bytes: usize,
 }
 
 impl Transaction<'_> {
@@ -247,7 +276,28 @@ impl Transaction<'_> {
 
     fn push(&mut self, op: Op) {
         op.apply(self.sprite);
+        self.bytes = self.bytes.saturating_add(op.byte_size());
         self.ops.push(op);
+    }
+
+    /// Refuses to go on once the changes hold more than [`MAX_TRANSACTION_BYTES`], or would
+    /// with `more` bytes on top.
+    fn check_budget(&self, more: usize) -> Result<(), SpriteError> {
+        if self.bytes.saturating_add(more) > MAX_TRANSACTION_BYTES {
+            return Err(SpriteError::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// Refuses `added` more layers if the sprite would then have more than [`MAX_LAYERS`].
+    fn check_layer_count(&self, added: usize) -> Result<(), SpriteError> {
+        if tree_count(self.sprite.layers()) + added > MAX_LAYERS {
+            return Err(SpriteError::TooMany {
+                what: "layers",
+                limit: MAX_LAYERS,
+            });
+        }
+        Ok(())
     }
 
     fn new_layer_id(&mut self) -> LayerId {
@@ -282,6 +332,9 @@ impl Transaction<'_> {
     /// that slot's siblings now and will be taken out first, which leaves one place fewer.
     fn check_slot(&self, slot: Slot, already_there: bool) -> Result<(), SpriteError> {
         self.check_depth(slot.parent, 0)?;
+        if !already_there {
+            self.check_layer_count(1)?;
+        }
         let siblings = self.sprite.siblings(slot.parent)?.len();
         let room = siblings - usize::from(already_there);
         if slot.index > room {
@@ -371,13 +424,24 @@ impl Transaction<'_> {
     }
 
     /// Adds an empty tileset. Returns its id.
-    pub fn add_tileset(&mut self, name: &str, tile_width: u32, tile_height: u32) -> TilesetId {
+    pub fn add_tileset(
+        &mut self,
+        name: &str,
+        tile_width: u32,
+        tile_height: u32,
+    ) -> Result<TilesetId, SpriteError> {
+        if self.sprite.tilesets().len() >= MAX_TILESETS {
+            return Err(SpriteError::TooMany {
+                what: "tilesets",
+                limit: MAX_TILESETS,
+            });
+        }
         let highest = self.sprite.tilesets().iter().map(|set| set.id.0).max();
         let id = TilesetId(highest.map_or(1, |id| id.saturating_add(1)));
         let size = |side: u32| side.clamp(1, MAX_TILE_SIZE);
         let tileset = Tileset::new(id, name, size(tile_width), size(tile_height));
         self.edit_frames(|state| state.tilesets.push(tileset));
-        id
+        Ok(id)
     }
 
     /// Adds an empty tilemap layer that draws from `tileset`. Returns its id.
@@ -438,6 +502,12 @@ impl Transaction<'_> {
     /// Adds a slice. Returns its position among the slices.
     pub fn add_slice(&mut self, slice: Slice) -> Result<usize, SpriteError> {
         Self::check_slice(&slice)?;
+        if self.sprite.slices().len() >= MAX_SLICES {
+            return Err(SpriteError::TooMany {
+                what: "slices",
+                limit: MAX_SLICES,
+            });
+        }
         self.edit_slices(|slices| slices.push(slice));
         Ok(self.sprite.slices().len() - 1)
     }
@@ -497,6 +567,12 @@ impl Transaction<'_> {
     pub fn add_frame(&mut self, at: usize, copy_of: Option<usize>) -> Result<(), SpriteError> {
         if at > self.sprite.frames().len() {
             return Err(SpriteError::UnknownFrame(at));
+        }
+        if self.sprite.frames().len() >= MAX_FRAMES {
+            return Err(SpriteError::TooMany {
+                what: "frames",
+                limit: MAX_FRAMES,
+            });
         }
         if let Some(source) = copy_of {
             self.check_frame(source)?;
@@ -672,6 +748,12 @@ impl Transaction<'_> {
     /// Adds a tag. Returns its position among the tags.
     pub fn add_tag(&mut self, tag: Tag) -> Result<usize, SpriteError> {
         self.check_tag(&tag)?;
+        if self.sprite.tags().len() >= MAX_TAGS {
+            return Err(SpriteError::TooMany {
+                what: "tags",
+                limit: MAX_TAGS,
+            });
+        }
         self.edit_frames(|state| state.tags.push(tag));
         Ok(self.sprite.tags().len() - 1)
     }
@@ -756,21 +838,25 @@ impl Transaction<'_> {
             return Err(SpriteError::InvalidSize(width, height));
         }
         let bounds = self.sprite.bounds();
-        let cels = self
-            .sprite
-            .cel_sources()
-            .into_iter()
-            .map(|cel| {
-                // Scale the cel as it sits on the canvas, so its position scales with it.
-                let mut canvas = Image::new(bounds.w, bounds.h);
-                canvas.blit(&cel.image, cel.origin);
-                CelSource {
-                    origin: Point::new(0, 0),
-                    image: canvas.scaled_to(width.max(1), height.max(1)),
-                    ..cel
-                }
-            })
-            .collect();
+        // One cel at a time, each cut down to what is in it before the next is made; and no
+        // more than one change may hold.
+        let mut cels = Vec::new();
+        let mut kept = 0_usize;
+        for cel in self.sprite.cel_sources() {
+            // Scale the cel as it sits on the canvas, so its position scales with it.
+            let mut canvas = Image::new(bounds.w, bounds.h);
+            canvas.blit(&cel.image, cel.origin);
+            let scaled = canvas.scaled_to(width, height);
+            let content = scaled.content_bounds();
+            let image = scaled.crop(content);
+            kept = kept.saturating_add(image.byte_size());
+            self.check_budget(kept)?;
+            cels.push(CelSource {
+                origin: Point::new(content.x, content.y),
+                image,
+                ..cel
+            });
+        }
         // A reference picture keeps covering the same part of the sprite.
         let scale = |at: i32, old: u32, new: u32| {
             (i64::from(at) * i64::from(new)).div_euclid(i64::from(old.max(1))) as i32
@@ -856,6 +942,8 @@ impl Transaction<'_> {
             .sprite
             .slot_of(id)
             .ok_or(SpriteError::UnknownLayer(id.0))?;
+        // Counted before anything is copied.
+        self.check_layer_count(tree_count(std::slice::from_ref(self.known(id)?)))?;
         let mut copy = self.known(id)?.clone();
 
         // Every layer in the copy needs an id of its own.
@@ -978,6 +1066,7 @@ impl Transaction<'_> {
                 }
             }
             self.set_pixels(below, frame, rect, &merged)?;
+            self.check_budget(0)?;
         }
         self.remove_layer(id)?;
         Ok(below)
@@ -989,12 +1078,16 @@ impl Transaction<'_> {
     /// Returns the id of the new layer.
     pub fn flatten(&mut self) -> Result<LayerId, SpriteError> {
         let id = self.new_layer_id();
-        let cels = (0..self.sprite.frames().len())
-            .filter_map(|frame| {
-                let flat = compositor::compose(self.sprite, frame);
-                Some((id, frame, Cel::cropped(&flat, Point::new(0, 0))?))
-            })
-            .collect();
+        let mut cels = Vec::new();
+        let mut kept = 0_usize;
+        for frame in 0..self.sprite.frames().len() {
+            let flat = compositor::compose(self.sprite, frame);
+            if let Some(cel) = Cel::cropped(&flat, Point::new(0, 0)) {
+                kept = kept.saturating_add(cel.image().byte_size());
+                self.check_budget(kept)?;
+                cels.push((id, frame, cel));
+            }
+        }
 
         // The new layer goes in first, so the sprite is never without a layer.
         self.push(Op::Insert(Box::new(Placement {
@@ -1198,6 +1291,7 @@ impl Document {
             sprite: &mut self.sprite,
             next_layer_id: &mut self.next_layer_id,
             ops: Vec::new(),
+            bytes: 0,
         };
         let result = edit(&mut transaction);
         let mut ops = transaction.ops;
@@ -3109,5 +3203,86 @@ mod canvas_tests {
             doc.transact("Move", |tx| tx.move_layer(groups[MAX_GROUP_DEPTH], top))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn copying_groups_into_themselves_cannot_double_the_layers_without_end() {
+        let mut doc = Document::new(Sprite::new(4, 4).unwrap());
+        let group = doc
+            .transact("Group", |tx| tx.add_layer(Slot::new(None, 1), "G", true))
+            .unwrap();
+        // Copy the group and put the copy inside it, again and again: twice the layers each
+        // time, until the limit says no.
+        let mut refused = None;
+        for _ in 0..20 {
+            let result = doc.transact("Double", |tx| {
+                let copy = tx.duplicate_layer(group)?;
+                tx.move_layer(copy, Slot::new(Some(group), 0))
+            });
+            if let Err(err) = result {
+                refused = Some(err);
+                break;
+            }
+        }
+        assert_eq!(
+            refused,
+            Some(SpriteError::TooMany {
+                what: "layers",
+                limit: MAX_LAYERS
+            })
+        );
+        assert!(doc.sprite().walk().len() <= MAX_LAYERS);
+    }
+
+    #[test]
+    fn frames_tags_slices_and_tilesets_stop_at_their_limits() {
+        let mut doc = Document::new(Sprite::new(4, 4).unwrap());
+        let result = doc.transact("Frames", |tx| {
+            for _ in 0..MAX_FRAMES {
+                tx.add_frame(0, None)?;
+            }
+            Ok::<_, SpriteError>(())
+        });
+        assert!(matches!(
+            result,
+            Err(SpriteError::TooMany { what: "frames", .. })
+        ));
+        let result = doc.transact("Sets", |tx| {
+            for _ in 0..=MAX_TILESETS {
+                tx.add_tileset("T", 4, 4)?;
+            }
+            Ok::<_, SpriteError>(())
+        });
+        assert!(matches!(
+            result,
+            Err(SpriteError::TooMany {
+                what: "tilesets",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_layers_a_change_inserts_are_all_counted() {
+        let mut doc = Document::new(Sprite::new(4, 4).unwrap());
+        let group = doc
+            .transact("Group", |tx| tx.add_layer(Slot::new(None, 1), "G", true))
+            .unwrap();
+        doc.transact("Fill", |tx| {
+            for index in 0..50 {
+                tx.add_layer(
+                    Slot::new(Some(group), index),
+                    "a long name for a layer",
+                    false,
+                )?;
+            }
+            Ok::<_, SpriteError>(())
+        })
+        .unwrap();
+        let before = doc.history_bytes();
+        doc.transact("Copy", |tx| tx.duplicate_layer(group))
+            .unwrap();
+        // 51 layers came in with the copy, each with its name.
+        assert!(doc.history_bytes() - before > 51 * std::mem::size_of::<Layer>());
     }
 }

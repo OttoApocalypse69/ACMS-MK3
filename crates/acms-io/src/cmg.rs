@@ -158,25 +158,43 @@ pub fn is_cmg_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cmg"))
 }
 
-/// The rows of a CMG file, as bytes, without their line endings.
-fn rows(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut rows: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+/// The rows of a CMG file, as bytes, without their line endings. `None` if there are more
+/// than a sprite can be tall: counted as they are found, so a file of nothing but line
+/// endings makes no list of millions of rows.
+fn rows(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    let limit = MAX_SPRITE_SIZE as usize;
+    let mut rows: Vec<&[u8]> = Vec::new();
+    for row in bytes.split(|byte| *byte == b'\n') {
+        // One more is allowed for the empty piece after a last newline.
+        if rows.len() > limit {
+            return None;
+        }
+        rows.push(row);
+    }
     // The newline after the last row ends it; it does not start another.
     if rows.last().is_some_and(|row| row.is_empty()) {
         rows.pop();
+    }
+    if rows.len() > limit {
+        return None;
     }
     for row in &mut rows {
         if let Some(without) = row.strip_suffix(b"\r") {
             *row = without;
         }
     }
-    rows
+    Some(rows)
 }
 
 /// Reads a CMG file into a sprite with one layer and one frame, and the CMG colours as its
 /// palette.
 pub fn import_cmg(bytes: &[u8]) -> Result<Imported, IoError> {
-    let rows = rows(bytes);
+    let limit = MAX_SPRITE_SIZE as usize;
+    let rows = rows(bytes).ok_or_else(|| {
+        IoError::Unsupported(format!(
+            "the picture has more than {limit} rows; ACMS takes at most {limit}"
+        ))
+    })?;
     let width = rows.iter().map(|row| row.len()).max().unwrap_or(0);
     let height = rows.len();
     if width == 0 {
@@ -504,5 +522,16 @@ mod tests {
                 assert_eq!(ours, reference.get(x, y), "pixel {x}, {y}");
             }
         }
+    }
+
+    #[test]
+    fn a_file_of_endless_rows_is_refused_without_listing_them() {
+        let bytes = vec![b'\n'; 1_000_000];
+        assert!(matches!(import_cmg(&bytes), Err(IoError::Unsupported(_))));
+        // As many rows as a sprite can be tall is fine, with or without a last newline.
+        let mut tall = b"R\n".repeat(MAX_SPRITE_SIZE as usize);
+        assert_eq!(import_cmg(&tall).unwrap().sprite.height(), MAX_SPRITE_SIZE);
+        tall.pop();
+        assert_eq!(import_cmg(&tall).unwrap().sprite.height(), MAX_SPRITE_SIZE);
     }
 }

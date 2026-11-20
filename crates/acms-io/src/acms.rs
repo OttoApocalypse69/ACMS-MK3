@@ -19,10 +19,10 @@ use acms_core::geom::{Point, Rect};
 use acms_core::image::Image;
 use acms_core::sprite::{
     BlendMode, CelSource, Direction, Frame, GroupLayer, ImageLayer, Layer, LayerId, LayerKind,
-    MAX_LAYER_ID, MAX_SPRITE_SIZE, Palette, PaletteEntry, ReferenceLayer, Sprite, Symmetry, Tag,
-    TilemapLayer,
+    MAX_LAYER_ID, MAX_LAYERS, MAX_SPRITE_SIZE, MAX_TILESETS, Palette, PaletteEntry, ReferenceLayer,
+    Sprite, Symmetry, Tag, TilemapLayer,
 };
-use acms_core::tiles::{MAX_TILE_SIZE, Slice, TileGrid, Tileset, TilesetId};
+use acms_core::tiles::{MAX_TILE_SIZE, MAX_TILES, Slice, TileGrid, Tileset, TilesetId};
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -545,6 +545,8 @@ pub fn write_acms<W: Write + Seek>(sprite: &Sprite, writer: W) -> Result<(), IoE
         encode_png(picture, &mut zip)?;
     }
     for set in sprite.tilesets() {
+        // A picture larger than ACMS reads back would make a file that does not open.
+        crate::tiled::check_atlas(set)?;
         zip.start_file(tileset_path(set.id.0), image)?;
         encode_png(&set.atlas(set.atlas_columns()), &mut zip)?;
     }
@@ -636,9 +638,8 @@ const MAX_DECODED_BYTES: usize = 1 << 30;
 /// Most frames, cels, tilesets or tiles of a set a file may have.
 const MAX_FRAMES: usize = 10_000;
 const MAX_CELS: usize = 1 << 20;
-const MAX_TILESETS: usize = 1024;
-const MAX_TILES: usize = 65_536;
-const MAX_LAYERS: usize = 4096;
+/// Most tiles all the tilesets of a file may have together.
+const MAX_TOTAL_TILES: usize = MAX_TILES;
 const MAX_LISTED: usize = 4096;
 
 /// Most entries the archive may list.
@@ -757,6 +758,13 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
     if manifest.tilesets.len() > MAX_TILESETS {
         return Err(too_many("tilesets"));
     }
+    let tiles = manifest
+        .tilesets
+        .iter()
+        .fold(0_usize, |sum, set| sum.saturating_add(set.count));
+    if tiles > MAX_TOTAL_TILES {
+        return Err(too_many("tiles"));
+    }
     let mut budget = Budget(0);
     let mut picture = |id: u32| {
         let image = decode_png(&read_entry(&mut zip, &reference_path(id))?)?;
@@ -861,6 +869,9 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
                 )));
             }
             let atlas = budget.take(decode_png(&read_entry(&mut zip, &tileset_path(set.id))?)?)?;
+            // Each tile becomes a picture of its own, with its own bookkeeping.
+            let tile = (set.tile_width * set.tile_height) as usize * 4 + 64;
+            budget.charge(set.count.saturating_mul(tile))?;
             // The picture has to be large enough for the tiles it is said to hold. With at
             // most `MAX_TILES` tiles of at most `MAX_TILE_SIZE`, nothing here overflows.
             let count = set.count as u64;

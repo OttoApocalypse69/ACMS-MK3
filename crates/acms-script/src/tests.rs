@@ -1119,6 +1119,32 @@ fn a_pattern_that_would_take_for_ever_is_refused() {
 }
 
 #[test]
+fn a_script_cannot_take_the_id_of_a_command_of_the_application() {
+    let (mut engine, mut host) = setup();
+    engine.reserve_commands(["file.export_gif"]).unwrap();
+    let evil = "register_command { id = 'file.export_gif', run = function() print('stolen') end }";
+    let err = engine.load(&mut host, "evil.lua", evil).unwrap_err();
+    assert!(err.0.contains("a command of the application"), "{err}");
+    // Another script asking for the command reaches the application.
+    eval(&mut engine, &mut host, "app.command('file.export_gif')");
+    assert_eq!(host.ran.len(), 1);
+    assert_eq!(host.ran[0].0, "file.export_gif");
+
+    // A command the application turned down for another reason is taken back too.
+    engine
+        .load(
+            &mut host,
+            "other.lua",
+            "register_command { id = 'mine', run = function() print('mine') end }",
+        )
+        .unwrap();
+    engine.forget_command("mine").unwrap();
+    assert!(engine.commands().iter().all(|command| command.id != "mine"));
+    eval(&mut engine, &mut host, "app.command('mine')");
+    assert_eq!(host.ran.last().unwrap().0, "mine");
+}
+
+#[test]
 fn one_script_cannot_change_what_another_sees() {
     let (mut engine, mut host) = setup();
     let evil = "

@@ -14,6 +14,54 @@ egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directorie
 serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4),
 aseprite-loader 0.4.
 
+## Security fixes from the second audit (2026-11-20, asked for)
+
+A second audit (`pass2_audit_report.md`, against `b0491ce`) found ten more problems, P2-01 to
+P2-10. All are fixed:
+
+- [x] **P2-01, Aseprite user data**: the parser reads the properties of user data chunks by
+  calling itself with no limit, so a small file overflowed the stack (checked: a file with
+  200 000 nested vectors ends the unprotected parser with `STATUS_STACK_OVERFLOW`). ACMS
+  does not use user data: the look-over now gives those chunks a type the parser skips.
+  Worth reporting to `aseprite-loader` as well.
+- [x] **P2-02, script command ids**: scripts are told the ids of the app's own commands
+  before they load; `register_command` / `register_filter` refuse them, `app.command` with
+  such an id always reaches the app, and a command the app turned down is taken back from
+  the script side. A script that tries fails to load as a whole.
+- [x] **P2-03, doubling layers**: at most 4096 layers (`MAX_LAYERS`), checked in
+  `Sprite::from_parts` and before a layer is added or copied (the whole copy is counted
+  first); the history counts every layer a change brings in, with its name.
+- [x] **P2-04, GIF and timelapse size**: held to the same export limits as PNG.
+- [x] **P2-05, every frame at once**: a spritesheet checks its size before drawing the
+  frames when untrimmed, and counts the trimmed pictures as it goes (at most 64 M pixels);
+  scaling the sprite crops each cel as soon as it is scaled; scaling, merging down and
+  flattening stop at 1 GB for one change (`MAX_TRANSACTION_BYTES`).
+- [x] **P2-06, Aseprite counts**: frames (10 000), layers (4096), tags and slices (4096
+  each) are capped on their own; a file without layers counts as one layer.
+- [x] **P2-07, CMG rows**: counted as they are found; more than 4096 is refused at once.
+- [x] **P2-08, tiles**: at most 65 536 tiles in a file altogether, and each tile's own
+  picture and bookkeeping is charged to the file's budget.
+- [x] **P2-09, palettes**: reading stops at the 257th colour; a JASC header promising more
+  is refused; palette text files are read up to 1 MB.
+- [x] **P2-10**: the history counts slice and colour names and ramps; frames, tags, slices,
+  tilesets, tiles (auto mode leaves a cell empty when its set is full) and palette colours
+  have limits while editing too; a tileset's picture is sized without making it
+  (`Tileset::atlas_size`), Tiled maps no longer draw it just to know its size, and saving or
+  exporting a tileset whose picture would be too large is refused.
+
+### How it was checked
+
+- New tests: user data nested 200 000 deep imports as if it were not there; scripts cannot
+  take a built-in id and calls reach the app; doubling a group stops at the layer limit;
+  frames and tilesets stop at theirs; copies count all their layers; GIF and timelapse at
+  scale 15 of 4096 × 4096 are refused; an untrimmed sheet of 11 such frames is refused
+  without drawing; Aseprite files without layers and with 1000 × 2000 cels are refused;
+  a CMG file of a million newlines is refused, 4096 rows are not; palettes of 257 colours,
+  a JASC header of 100 000, and a 2 MB palette file are refused.
+- `cargo fmt`, `cargo clippy -D warnings` and all 612 tests pass on Windows.
+- **Not checked by me**: how the 1 GB limit for one change feels on very large animated
+  sprites (scaling a 4096 × 4096 sprite of more than about 16 full frames is now refused).
+
 ## Security fixes from the audit report (2026-11-20, asked for)
 
 An outside audit of 0.3.0 listed 19 findings (VULN-01 to VULN-19). All of them are fixed:

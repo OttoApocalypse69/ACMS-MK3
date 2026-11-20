@@ -216,6 +216,10 @@ pub fn export_png_sequence(
 ) -> Result<Vec<PathBuf>, IoError> {
     check_frames(sprite, frames)?;
     check_scale(scale)?;
+    crate::png::check_export_size(
+        u64::from(sprite.width()) * u64::from(scale),
+        u64::from(sprite.height()) * u64::from(scale),
+    )?;
     let paths = sequence_paths(path, frames.len());
     for (&frame, file) in frames.iter().zip(&paths) {
         let image = compositor::compose(sprite, frame).scaled_up(scale);
@@ -310,6 +314,12 @@ pub fn build_sheet(
     options: &SheetOptions,
 ) -> Result<Sheet, IoError> {
     check_frames(sprite, frames)?;
+    if options.padding > MAX_SHEET_SIZE {
+        return Err(unsupported(format!(
+            "the padding can be at most {MAX_SHEET_SIZE} pixels"
+        )));
+    }
+    // Fits: at most `MAX_SHEET_SIZE`. Sums below saturate, and a sheet that large is refused.
     let pad = options.padding as i32;
 
     // The picture of each frame and the part of the canvas it shows.
@@ -347,7 +357,7 @@ pub fn build_sheet(
             let (mut along, mut line_start, mut thickness) = (pad, pad, 0);
             for (index, corner) in corners.iter_mut().enumerate() {
                 if index > 0 && index % per_line == 0 {
-                    line_start += thickness + pad;
+                    line_start = line_start.saturating_add(thickness + pad);
                     along = pad;
                     thickness = 0;
                 }
@@ -358,9 +368,10 @@ pub fn build_sheet(
                 } else {
                     Point::new(line_start, along)
                 };
-                along += length + pad;
+                along = along.saturating_add(length + pad);
                 thickness = thickness.max(thick);
-                let (far_along, far_across) = (along, line_start + thickness + pad);
+                let far_across = line_start.saturating_add(thickness + pad);
+                let far_along = along;
                 if across {
                     width = width.max(far_along);
                     height = height.max(far_across);
@@ -387,15 +398,15 @@ pub fn build_sheet(
             for index in order {
                 let (w, h) = size(index);
                 if x > pad && x + w + pad > target {
-                    y += shelf + pad;
+                    y = y.saturating_add(shelf + pad);
                     x = pad;
                     shelf = 0;
                 }
                 corners[index] = Point::new(x, y);
-                x += w + pad;
+                x = x.saturating_add(w + pad);
                 shelf = shelf.max(h);
                 width = width.max(x);
-                height = height.max(y + shelf + pad);
+                height = height.max(y.saturating_add(shelf + pad));
             }
         }
     }
@@ -1192,5 +1203,36 @@ mod tests {
         };
         assert!(export_timelapse(&mut document, no_scale, &mut bytes).is_err());
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn padding_too_large_for_a_sheet_is_refused_not_wrapped() {
+        let sprite = animated_sprite();
+        for padding in [MAX_SHEET_SIZE + 1, u32::MAX / 2, u32::MAX] {
+            let options = SheetOptions {
+                padding,
+                ..SheetOptions::default()
+            };
+            assert!(matches!(
+                build_sheet(&sprite, &[0, 1], &options),
+                Err(IoError::Unsupported(_))
+            ));
+        }
+        // Large but allowed padding gives a sheet that is too large: refused all the same.
+        let options = SheetOptions {
+            padding: MAX_SHEET_SIZE,
+            ..SheetOptions::default()
+        };
+        assert!(build_sheet(&sprite, &[0, 1, 2, 3], &options).is_err());
+    }
+
+    #[test]
+    fn a_sequence_too_large_to_hold_is_refused() {
+        let sprite = Sprite::new(4096, 4096).unwrap();
+        let target = TempPath::new("huge-sequence.png");
+        assert!(matches!(
+            export_png_sequence(&sprite, &[0], 64, target.path()),
+            Err(IoError::Unsupported(_))
+        ));
     }
 }

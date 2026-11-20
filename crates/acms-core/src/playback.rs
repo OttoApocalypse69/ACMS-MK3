@@ -90,15 +90,17 @@ impl Playback {
 
         // After a long pause (the window was hidden, say) there is no point in replaying
         // every loop that was missed: only where in the loop the time lands matters.
-        let cycle: u32 = match direction {
-            Direction::PingPong if to > from => {
-                let all: u32 = frames[from..=to].iter().map(|f| f.duration_ms).sum();
-                2 * all - frames[from].duration_ms - frames[to].duration_ms
-            }
-            _ => frames[from..=to].iter().map(|f| f.duration_ms).sum(),
+        // Counted in 64 bits, each frame at least 1 ms as below, so that no sprite overflows
+        // it and a cycle is never 0.
+        let ms = |frame: &crate::sprite::Frame| u64::from(frame.duration_ms.max(1));
+        let all: u64 = frames[from..=to].iter().map(ms).sum();
+        let cycle = match direction {
+            Direction::PingPong if to > from => 2 * all - ms(&frames[from]) - ms(&frames[to]),
+            _ => all,
         };
-        if cycle > 0 && self.shown_ms > 2 * cycle {
-            self.shown_ms %= cycle;
+        if u64::from(self.shown_ms) > 2 * cycle {
+            // Smaller than the cycle, and the cycle is below `shown_ms`: it fits.
+            self.shown_ms = (u64::from(self.shown_ms) % cycle) as u32;
         }
 
         loop {
@@ -227,5 +229,30 @@ mod tests {
         let single = sprite(Some((2, 2, Direction::PingPong)));
         assert_eq!(shown(&single, Some(0), 2, 20), [2]);
         assert_eq!(shown(&single, Some(7), 3, 4), [3, 4, 0]);
+    }
+
+    #[test]
+    fn the_longest_frames_and_pauses_neither_overflow_nor_hang() {
+        use crate::sprite::{Frame, MAX_FRAME_MS};
+        let frames = vec![
+            Frame {
+                duration_ms: MAX_FRAME_MS,
+            };
+            10_000
+        ];
+        let sprite = Sprite::from_parts(
+            1,
+            1,
+            crate::sprite::Palette::default_palette(),
+            vec![crate::sprite::Layer::image(crate::sprite::LayerId(1), "A")],
+            frames,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut playback = Playback::starting_at(0);
+        for _ in 0..100 {
+            playback.advance(&sprite, None, u32::MAX);
+        }
+        assert!(playback.frame < 10_000);
     }
 }

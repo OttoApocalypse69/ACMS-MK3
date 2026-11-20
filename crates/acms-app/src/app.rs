@@ -1698,7 +1698,8 @@ mod tests {
                 .unwrap()
                 .count()
         };
-        assert_eq!(kept(), 2);
+        // The copy, its note, and the lock that says the app is running.
+        assert_eq!(kept(), 3);
 
         h.app.exit();
         assert_eq!(kept(), 0);

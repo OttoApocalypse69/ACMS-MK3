@@ -167,18 +167,17 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, Str
     }
 }
 
-/// Writes a small settings file, by way of a temporary file so that a crash halfway leaves
-/// the old one.
+/// Writes a small settings file, by way of a new temporary file so that a crash halfway
+/// leaves the old one, and two windows writing at once do not mix their files.
 pub fn write_text(path: &Path, text: &str) -> Result<(), String> {
-    let write = || -> std::io::Result<()> {
+    let write = || -> Result<(), acms_io::IoError> {
         if let Some(folder) = path.parent() {
             std::fs::create_dir_all(folder)?;
         }
-        let mut temp = path.as_os_str().to_owned();
-        temp.push(".tmp");
-        let temp = PathBuf::from(temp);
-        std::fs::write(&temp, text)?;
-        std::fs::rename(&temp, path)
+        acms_io::write_atomically(path, |file| {
+            use std::io::Write;
+            Ok(file.write_all(text.as_bytes())?)
+        })
     };
     write().map_err(|err| format!("could not write {} ({err})", path.display()))
 }

@@ -6,7 +6,7 @@ use acms_core::edit::{self, Clip, Transform};
 use acms_core::editor::DocId;
 use acms_core::geom::{Point, Rect};
 use acms_core::selection::Mask;
-use acms_core::sprite::{LayerId, Sprite};
+use acms_core::sprite::{LayerId, MAX_SPRITE_SIZE, Sprite};
 
 use crate::clipboard;
 use crate::layer_commands::transact;
@@ -128,10 +128,19 @@ fn scale_selection(state: &mut AppState, params: &Params) -> CommandResult {
         ask_size(state, SizePurpose::ScaleSelection, region);
         return Ok(());
     };
-    if width == 0 || height == 0 {
-        return Err(CommandError::failed("The size must be at least 1 × 1."));
-    }
+    check_size(width, height)?;
     transform(state, "Scale Selection", Transform::Scale { width, height })
+}
+
+/// Refuses a size that no sprite can have, before anything of that size is made.
+fn check_size(width: u32, height: u32) -> CommandResult {
+    let valid = 1..=MAX_SPRITE_SIZE;
+    if !valid.contains(&width) || !valid.contains(&height) {
+        return Err(CommandError::failed(format!(
+            "The size must be between 1 × 1 and {MAX_SPRITE_SIZE} × {MAX_SPRITE_SIZE}."
+        )));
+    }
+    Ok(())
 }
 
 fn canvas_size(state: &mut AppState, params: &Params) -> CommandResult {
@@ -146,6 +155,8 @@ fn canvas_size(state: &mut AppState, params: &Params) -> CommandResult {
         Some(id) => Anchor::from_id(id)
             .ok_or_else(|| CommandError::failed(format!("\"{id}\" is not an anchor.")))?,
     };
+    check_size(width, height)?;
+    // Both sizes are at most `MAX_SPRITE_SIZE`, so the differences fit.
     let (dx, dy) = anchor.offset(width as i32 - old.w as i32, height as i32 - old.h as i32);
     transact(state, "Canvas Size", |tx| {
         tx.resize_canvas(width, height, dx, dy)

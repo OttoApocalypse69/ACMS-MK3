@@ -12,8 +12,8 @@ use crate::image::Image;
 use crate::selection::Mask;
 use crate::sprite::{
     CanvasState, Cel, CelSource, DEFAULT_FRAME_MS, Frame, FrameState, Layer, LayerId, LayerKind,
-    LayerProps, MAX_FRAME_MS, MAX_SPRITE_SIZE, Palette, PlacedCel, Slot, Sprite, SpriteError,
-    Symmetry, Tag,
+    LayerProps, MAX_FRAME_MS, MAX_GROUP_DEPTH, MAX_SPRITE_SIZE, Palette, PlacedCel, Slot, Sprite,
+    SpriteError, Symmetry, Tag, tree_depth,
 };
 use crate::tiles::{MAX_TILE_SIZE, Slice, Tileset, TilesetId};
 
@@ -45,6 +45,9 @@ impl Placement {
 }
 
 /// One reversible change.
+/// What every change in the history costs on top of the data it holds.
+const OP_OVERHEAD: usize = std::mem::size_of::<Op>();
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Op {
     /// The pixels of `rect` on one cel went from `before` to `after`.
@@ -153,14 +156,30 @@ impl Op {
     }
 
     fn byte_size(&self) -> usize {
+        // Every step costs at least its own bookkeeping, so that many small ones add up.
+        OP_OVERHEAD + self.content_size()
+    }
+
+    fn content_size(&self) -> usize {
         match self {
             Self::Pixels { before, after, .. } => before.byte_size() + after.byte_size(),
-            Self::Insert(placement) | Self::Remove(placement) => placement
-                .cels
-                .iter()
-                .map(|(_, _, cel)| cel.image().byte_size())
-                .sum(),
-            Self::Move { .. } | Self::Props { .. } | Self::Slices { .. } => 0,
+            Self::Insert(placement) | Self::Remove(placement) => {
+                let reference = match &placement.layer.kind {
+                    LayerKind::Reference(reference) => reference.image.byte_size(),
+                    _ => 0,
+                };
+                let cels: usize = placement
+                    .cels
+                    .iter()
+                    .map(|(_, _, cel)| cel.image().byte_size())
+                    .sum();
+                reference + cels + placement.layer.name.len()
+            }
+            Self::Move { .. } => 0,
+            Self::Props { before, after, .. } => before.name.len() + after.name.len(),
+            Self::Slices { before, after } => {
+                (before.len() + after.len()) * std::mem::size_of::<Slice>()
+            }
             // The pictures are shared with the sprite; only the bookkeeping is extra.
             Self::Frames { before, after } => {
                 (before.cels.len() + after.cels.len()) * std::mem::size_of::<Cel>()
@@ -204,8 +223,26 @@ impl Transaction<'_> {
 
     fn new_layer_id(&mut self) -> LayerId {
         let id = LayerId(*self.next_layer_id);
-        *self.next_layer_id += 1;
+        // Sprites from files use ids up to `MAX_LAYER_ID` only, which leaves billions free.
+        *self.next_layer_id = self.next_layer_id.saturating_add(1);
         id
+    }
+
+    /// Checks that a layer whose own children reach `below` levels down fits into `parent`
+    /// without groups going deeper than [`MAX_GROUP_DEPTH`].
+    fn check_depth(&self, parent: Option<LayerId>, below: usize) -> Result<(), SpriteError> {
+        let level = match parent {
+            None => 0,
+            Some(parent) => {
+                let entries = self.sprite.walk();
+                let entry = entries.iter().find(|entry| entry.layer.id == parent);
+                entry.ok_or(SpriteError::UnknownLayer(parent.0))?.depth + 1
+            }
+        };
+        if level + below > MAX_GROUP_DEPTH {
+            return Err(SpriteError::TooDeep);
+        }
+        Ok(())
     }
 
     fn known(&self, id: LayerId) -> Result<&Layer, SpriteError> {
@@ -215,6 +252,7 @@ impl Transaction<'_> {
     /// Checks that a layer could be placed at `slot`. `already_there` says the layer is one of
     /// that slot's siblings now and will be taken out first, which leaves one place fewer.
     fn check_slot(&self, slot: Slot, already_there: bool) -> Result<(), SpriteError> {
+        self.check_depth(slot.parent, 0)?;
         let siblings = self.sprite.siblings(slot.parent)?.len();
         let room = siblings - usize::from(already_there);
         if slot.index > room {
@@ -306,7 +344,7 @@ impl Transaction<'_> {
     /// Adds an empty tileset. Returns its id.
     pub fn add_tileset(&mut self, name: &str, tile_width: u32, tile_height: u32) -> TilesetId {
         let highest = self.sprite.tilesets().iter().map(|set| set.id.0).max();
-        let id = TilesetId(highest.map_or(1, |id| id + 1));
+        let id = TilesetId(highest.map_or(1, |id| id.saturating_add(1)));
         let size = |side: u32| side.clamp(1, MAX_TILE_SIZE);
         let tileset = Tileset::new(id, name, size(tile_width), size(tile_height));
         self.edit_frames(|state| state.tilesets.push(tileset));
@@ -683,6 +721,11 @@ impl Transaction<'_> {
     /// Scales the whole sprite to a new size with nearest-neighbour sampling.
     pub fn scale_sprite(&mut self, width: u32, height: u32) -> Result<(), SpriteError> {
         self.check_no_tilemaps()?;
+        // Checked before any cel is scaled to the new size.
+        let valid = 1..=MAX_SPRITE_SIZE;
+        if !valid.contains(&width) || !valid.contains(&height) {
+            return Err(SpriteError::InvalidSize(width, height));
+        }
         let bounds = self.sprite.bounds();
         let cels = self
             .sprite
@@ -839,6 +882,8 @@ impl Transaction<'_> {
         {
             return Err(SpriteError::IntoItself);
         }
+        let below = tree_depth(std::slice::from_ref(self.known(id)?));
+        self.check_depth(to.parent, below)?;
         self.check_slot(to, from.parent == to.parent)?;
         if from != to {
             self.push(Op::Move { id, from, to });
@@ -1330,6 +1375,15 @@ impl Document {
         self.entries.iter().map(Entry::byte_size).sum()
     }
 
+    /// The memory the steps of the open undo group use, in bytes; 0 if no group is open.
+    /// While a group is open nothing of it can be forgotten, so whoever keeps one open should
+    /// keep an eye on this.
+    pub fn open_group_bytes(&self) -> usize {
+        self.group.map_or(0, |start| {
+            self.entries.iter().skip(start).map(Entry::byte_size).sum()
+        })
+    }
+
     /// How much memory the history may use, in bytes.
     pub fn history_limit(&self) -> usize {
         self.history_limit
@@ -1614,7 +1668,7 @@ mod tests {
         let mut doc = document();
         paint(&mut doc, "Red", Rect::new(0, 0, 16, 16), RED);
         let full = doc.history_bytes();
-        assert_eq!(full, 16 * 16 * 4 * 2);
+        assert_eq!(full, 16 * 16 * 4 * 2 + OP_OVERHEAD);
 
         // Repainting everything red again changes nothing.
         paint(&mut doc, "Same", Rect::new(0, 0, 16, 16), RED);
@@ -1627,7 +1681,7 @@ mod tests {
             tx.set_pixels(L1, 0, Rect::new(0, 0, 16, 16), &pixels)
         })
         .unwrap();
-        assert_eq!(doc.history_bytes(), full + 4 * 2);
+        assert_eq!(doc.history_bytes(), full + 4 * 2 + OP_OVERHEAD);
         assert_eq!(doc.take_damage(), Rect::new(0, 0, 16, 16));
         doc.undo();
         assert_eq!(doc.take_damage(), Rect::new(5, 7, 1, 1));
@@ -1728,8 +1782,9 @@ mod tests {
         let final_state = doc.sprite().clone();
         let revision = doc.revision();
 
-        // Each step holds one pixel before and after: 8 bytes. Keep room for three.
-        doc.set_history_limit(24);
+        // Each step holds one pixel before and after, 8 bytes, and its bookkeeping. Keep room
+        // for three.
+        doc.set_history_limit(3 * (8 + OP_OVERHEAD));
         assert_eq!(
             doc.history().collect::<Vec<_>>(),
             ["Dot 5", "Dot 6", "Dot 7"]
@@ -2991,5 +3046,39 @@ mod canvas_tests {
         );
         let bad = doc.transact("Bad", |tx| tx.scale_sprite(5000, 5));
         assert_eq!(bad, Err(SpriteError::InvalidSize(5000, 5)));
+    }
+
+    #[test]
+    fn groups_cannot_be_put_inside_one_another_too_deep() {
+        let mut doc = Document::new(Sprite::new(4, 4).unwrap());
+        let mut parent = None;
+        let mut groups = Vec::new();
+        for _ in 0..=MAX_GROUP_DEPTH {
+            let group = doc
+                .transact("Group", |tx| tx.add_layer(Slot::new(parent, 0), "G", true))
+                .unwrap();
+            groups.push(group);
+            parent = Some(group);
+        }
+        // The deepest group is at the deepest level: nothing more fits inside it.
+        let deeper = doc.transact("Too deep", |tx| {
+            tx.add_layer(Slot::new(parent, 0), "X", false)
+        });
+        assert_eq!(deeper, Err(SpriteError::TooDeep));
+        // A group with groups inside it cannot be moved where they would end up too deep.
+        let second = groups[1];
+        let moved = doc.transact("Move", |tx| {
+            tx.move_layer(groups[0], Slot::new(Some(second), 0))
+        });
+        assert!(moved.is_err());
+        let top = Slot::new(None, 0);
+        let nest = doc.transact("Move", |tx| {
+            tx.move_layer(groups[1], Slot::new(Some(groups[MAX_GROUP_DEPTH]), 0))
+        });
+        assert!(nest.is_err());
+        assert!(
+            doc.transact("Move", |tx| tx.move_layer(groups[MAX_GROUP_DEPTH], top))
+                .is_ok()
+        );
     }
 }

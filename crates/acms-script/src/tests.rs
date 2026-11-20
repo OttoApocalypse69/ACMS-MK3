@@ -950,7 +950,8 @@ fn commands_get_their_parameters() {
 #[test]
 fn files_can_only_be_named_inside_a_folder_the_user_picked() {
     let (mut engine, mut host) = setup();
-    let folder = std::env::temp_dir().join("acms-script-test");
+    let folder = TestFolder::new("picked");
+    let folder = folder.0.clone();
     let inside = folder
         .join("out.gif")
         .to_string_lossy()
@@ -994,6 +995,202 @@ fn files_can_only_be_named_inside_a_folder_the_user_picked() {
     // The permission ends with the run it was given in.
     assert!(engine.eval(&mut host, &export).is_err());
     assert_eq!(host.ran.len(), 1);
+
+    // The folder itself is not a file inside it: exporters name files next to the one they
+    // are given, which would be outside.
+    let code = "local folder = app.choose_folder()
+         print(pcall(app.command, 'file.export_sheet', { path = folder }))";
+    let printed = eval(&mut engine, &mut host, code);
+    assert!(printed[0].starts_with("false\t"), "{printed:?}");
+    assert_eq!(host.ran.len(), 1);
+}
+
+/// A folder made for one test, removed afterwards.
+struct TestFolder(PathBuf);
+
+impl TestFolder {
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("acms-script-tests-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TestFolder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn a_folder_given_to_one_run_is_not_given_to_a_tool_or_the_next_run() {
+    let (mut engine, mut host) = setup();
+    let folder = TestFolder::new("stale");
+    host.folder = Some(folder.0.clone());
+    let path = folder
+        .0
+        .join("x.png")
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let code = format!(
+        "register_tool {{ id = 'thief', on_down = function() \
+             app.command('file.export_png', {{ path = '{path}' }}) end }}"
+    );
+    engine.load(&mut host, "thief.lua", &code).unwrap();
+    // A run is given the folder, and ends.
+    eval(&mut engine, &mut host, "app.choose_folder()");
+    // The tool of another script cannot use it.
+    let result = engine.tool_event(&mut host, "thief", ToolPhase::Down, at(1, 1));
+    assert!(result.is_err());
+    assert!(host.ran.is_empty());
+}
+
+#[test]
+fn a_folder_can_only_be_asked_for_when_the_user_runs_a_script() {
+    let (mut engine, mut host) = setup();
+    let folder = TestFolder::new("asked");
+    host.folder = Some(folder.0.clone());
+    // While loading, the user is not there to be asked.
+    let err = engine
+        .load(&mut host, "asks.lua", "app.choose_folder()")
+        .unwrap_err();
+    assert!(err.0.contains("cannot be asked for"), "{err}");
+    // And a run may only ask so often.
+    let err = eval_error(
+        &mut engine,
+        &mut host,
+        "for i = 1, 100 do app.choose_folder() end",
+    );
+    assert!(err.contains("too often"), "{err}");
+}
+
+#[test]
+fn catching_the_timeout_does_not_keep_a_script_running() {
+    let (mut engine, mut host) = setup();
+    engine.set_time_limit(Duration::from_millis(50));
+    for code in [
+        "while true do pcall(function() while true do end end) end",
+        "while true do xpcall(function() while true do end end, function(e) return e end) end",
+        "while true do coroutine.resume(coroutine.create(function() while true do end end)) end",
+        // Nor does asking the application for something afterwards.
+        "pcall(function() while true do end end) app.command('test.paint')",
+    ] {
+        let message = eval_error(&mut engine, &mut host, code);
+        assert!(message.contains("took too long"), "{code}: {message}");
+    }
+    assert!(host.ran.is_empty());
+    assert_eq!(eval(&mut engine, &mut host, "1"), ["1"]);
+}
+
+#[test]
+fn a_pattern_that_would_take_for_ever_is_refused() {
+    let (mut engine, mut host) = setup();
+    let code = "local s = ('a'):rep(20000) return s:find('.-.-.-.-.-.-b')";
+    let message = eval_error(&mut engine, &mut host, code);
+    assert!(message.contains("too many repeats"), "{message}");
+    let code = "return string.match(('a'):rep(5000), '(.*)(.*)(.*)(.*)b')";
+    let message = eval_error(&mut engine, &mut host, code);
+    assert!(message.contains("too many repeats"), "{message}");
+    // Ordinary matching is untouched.
+    assert_eq!(
+        eval(
+            &mut engine,
+            &mut host,
+            "('name = value'):match('^(%w+)%s*=%s*(.-)$')"
+        ),
+        ["name\tvalue"]
+    );
+    assert_eq!(
+        eval(&mut engine, &mut host, "(('a b c'):gsub('%s+', ''))"),
+        ["abc"]
+    );
+    assert_eq!(
+        eval(&mut engine, &mut host, "('x.y'):find('.', 1, true)"),
+        ["2\t2"]
+    );
+}
+
+#[test]
+fn one_script_cannot_change_what_another_sees() {
+    let (mut engine, mut host) = setup();
+    let evil = "
+        string.format = function() return 'hijacked' end
+        _G.print = function() end
+        coroutine.yield = function() error('stolen') end
+        local ok = pcall(function() getmetatable(app).__index = nil end)
+        assert(not ok or getmetatable(app) == false)
+        assert(getmetatable(app) == false)
+        assert(getmetatable('') == false)
+        assert(getmetatable(Color(1, 2, 3)) == false)
+        assert(rawset == nil)
+        assert(not pcall(setmetatable, app, {}))
+        local up = ('x'):upper()
+        assert(up == 'X')
+    ";
+    engine.load(&mut host, "evil.lua", evil).unwrap();
+    engine
+        .load(
+            &mut host,
+            "good.lua",
+            "print(string.format('%d', 42)) print(('ok'):upper())",
+        )
+        .unwrap();
+    assert_eq!(engine.take_output(), ["42", "OK"]);
+    // Neither does the console.
+    assert_eq!(
+        eval(&mut engine, &mut host, "string.format('%d', 7)"),
+        ["7"]
+    );
+    // A finaliser would run outside the script's time.
+    let message = eval_error(&mut engine, &mut host, "setmetatable({}, { __gc = print })");
+    assert!(message.contains("__gc"), "{message}");
+}
+
+#[test]
+fn a_dialog_is_read_as_it_is_and_kept_small() {
+    let (mut engine, mut host) = setup();
+    let too_many = "local d = Dialog('x') for i = 1, 100 do d:check { id = 'c' .. i } end d:show()";
+    let message = eval_error(&mut engine, &mut host, too_many);
+    assert!(message.contains("at most 64 fields"), "{message}");
+    let long = "Dialog(('t'):rep(10000)):show()";
+    let message = eval_error(&mut engine, &mut host, long);
+    assert!(message.contains("too long"), "{message}");
+    let options = "local o = {} for i = 1, 1000 do o[i] = 'o' .. i end \
+                   Dialog('x'):dropdown { id = 'd', options = o }:show()";
+    let message = eval_error(&mut engine, &mut host, options);
+    assert!(message.contains("at most 256 options"), "{message}");
+}
+
+#[test]
+fn printing_without_end_is_cut_off() {
+    let (mut engine, mut host) = setup();
+    let printed = eval(
+        &mut engine,
+        &mut host,
+        "for i = 1, 5000 do print(('x'):rep(1000)) end",
+    );
+    assert!(printed.len() < 1100, "{}", printed.len());
+    assert!(printed.last().unwrap().contains("printed too much"));
+}
+
+#[test]
+fn pictures_a_script_holds_are_counted_and_given_back() {
+    let (mut engine, mut host) = setup();
+    host.editor = Editor::new();
+    host.editor
+        .add_document(Document::new(Sprite::new(4096, 4096).unwrap()));
+    // Each copy is 64 MB outside Lua: holding more than the limit allows is refused.
+    let code = "local hoard = {} local image = app.active_cel:image() \
+                for i = 1, 64 do hoard[i] = image:clone() end";
+    let message = eval_error(&mut engine, &mut host, code);
+    assert!(message.contains("too many pictures"), "{message}");
+    // What the script let go of is given back once collected.
+    eval(&mut engine, &mut host, "local a = app.active_cel:image()");
+    let code = "for i = 1, 40 do local copy = app.active_cel:image() end";
+    eval(&mut engine, &mut host, code);
+    assert!(engine.image_bytes() <= api::MAX_IMAGE_BYTES);
 }
 
 #[test]

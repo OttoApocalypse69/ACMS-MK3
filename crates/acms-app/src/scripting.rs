@@ -23,6 +23,73 @@ type Registry = CommandRegistry<AppState>;
 /// Most lines the console keeps.
 const MAX_CONSOLE_LINES: usize = 1000;
 
+/// Most requests [`pump`] carries out in one go; the rest wait for the next frame.
+const MAX_REQUESTS_PER_PUMP: usize = 16;
+
+/// The families of commands a script may run: what edits the sprite, the tools and the view
+/// of it. Anything else is refused unless listed in [`SCRIPT_COMMANDS`].
+const SCRIPT_FAMILIES: [&str; 21] = [
+    "brush.",
+    "cel.",
+    "color.",
+    "doc.",
+    "frame.",
+    "ink.",
+    "layer.",
+    "onion.",
+    "palette.",
+    "pattern.",
+    "playback.",
+    "preview.",
+    "select.",
+    "selection.",
+    "slice.",
+    "sprite.",
+    "symmetry.",
+    "tag.",
+    "tile.",
+    "timeline.",
+    "tool.",
+];
+
+/// Commands outside those families that a script may run. Files are only reached through
+/// a path, which must be inside a folder the user picked for the script.
+const SCRIPT_COMMANDS: [&str; 26] = [
+    "edit.undo",
+    "edit.redo",
+    "edit.clear",
+    "edit.history_jump",
+    "file.new",
+    "file.open",
+    "file.save_as",
+    "file.import_aseprite",
+    "file.import_cmg",
+    "file.import_netpbm",
+    "file.export_png",
+    "file.export_gif",
+    "file.export_sequence",
+    "file.export_sheet",
+    "file.export_cmg",
+    "file.export_netpbm",
+    "file.export_tileset",
+    "file.export_tilemap",
+    "file.export_tilemap_csv",
+    "file.export_timelapse",
+    "view.pan",
+    "view.toggle_grid",
+    "view.toggle_tiled",
+    "view.zoom_in",
+    "view.zoom_out",
+    "view.zoom_fit",
+];
+
+/// Whether a script may run a command of the app. Refused are the ones that reach past the
+/// sprite: saving over the file without a path, the clipboard, preferences and shortcuts,
+/// other scripts, recovery, closing and quitting.
+pub fn script_may_run(id: &str) -> bool {
+    SCRIPT_COMMANDS.contains(&id) || SCRIPT_FAMILIES.iter().any(|family| id.starts_with(family))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
     /// A line the user typed.
@@ -148,6 +215,18 @@ impl Host for AppHost<'_> {
     }
 
     fn run_command(&mut self, id: &str, params: &Params) -> Result<(), String> {
+        // A script's own commands are run by the script itself; asking the app for one (or
+        // for any command not meant for scripts) would let it run without end or limit.
+        let a_script_command = self
+            .state
+            .scripts
+            .commands
+            .iter()
+            .any(|known| known.id == id);
+        let known = self.registry.get(id).is_some();
+        if known && (a_script_command || !script_may_run(id)) {
+            return Err(format!("scripts cannot run the command `{id}`"));
+        }
         let result = self.registry.run(id, self.state, params);
         self.state.sync_active_document();
         result.map_err(|err| err.to_string())
@@ -208,8 +287,14 @@ fn fail(state: &mut AppState, title: &str, err: &ScriptError) {
 /// Returns whether anything was done.
 pub fn pump(registry: &Registry, state: &mut AppState) -> bool {
     let mut busy = false;
+    let mut done = 0;
     while state.scripts.engine.is_some() {
         if !state.scripts.requests.is_empty() {
+            if done == MAX_REQUESTS_PER_PUMP {
+                // The others wait for the next frame, which comes at once.
+                return true;
+            }
+            done += 1;
             busy = true;
             match state.scripts.requests.remove(0) {
                 Request::Command(id) => {
@@ -593,6 +678,49 @@ mod tests {
         let mut f = Fixture::with_sprite();
         reload(&mut f.registry, &mut f.state);
         f
+    }
+
+    #[test]
+    fn scripts_are_refused_the_commands_that_reach_past_the_sprite() {
+        let f = Fixture::new();
+        let mut refused: Vec<&str> = f
+            .registry
+            .iter()
+            .map(|command| command.id())
+            .filter(|id| !script_may_run(id))
+            .collect();
+        refused.sort_unstable();
+        // A new command is refused until someone decides scripts may have it.
+        assert_eq!(
+            refused,
+            [
+                "app.preferences",
+                "app.quit",
+                "edit.copy",
+                "edit.cut",
+                "edit.paste",
+                "file.clear_recent",
+                "file.close",
+                "file.recover",
+                "file.save",
+                "fun.flappy",
+                "keymap.bind",
+                "keymap.clear",
+                "keymap.edit",
+                "keymap.reset",
+                "keymap.unbind",
+                "prefs.set",
+                "script.clear_console",
+                "script.reload",
+                "script.run",
+                "view.clear_log",
+                "view.command_palette",
+                "view.layout_animation",
+                "view.layout_drawing",
+                "view.reset_layout",
+                "view.toggle_theme",
+            ]
+        );
     }
 
     /// The same, with scripts of the user's own.

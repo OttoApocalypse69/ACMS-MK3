@@ -23,6 +23,25 @@ pub(crate) const COLOR_META: &str = "acms.color";
 /// Most decimals a number field of a dialog can ask for.
 const MAX_DECIMALS: u8 = 6;
 
+/// Most fields a dialog can have, options a dropdown can have, and bytes of any text in it.
+const MAX_FIELDS: usize = 64;
+const MAX_OPTIONS: usize = 256;
+const MAX_DIALOG_TEXT: usize = 4096;
+
+/// Most bytes the pictures scripts hold may take together. They live outside Lua, so the
+/// memory limit of the Lua state does not see them.
+pub(crate) const MAX_IMAGE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Most text scripts may print before the application collects it, and most of one line.
+pub(crate) const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_LINE_BYTES: usize = 16 * 1024;
+
+/// How often one run may ask the user for a folder.
+const MAX_FOLDER_ASKS: u32 = 4;
+
+/// What a script is told once its time is up, whatever it tries next.
+pub(crate) const TOO_LONG: &str = "the script took too long and was stopped";
+
 /// A request that was refused; the text is raised as an error in the script.
 pub(crate) struct Fail(pub String);
 
@@ -70,27 +89,99 @@ pub(crate) struct Session {
     pub may_ask: bool,
     /// When the code running now is stopped for taking too long.
     pub deadline: Rc<Cell<Instant>>,
+    /// The time is up. Stays so until the next entry into Lua: nothing the script does after
+    /// that, not even catching the error, lets it go on.
+    pub expired: Rc<Cell<bool>>,
+    /// Bytes the pictures scripts hold take now.
+    pub images: Rc<Cell<usize>>,
+    /// How often the run going on asked for a folder.
+    pub folder_asks: u32,
+    /// Bytes of `output`, and whether some was left out for being too much.
+    pub output_bytes: usize,
+    pub output_cut: bool,
 }
 
-/// A picture owned by a script: a copy it can read and change freely.
-pub(crate) struct ScriptImage(pub Image);
+impl Session {
+    /// Whether the time of the code running now is up; notes it for good if so.
+    pub fn out_of_time(&self) -> bool {
+        if !self.expired.get() && Instant::now() > self.deadline.get() {
+            self.expired.set(true);
+        }
+        self.expired.get()
+    }
+
+    fn say(&mut self, text: String) {
+        if self.output_bytes + text.len() > MAX_OUTPUT_BYTES {
+            if !self.output_cut {
+                self.output_cut = true;
+                self.output
+                    .push("(the script printed too much; the rest was left out)".to_owned());
+            }
+            return;
+        }
+        let text = match text.char_indices().nth(MAX_LINE_BYTES) {
+            Some((end, _)) if end < text.len() => format!("{} …", &text[..end]),
+            _ => text,
+        };
+        self.output_bytes += text.len();
+        self.output.push(text);
+    }
+}
+
+/// A picture owned by a script: a copy it can read and change freely. What it takes is
+/// counted against [`MAX_IMAGE_BYTES`] for as long as it lives.
+pub(crate) struct ScriptImage {
+    pub image: Image,
+    budget: Rc<Cell<usize>>,
+}
+
+impl ScriptImage {
+    /// Makes room for a picture, if the pictures scripts hold leave enough.
+    pub fn new(lua: &Lua, budget: &Rc<Cell<usize>>, image: Image) -> Result<Self, Fail> {
+        let size = image.byte_size();
+        if budget.get() + size > MAX_IMAGE_BYTES {
+            // Pictures a script let go of are only given back when Lua collects them.
+            lua.gc_collect()?;
+            lua.gc_collect()?;
+            if budget.get() + size > MAX_IMAGE_BYTES {
+                return Err(Fail::from(
+                    "the script holds too many pictures; let go of some first",
+                ));
+            }
+        }
+        budget.set(budget.get() + size);
+        Ok(Self {
+            image,
+            budget: budget.clone(),
+        })
+    }
+}
+
+impl Drop for ScriptImage {
+    fn drop(&mut self) {
+        let size = self.image.byte_size();
+        self.budget.set(self.budget.get().saturating_sub(size));
+    }
+}
 
 impl UserData for ScriptImage {
     fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("width", |_, this| Ok(this.0.width()));
-        fields.add_field_method_get("height", |_, this| Ok(this.0.height()));
+        fields.add_field_method_get("width", |_, this| Ok(this.image.width()));
+        fields.add_field_method_get("height", |_, this| Ok(this.image.height()));
     }
 
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("get_pixel", |lua, this, (x, y): (f64, f64)| {
-            color_to_lua(lua, this.0.get(coord(x), coord(y)))
+            color_to_lua(lua, this.image.get(coord(x), coord(y)))
         });
         methods.add_method_mut("set_pixel", |_, this, (x, y, color): (f64, f64, Value)| {
             let color = color_from(&color)?;
-            this.0.set(coord(x), coord(y), color.normalized());
+            this.image.set(coord(x), coord(y), color.normalized());
             Ok(())
         });
-        methods.add_method("clone", |_, this, ()| Ok(ScriptImage(this.0.clone())));
+        methods.add_method("clone", |lua, this, ()| {
+            Ok(ScriptImage::new(lua, &this.budget, this.image.clone())?)
+        });
     }
 }
 
@@ -179,27 +270,51 @@ pub(crate) fn color_constructor(lua: &Lua, args: MultiValue) -> mlua::Result<Tab
     color_to_lua(lua, color)
 }
 
-/// Reads the description of a dialog a script built.
+/// Text of a dialog, of at most [`MAX_DIALOG_TEXT`] bytes.
+fn dialog_text(text: &mlua::LuaString, what: &str) -> Result<String, Fail> {
+    if text.as_bytes().len() > MAX_DIALOG_TEXT {
+        return Err(Fail(format!("{what} is too long")));
+    }
+    Ok(text.to_string_lossy())
+}
+
+fn dialog_string(table: &Table, key: &str, what: &str) -> Result<String, Fail> {
+    match table.raw_get::<Value>(key)? {
+        Value::String(text) => dialog_text(&text, what),
+        _ => Err(Fail(format!("{what} must be text"))),
+    }
+}
+
+/// Reads the description of a dialog a script built. Only what is in the tables is read
+/// (no metamethods run), and only so much of it.
 pub(crate) fn parse_dialog(table: &Table) -> Result<DialogSpec, Fail> {
-    let title: String = table.get("title")?;
+    let title = dialog_string(table, "title", "the title of a dialog")?;
     let mut fields: Vec<Field> = Vec::new();
-    for entry in table.get::<Table>("fields")?.sequence_values::<Table>() {
+    let Value::Table(list) = table.raw_get::<Value>("fields")? else {
+        return Err(Fail::from("a dialog needs a list of fields"));
+    };
+    if list.raw_len() > MAX_FIELDS {
+        return Err(Fail(format!(
+            "a dialog can have at most {MAX_FIELDS} fields"
+        )));
+    }
+    for entry in list.sequence_values::<Table>() {
         let entry = entry?;
-        let kind: String = entry.get("kind")?;
-        let id: String = entry.get("id")?;
+        let kind = dialog_string(&entry, "kind", "the kind of a dialog field")?;
+        let id = dialog_string(&entry, "id", "the id of a dialog field")?;
         if fields.iter().any(|field| field.id == id) {
             return Err(Fail(format!("the dialog has two fields called `{id}`")));
         }
         let bad = |what: &str| Fail(format!("dialog field `{id}`: {what}"));
-        let label = match entry.get::<Value>("label")? {
+        let label = match entry.raw_get::<Value>("label")? {
             Value::Nil => id.clone(),
-            Value::String(text) => text.to_string_lossy(),
+            Value::String(text) => dialog_text(&text, "the label")?,
             _ => return Err(bad("the label must be text")),
         };
-        let value: Value = entry.get("value")?;
+        let value: Value = entry.raw_get("value")?;
         let kind = match kind.as_str() {
             "number" => {
-                let number = |name: &str, default: f64| match entry.get::<Value>(name) {
+                let number = |name: &str, default: f64| match entry.raw_get::<Value>(name) {
                     Ok(Value::Nil) => Ok(default),
                     Ok(Value::Integer(n)) => Ok(n as f64),
                     Ok(Value::Number(n)) if n.is_finite() => Ok(n),
@@ -224,7 +339,7 @@ pub(crate) fn parse_dialog(table: &Table) -> Result<DialogSpec, Fail> {
             }),
             "text" => FieldKind::Text(match value {
                 Value::Nil => String::new(),
-                Value::String(text) => text.to_string_lossy(),
+                Value::String(text) => dialog_text(&text, "the value")?,
                 _ => return Err(bad("the value must be text")),
             }),
             "check" => FieldKind::Check(match value {
@@ -233,11 +348,19 @@ pub(crate) fn parse_dialog(table: &Table) -> Result<DialogSpec, Fail> {
                 _ => return Err(bad("the value must be true or false")),
             }),
             "dropdown" => {
-                let options: Vec<String> = match entry.get::<Value>("options")? {
+                let options: Vec<String> = match entry.raw_get::<Value>("options")? {
+                    Value::Table(list) if list.raw_len() > MAX_OPTIONS => {
+                        return Err(bad(&format!(
+                            "a dropdown can have at most {MAX_OPTIONS} options"
+                        )));
+                    }
                     Value::Table(list) => list
-                        .sequence_values::<String>()
-                        .collect::<mlua::Result<_>>()
-                        .map_err(|_| bad("the options must be text"))?,
+                        .sequence_values::<mlua::LuaString>()
+                        .map(|option| match option {
+                            Ok(text) => dialog_text(&text, "an option"),
+                            Err(_) => Err(bad("the options must be text")),
+                        })
+                        .collect::<Result<_, Fail>>()?,
                     _ => Vec::new(),
                 };
                 if options.is_empty() {
@@ -322,13 +445,71 @@ fn frame_index(document: &Document, frame: Option<f64>) -> Result<usize, Fail> {
     }
 }
 
-/// Whether a script may name this file: only inside a folder the user picked.
-fn allowed(path: &Path, granted: &[PathBuf]) -> bool {
-    path.is_absolute()
-        && !path
+/// Whether a script may name this file: only a file inside a folder the user picked (never
+/// the folder itself), with no `..` in the way and no link that leads out of the folder.
+/// The folders in `granted` are as [`grant`] made them.
+pub(crate) fn allowed(path: &Path, granted: &[PathBuf]) -> bool {
+    if !path.is_absolute()
+        || path
             .components()
-            .any(|part| matches!(part, Component::ParentDir))
-        && granted.iter().any(|folder| path.starts_with(folder))
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
+    // The deepest part of the path that exists, with every link in it followed; the rest
+    // does not exist yet, so it cannot be a link.
+    let mut existing = path;
+    let mut rest = Vec::new();
+    let real = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(real) => break real,
+            Err(_) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_owned());
+                    existing = parent;
+                }
+                _ => return false,
+            },
+        }
+    };
+    let mut real = real;
+    for name in rest.into_iter().rev() {
+        real.push(name);
+    }
+    granted.iter().any(|folder| {
+        real.strip_prefix(folder).is_ok_and(|inside| {
+            inside.components().next().is_some()
+                && inside
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+        })
+    })
+}
+
+/// The form a folder the user picked is remembered in: with every link followed, so that
+/// [`allowed`] compares like with like. `None` if the folder is not there.
+pub(crate) fn grant(folder: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(folder)
+        .ok()
+        .filter(|real| real.is_dir())
+}
+
+/// Refuses to let an undo group a script keeps open grow past what the history may hold:
+/// nothing in an open group can be forgotten.
+fn check_group(host: &mut dyn Host, session: &Session) -> Result<(), Fail> {
+    let Some(group) = &session.group else {
+        return Ok(());
+    };
+    let too_much = host
+        .editor()
+        .document_mut_by_id(group.doc)
+        .is_some_and(|document| document.open_group_bytes() > document.history_limit());
+    if too_much {
+        return Err(Fail::from(
+            "the script changed more in one undo step than the undo history can hold",
+        ));
+    }
+    Ok(())
 }
 
 fn command_params(table: Option<Table>) -> Result<Params, Fail> {
@@ -370,7 +551,15 @@ pub(crate) fn dispatch(
     op: &str,
     args: MultiValue,
 ) -> mlua::Result<MultiValue> {
-    match answer(lua, host, session, op, args) {
+    // Once the time is up, nothing more is done for the script, whatever it caught.
+    if session.out_of_time() {
+        return Err(mlua::Error::runtime(TOO_LONG));
+    }
+    let result = answer(lua, host, session, op, args);
+    if session.out_of_time() {
+        return Err(mlua::Error::runtime(TOO_LONG));
+    }
+    match result {
         Ok(mut values) => {
             values.push_front(Value::Boolean(true));
             Ok(values)
@@ -422,7 +611,7 @@ fn answer(
     match op {
         "print" => {
             let text: mlua::LuaString = lua.unpack_multi(args)?;
-            session.output.push(text.to_string_lossy());
+            session.say(text.to_string_lossy());
             give!(())
         }
         "has_sprite" => give!(host.editor().document().is_some()),
@@ -537,6 +726,7 @@ fn answer(
             document.transact("Script", |tx| {
                 tx.set_pixels(LayerId(layer), frame, Rect::new(x, y, 1, 1), &pixel)
             })?;
+            check_group(host, session)?;
             give!(())
         }
         "image" => {
@@ -546,12 +736,13 @@ fn answer(
             let sprite = document.sprite();
             sprite.check_cel(LayerId(layer), frame)?;
             let image = sprite.read_region(LayerId(layer), frame, sprite.bounds());
-            give!(lua.create_userdata(ScriptImage(image))?)
+            let image = ScriptImage::new(lua, &session.images, image)?;
+            give!(lua.create_userdata(image)?)
         }
         "set_image" => {
             let (layer, frame, image): (u32, Option<f64>, AnyUserData) = lua.unpack_multi(args)?;
             let mut image = match image.borrow::<ScriptImage>() {
-                Ok(image) => image.0.clone(),
+                Ok(image) => image.image.clone(),
                 Err(_) => return Err(Fail::from("expected an image")),
             };
             let document = document(host)?;
@@ -582,6 +773,7 @@ fn answer(
             document.transact("Script", |tx| {
                 tx.set_pixels(LayerId(layer), frame, bounds, &image)
             })?;
+            check_group(host, session)?;
             give!(())
         }
         "begin" => {
@@ -652,27 +844,34 @@ fn answer(
                     ));
                 }
             }
-            let started = Instant::now();
-            let result = host.run_command(&id, &params);
-            // Time the application spent is not the script's.
-            session
-                .deadline
-                .set(session.deadline.get() + started.elapsed());
-            result.map_err(Fail)?;
+            // The time the command takes is the script's: a script cannot run for ever by
+            // having the application work for it.
+            host.run_command(&id, &params).map_err(Fail)?;
+            check_group(host, session)?;
             give!(())
         }
         "choose_folder" => {
             let title: Option<String> = lua.unpack_multi(args)?;
+            // Like a dialog, only when the user ran the script and nothing is half done.
+            if !session.may_ask || session.group.is_some() {
+                return Err(Fail::from("a folder cannot be asked for here"));
+            }
+            if session.folder_asks >= MAX_FOLDER_ASKS {
+                return Err(Fail::from("the script asked for folders too often"));
+            }
+            session.folder_asks += 1;
             let started = Instant::now();
             let folder = host.choose_folder(title.as_deref().unwrap_or("Choose a folder"));
+            // The time the user takes to choose is not the script's.
             session
                 .deadline
                 .set(session.deadline.get() + started.elapsed());
-            match folder {
-                Some(folder) => {
-                    let text = folder.to_string_lossy().into_owned();
-                    session.granted.push(folder);
-                    give!(text)
+            // The script is given the folder as the user picked it; what is remembered is
+            // where it really is.
+            match folder.and_then(|folder| Some((grant(&folder)?, folder))) {
+                Some((real, folder)) => {
+                    session.granted.push(real);
+                    give!(folder.to_string_lossy().into_owned())
                 }
                 None => give!(Value::Nil),
             }
@@ -690,9 +889,52 @@ fn answer(
 mod tests {
     use super::*;
 
+    /// A folder made for one test, removed afterwards.
+    struct Folder(PathBuf);
+
+    impl Folder {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("acms-script-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_granted_folder_itself_is_not_a_file_a_script_may_name() {
+        let folder = Folder::new("itself");
+        let granted = vec![grant(&folder.0).unwrap()];
+        assert!(!allowed(&folder.0, &granted));
+        assert!(!allowed(&folder.0.join("."), &granted));
+        assert!(allowed(&folder.0.join("out.png"), &granted));
+        assert!(allowed(&folder.0.join("new").join("out.png"), &granted));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_the_granted_folder_is_not_followed() {
+        let outside = Folder::new("outside");
+        let folder = Folder::new("linked");
+        std::os::unix::fs::symlink(&outside.0, folder.0.join("door")).unwrap();
+        std::os::unix::fs::symlink(outside.0.join("x"), folder.0.join("file")).unwrap();
+        let granted = vec![grant(&folder.0).unwrap()];
+        assert!(!allowed(&folder.0.join("door").join("a.png"), &granted));
+        assert!(!allowed(&folder.0.join("file"), &granted));
+        assert!(allowed(&folder.0.join("a.png"), &granted));
+    }
+
     #[test]
     fn only_files_inside_a_granted_folder_are_allowed() {
-        let root = std::env::temp_dir().join("acms-granted");
+        let root = Folder::new("granted");
+        let root = grant(&root.0).unwrap();
         let granted = vec![root.clone()];
         assert!(allowed(&root.join("a.gif"), &granted));
         assert!(allowed(&root.join("sub").join("a.gif"), &granted));
@@ -705,8 +947,9 @@ mod tests {
         assert!(!allowed(Path::new("a.gif"), &granted));
         assert!(!allowed(&root.join("a.gif"), &[]));
         // A folder whose name merely starts the same is another folder.
-        let sibling = std::env::temp_dir().join("acms-granted-too").join("a.gif");
-        assert!(!allowed(&sibling, &granted));
+        let mut sibling = root.clone().into_os_string();
+        sibling.push("-too");
+        assert!(!allowed(&PathBuf::from(sibling).join("a.gif"), &granted));
     }
 
     #[test]

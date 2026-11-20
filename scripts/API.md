@@ -15,8 +15,9 @@ in the Tools panel, and it can be given a shortcut in the keymap file.
 - **Scripts → Reload Scripts** loads everything again without restarting. Do this after you
   change a file.
 
-Each file has its own global variables. A variable you set in one script is not visible in
-another.
+Each file has its own global variables, and its own copies of the libraries. A variable you
+set in one script is not visible in another, and a script that replaces `string.format` only
+replaces its own.
 
 ## The Script Console
 
@@ -38,9 +39,22 @@ libraries. They do not have `os`, `io`, `debug`, `package`, `require`, `load`, `
 
 - **Files:** a script can only name files inside a folder you picked for it; see
   `app.choose_folder`.
+- **Commands:** a script can run the commands that work on sprites, but not the ones that
+  reach past them; see "Commands".
 - **Time:** a script that runs for more than 10 seconds is stopped. Time you spend in a dialog
-  or a file dialog does not count.
-- **Memory:** a script that uses more than 256 MB is stopped.
+  or a file dialog does not count; time a command takes does. Once the time is up, catching
+  the error with `pcall`, `xpcall` or `coroutine.resume` does not help: it is raised again,
+  and the application does nothing more for the script.
+- **Memory:** a script that uses more than 256 MB is stopped. Pictures a script holds
+  (`cel:image()`, `image:clone()`) may take 512 MB together; let go of the ones you no
+  longer need.
+- **Patterns:** `string.find`, `match`, `gmatch` and `gsub` refuse a pattern with so many
+  repeats (`*`, `+`, `-`, `?`) for text so long that matching could take minutes, since
+  matching cannot be stopped halfway.
+- **Printing:** what a script prints in one run is cut off after 1 MB.
+- **Tables of the API:** their metatables are locked, `rawset` is not there, and a metatable
+  with `__gc` is refused.
+- **Undo:** a transaction may not grow larger than the undo history can hold.
 
 An error in a script never takes the application down: the script stops, the error is shown,
 and whatever the script had changed inside a transaction is taken back.
@@ -102,8 +116,16 @@ end)
 
 ### Commands
 
-`app.command(id, params)` runs any command of the application, the same ones the menus and
+`app.command(id, params)` runs a command of the application, the same ones the menus and
 shortcuts run. `params` is a table of named values and can be left out.
+
+Scripts may run the commands that work on the sprite and the tools: those whose ids start
+with `brush.`, `cel.`, `color.`, `doc.`, `frame.`, `ink.`, `layer.`, `onion.`, `palette.`,
+`pattern.`, `playback.`, `preview.`, `select.`, `selection.`, `slice.`, `sprite.`,
+`symmetry.`, `tag.`, `tile.`, `timeline.` or `tool.`, and undo, redo, clear, the history,
+zoom and pan, the grid, and opening, importing, exporting and *Save As* with a `path`. They
+may not save over a file without a path, use the clipboard, change preferences or shortcuts,
+run, reload or type into scripts, recover or discard autosaved sprites, close sprites or quit.
 
 ```lua
 app.command("layer.new")
@@ -130,7 +152,11 @@ if folder then
 end
 ```
 
-The permission lasts until the script finishes. A `path` anywhere else is refused.
+The permission lasts until the script finishes (a script waiting for a dialog keeps it).
+A `path` anywhere else is refused, and so is the folder itself: some commands write files
+next to the one they are given. A link inside the folder that leads out of it is not
+followed. A folder can only be asked for by a command the user runs, not while scripts load
+or from a tool, and at most 4 times in one run.
 
 ## The sprite
 
@@ -298,7 +324,8 @@ print(answer.size, answer.ink, answer.name, answer.dotted, answer.where)
 | `dropdown` | `options` (a list of text), `value` (one of them) | the chosen option |
 
 Every field needs an `id`. `label` is the text shown next to it; the id is shown if it is left
-out.
+out. A dialog has at most 64 fields, a dropdown at most 256 options, and each piece of text
+in a dialog at most 4096 bytes.
 
 A dialog can be shown from a command and from the console. It cannot be shown while a script
 file is loading, inside a transaction, in a filter's `run`, or from a tool.

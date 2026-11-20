@@ -13,6 +13,30 @@ use crate::{IoError, write_atomically};
 /// Largest factor [`export_png`] accepts.
 pub const MAX_EXPORT_SCALE: u32 = 64;
 
+/// Widest and tallest picture that is read or exported, in pixels.
+pub const MAX_IMAGE_SIDE: u32 = 16_384;
+
+/// Most pixels a picture that is read or exported may have (a quarter of a gigabyte).
+pub const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+
+/// Whether a picture of this size may be made.
+pub fn image_size_allowed(width: u64, height: u64) -> bool {
+    let side = u64::from(MAX_IMAGE_SIDE);
+    width <= side && height <= side && width * height <= MAX_IMAGE_PIXELS
+}
+
+/// Refuses an export larger than [`image_size_allowed`] lets through.
+pub(crate) fn check_export_size(width: u64, height: u64) -> Result<(), IoError> {
+    if image_size_allowed(width, height) {
+        Ok(())
+    } else {
+        Err(IoError::Unsupported(format!(
+            "the picture would be {width} × {height} pixels, larger than ACMS writes \
+             (at most {MAX_IMAGE_SIDE} on a side); choose a smaller scale"
+        )))
+    }
+}
+
 /// Writes an image as an 8-bit RGBA PNG.
 pub fn encode_png(image: &Image, writer: impl Write) -> Result<(), IoError> {
     let mut encoder = png::Encoder::new(writer, image.width(), image.height());
@@ -26,9 +50,20 @@ pub fn encode_png(image: &Image, writer: impl Write) -> Result<(), IoError> {
 
 /// Reads any PNG into an RGBA image. Palettes, greyscale and 16-bit samples are converted.
 pub fn decode_png(bytes: &[u8]) -> Result<Image, IoError> {
-    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    // The decoder's own buffers are limited, and the size the header claims is checked
+    // before room is made for the picture.
+    let limits = png::Limits {
+        bytes: 2 * 8 * MAX_IMAGE_PIXELS as usize,
+    };
+    let mut decoder = png::Decoder::new_with_limits(Cursor::new(bytes), limits);
     decoder.set_transformations(Transformations::normalize_to_color8());
     let mut reader = decoder.read_info()?;
+    let (width, height) = (reader.info().width, reader.info().height);
+    if !image_size_allowed(u64::from(width), u64::from(height)) {
+        return Err(IoError::Unsupported(format!(
+            "a PNG image of {width} × {height} pixels is larger than ACMS opens"
+        )));
+    }
 
     let size = reader
         .output_buffer_size()
@@ -78,6 +113,10 @@ pub fn export_png(
     if frame >= sprite.frames().len() {
         return Err(SpriteError::UnknownFrame(frame).into());
     }
+    check_export_size(
+        u64::from(sprite.width()) * u64::from(scale),
+        u64::from(sprite.height()) * u64::from(scale),
+    )?;
     let flat = compositor::compose(sprite, frame);
     encode_png(&flat.scaled_up(scale), writer)
 }
@@ -147,6 +186,43 @@ mod tests {
     }
 
     #[test]
+    fn a_header_claiming_a_huge_picture_is_refused_before_room_is_made() {
+        // A valid PNG, then its header changed to claim 100 000 × 100 000 pixels.
+        let mut bytes = encoded(&Image::new(1, 1));
+        let ihdr = bytes.windows(4).position(|w| w == b"IHDR").unwrap();
+        bytes[ihdr + 4..ihdr + 8].copy_from_slice(&100_000_u32.to_be_bytes());
+        bytes[ihdr + 8..ihdr + 12].copy_from_slice(&100_000_u32.to_be_bytes());
+        let crc = crc32(&bytes[ihdr..ihdr + 17]);
+        bytes[ihdr + 17..ihdr + 21].copy_from_slice(&crc.to_be_bytes());
+        assert!(matches!(decode_png(&bytes), Err(IoError::Unsupported(_))));
+    }
+
+    /// The CRC-32 of PNG chunks.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFF_u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn exports_too_large_to_hold_are_refused() {
+        let sprite = Sprite::new(4096, 4096).unwrap();
+        assert!(matches!(
+            export_png(&sprite, 0, MAX_EXPORT_SCALE, Vec::new()),
+            Err(IoError::Unsupported(_))
+        ));
+    }
+
+    #[test]
     fn garbage_is_an_error_not_a_panic() {
         assert!(decode_png(b"definitely not a png").is_err());
         assert!(decode_png(&[]).is_err());
@@ -191,8 +267,20 @@ mod tests {
 
         let bytes = std::fs::read(target.path()).unwrap();
         assert_eq!(decode_png(&bytes).unwrap().width(), 48);
-        let mut temp = target.path().as_os_str().to_owned();
-        temp.push(".tmp");
-        assert!(!Path::new(&temp).exists());
+        let folder = target.path().parent().unwrap();
+        let name = target
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let left = std::fs::read_dir(folder)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let other = entry.file_name().to_string_lossy().into_owned();
+                other.starts_with(&format!(".{name}.")) && other.ends_with(".tmp")
+            });
+        assert!(!left);
     }
 }

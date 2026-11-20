@@ -192,7 +192,7 @@ pub fn load_palette(path: &Path) -> Result<LoadedPalette, IoError> {
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
     if is_png {
-        let image = decode_png(&std::fs::read(path)?)?;
+        let image = decode_png(&crate::read_file(path)?)?;
         let (palette, truncated) = palette::from_image(&image);
         if palette.is_empty() {
             return Err(IoError::Invalid("the picture is empty".to_owned()));
@@ -203,7 +203,7 @@ pub fn load_palette(path: &Path) -> Result<LoadedPalette, IoError> {
     let format = PaletteFormat::from_path(path).ok_or_else(|| {
         IoError::Unsupported("palettes are read from .gpl, .hex, .pal and .png files".to_owned())
     })?;
-    let bytes = std::fs::read(path)?;
+    let bytes = crate::read_file(path)?;
     let text = String::from_utf8_lossy(&bytes);
     Ok(LoadedPalette {
         palette: parse_palette(&text, format)?,

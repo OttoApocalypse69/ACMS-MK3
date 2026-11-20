@@ -14,7 +14,7 @@ use acms_core::image::Image;
 use acms_core::palette::MAX_PALETTE_COLORS;
 use acms_core::sprite::{
     BlendMode, CelSource, Direction, Frame, ImageLayer, Layer, LayerId, LayerKind, MAX_FRAME_MS,
-    MAX_SPRITE_SIZE, Palette, Sprite, Tag,
+    MAX_GROUP_DEPTH, MAX_SPRITE_SIZE, Palette, Sprite, Tag,
 };
 use acms_core::tiles::Slice;
 use aseprite_loader::binary::blend_mode::BlendMode as AseBlend;
@@ -41,6 +41,64 @@ pub struct Imported {
 
 fn damaged(why: impl std::fmt::Display) -> IoError {
     IoError::Invalid(why.to_string())
+}
+
+/// Most frames × layers a file may have: the parser keeps a place for every cel of every
+/// frame, whether it is there or not.
+const MAX_CEL_SLOTS: u64 = 1 << 20;
+
+/// Most bytes the pixels of all cels may unpack to together.
+const MAX_DECODED_BYTES: u64 = 1 << 30;
+
+/// Looks at how many frames and layers a file has before it is handed to the parser, which
+/// would make room for all of them at once. The parser checks everything else.
+fn prescan(bytes: &[u8]) -> Result<(), IoError> {
+    let u16_at = |at: usize| {
+        let b = bytes.get(at..at.checked_add(2)?)?;
+        Some(u16::from_le_bytes([b[0], b[1]]))
+    };
+    let u32_at = |at: usize| {
+        let b = bytes.get(at..at.checked_add(4)?)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    const HEADER: usize = 128;
+    const FRAME_HEADER: usize = 16;
+    const CHUNK_HEADER: usize = 6;
+    const LAYER_CHUNK: u16 = 0x2004;
+    let Some(frames) = u16_at(6) else {
+        return Ok(());
+    };
+    let mut layers: u64 = 0;
+    let mut at = HEADER;
+    for _ in 0..frames {
+        let Some(size) = u32_at(at).map(|size| size as usize) else {
+            break;
+        };
+        if size < FRAME_HEADER {
+            break;
+        }
+        let end = at.saturating_add(size).min(bytes.len());
+        let mut chunk = at + FRAME_HEADER;
+        while chunk.saturating_add(CHUNK_HEADER) <= end {
+            let (Some(chunk_size), Some(kind)) = (u32_at(chunk), u16_at(chunk + 4)) else {
+                break;
+            };
+            if kind == LAYER_CHUNK {
+                layers += 1;
+            }
+            if (chunk_size as usize) < CHUNK_HEADER {
+                break;
+            }
+            chunk = chunk.saturating_add(chunk_size as usize);
+        }
+        at = at.saturating_add(size);
+    }
+    if u64::from(frames) * layers > MAX_CEL_SLOTS {
+        return Err(IoError::Unsupported(format!(
+            "the file has {frames} frames of {layers} layers, more than ACMS can open"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether a file name looks like an Aseprite file.
@@ -125,7 +183,12 @@ struct LayerBuilder<'a, 'f> {
 impl LayerBuilder<'_, '_> {
     /// The layers at nesting depth `level` from the current position on: the file lists the
     /// tree bottom to top, each group followed by what is in it one level deeper.
-    fn level(&mut self, level: u16) -> Vec<Layer> {
+    fn level(&mut self, level: u16) -> Result<Vec<Layer>, IoError> {
+        if usize::from(level) > MAX_GROUP_DEPTH {
+            return Err(IoError::Unsupported(format!(
+                "the groups of layers are more than {MAX_GROUP_DEPTH} deep"
+            )));
+        }
         let mut layers = Vec::new();
         while let Some(chunk) = self.chunks.get(self.next) {
             if chunk.child_level < level {
@@ -142,7 +205,10 @@ impl LayerBuilder<'_, '_> {
             let visible = chunk.flags.contains(LayerFlags::VISIBLE);
             match chunk.layer_type {
                 LayerType::Group => {
-                    let children = self.level(chunk.child_level.saturating_add(1));
+                    let below = chunk.child_level.checked_add(1).ok_or_else(|| {
+                        IoError::Unsupported("the groups of layers are too deep".to_owned())
+                    })?;
+                    let children = self.level(below)?;
                     let mut group = Layer::group(id, name, children);
                     group.visible = visible;
                     self.fates[index] = Fate::Group;
@@ -189,7 +255,7 @@ impl LayerBuilder<'_, '_> {
                 }
             }
         }
-        layers
+        Ok(layers)
     }
 }
 
@@ -222,6 +288,7 @@ fn palette_of(cels: &[CelSource]) -> Palette {
 /// and slices come across. Indexed and greyscale files become RGBA. What does not come
 /// across is named in [`Imported::notes`].
 pub fn import_aseprite(bytes: &[u8]) -> Result<Imported, IoError> {
+    prescan(bytes)?;
     // The parser is somebody else's code reading somebody else's file: a mistake in either
     // must not take the app down.
     let parsed = std::panic::catch_unwind(|| parse_file(bytes).map_err(|err| err.to_string()));
@@ -239,7 +306,7 @@ pub fn import_aseprite(bytes: &[u8]) -> Result<Imported, IoError> {
         fates: vec![Fate::LeftOut; file.layers.len()],
         notes: Vec::new(),
     };
-    let mut layers = builder.level(0);
+    let mut layers = builder.level(0)?;
     let (fates, mut notes) = (builder.fates, builder.notes);
     if layers.is_empty() {
         layers.push(Layer::image(
@@ -269,6 +336,7 @@ pub fn import_aseprite(bytes: &[u8]) -> Result<Imported, IoError> {
     }
 
     let mut cels = Vec::new();
+    let mut decoded: u64 = 0;
     // For every cel that is a link: the frame whose picture it shows.
     let mut sources: BTreeMap<(LayerId, usize), usize> = BTreeMap::new();
     for (frame_index, frame) in file.frames.iter().enumerate() {
@@ -280,6 +348,12 @@ pub fn import_aseprite(bytes: &[u8]) -> Result<Imported, IoError> {
             };
             match &cel.content {
                 CelContent::Image(image) => {
+                    decoded += u64::from(image.width) * u64::from(image.height) * 4;
+                    if decoded > MAX_DECODED_BYTES {
+                        return Err(IoError::Unsupported(
+                            "the cels hold more pixels than ACMS can open".to_owned(),
+                        ));
+                    }
                     let mut picture = decode(&file, image, background)?;
                     if cel.opacity != 255 {
                         let opacity = u32::from(cel.opacity);
@@ -414,7 +488,7 @@ pub fn import_aseprite(bytes: &[u8]) -> Result<Imported, IoError> {
 
 /// [`import_aseprite`] from a file.
 pub fn import_aseprite_from_path(path: &Path) -> Result<Imported, IoError> {
-    import_aseprite(&std::fs::read(path)?)
+    import_aseprite(&crate::read_file(path)?)
 }
 
 #[cfg(test)]
@@ -872,5 +946,58 @@ mod tests {
         crate::acms::write_acms(&sprite, &mut bytes).unwrap();
         bytes.set_position(0);
         assert_eq!(crate::acms::read_acms(bytes).unwrap(), sprite);
+    }
+
+    #[test]
+    fn a_file_claiming_frames_times_layers_beyond_reason_is_refused_first() {
+        // A header claiming 65 535 frames, then one frame of 20 (empty) layer chunks: the
+        // parser would make room for 65 535 × 20 cels.
+        let mut bytes = vec![0_u8; 128];
+        bytes[4..6].copy_from_slice(&0xA5E0_u16.to_le_bytes());
+        bytes[6..8].copy_from_slice(&u16::MAX.to_le_bytes());
+        let chunks = 20;
+        let frame_size = 16 + chunks * 6;
+        bytes.extend_from_slice(&(frame_size as u32).to_le_bytes());
+        bytes.extend_from_slice(&0xF1FA_u16.to_le_bytes());
+        bytes.extend_from_slice(&[0; 10]);
+        for _ in 0..chunks {
+            bytes.extend_from_slice(&6_u32.to_le_bytes());
+            bytes.extend_from_slice(&0x2004_u16.to_le_bytes());
+        }
+        assert!(matches!(
+            import_aseprite(&bytes),
+            Err(IoError::Unsupported(message)) if message.contains("65535 frames")
+        ));
+        // And garbage is still only an error.
+        assert!(prescan(&[0xFF; 3]).is_ok());
+        assert!(import_aseprite(&[0xFF; 200]).is_err());
+    }
+
+    #[test]
+    fn groups_nested_too_deep_are_refused_without_running_out_of_stack() {
+        let group = |level: u16| LayerChunk {
+            flags: LayerFlags::VISIBLE,
+            layer_type: LayerType::Group,
+            child_level: level,
+            blend_mode: AseBlend::Normal,
+            opacity: 255,
+            name: "g",
+            tileset_index: None,
+        };
+        // Each group one level deeper than the last; and the trick of a level that cannot
+        // go deeper, which would never end a level.
+        for chunks in [
+            (0..5000).map(group).collect::<Vec<_>>(),
+            (0..5000).map(|_| group(u16::MAX)).collect(),
+        ] {
+            let mut builder = LayerBuilder {
+                chunks: &chunks,
+                opacity_stored: true,
+                next: 0,
+                fates: vec![Fate::LeftOut; chunks.len()],
+                notes: Vec::new(),
+            };
+            assert!(matches!(builder.level(0), Err(IoError::Unsupported(_))));
+        }
     }
 }

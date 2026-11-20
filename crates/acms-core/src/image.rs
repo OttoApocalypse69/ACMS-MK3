@@ -11,19 +11,25 @@ pub struct Image {
     pixels: Vec<Rgba8>,
 }
 
+/// How many pixels an image of this size has. Saturates where `usize` is too small, so that
+/// a size that cannot be allocated fails to allocate rather than wraps to a small number.
+fn pixel_count(width: u32, height: u32) -> usize {
+    (width as usize).saturating_mul(height as usize)
+}
+
 impl Image {
     /// A fully transparent image.
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             width,
             height,
-            pixels: vec![Rgba8::TRANSPARENT; width as usize * height as usize],
+            pixels: vec![Rgba8::TRANSPARENT; pixel_count(width, height)],
         }
     }
 
     /// `None` if `pixels` does not hold exactly `width * height` pixels.
     pub fn from_pixels(width: u32, height: u32, pixels: Vec<Rgba8>) -> Option<Self> {
-        (pixels.len() == width as usize * height as usize).then_some(Self {
+        (pixels.len() == pixel_count(width, height)).then_some(Self {
             width,
             height,
             pixels,
@@ -32,7 +38,7 @@ impl Image {
 
     /// Builds an image from `R, G, B, A` bytes. `None` if the length does not match.
     pub fn from_rgba_bytes(width: u32, height: u32, bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != width as usize * height as usize * 4 {
+        if Some(bytes.len()) != pixel_count(width, height).checked_mul(4) {
             return None;
         }
         let pixels = bytes
@@ -186,7 +192,11 @@ impl Image {
     /// Nearest-neighbour upscale by a whole factor.
     pub fn scaled_up(&self, factor: u32) -> Self {
         let factor = factor.max(1);
-        let mut out = Self::new(self.width * factor, self.height * factor);
+        // Callers keep the result to a sensible size; this only keeps the sizes honest.
+        let mut out = Self::new(
+            self.width.saturating_mul(factor),
+            self.height.saturating_mul(factor),
+        );
         let out_width = out.width as usize;
         for (index, px) in out.pixels.iter_mut().enumerate() {
             let x = (index % out_width) as u32 / factor;

@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Jobs only read the repository; the one that publishes asks for more itself.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Check (${{ matrix.os }})
@@ -18,10 +22,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to the commit of a release, so a moved tag changes nothing.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The version comes from rust-toolchain.toml.
       - run: rustup toolchain install && rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Linux packages
         if: runner.os == 'Linux'
         run: |
@@ -36,9 +41,9 @@ jobs:
     needs: check
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install && rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release -p acms-app
       # How long flattening a large sprite takes here, for the record. The 120 fps budget
       # itself is checked on a developer's machine (see README): shared runners are too
@@ -47,7 +52,7 @@ jobs:
       - name: Installer
         shell: pwsh
         run: |
-          choco install innosetup --no-progress -y
+          choco install innosetup --version=6.7.1 --no-progress -y
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
             Where-Object name -eq 'acms-app' | ForEach-Object version
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer\windows\acms-mk3.iss
@@ -59,7 +64,7 @@ jobs:
           Copy-Item target\release\acms-app.exe, README.md, LICENSE-MIT, LICENSE-APACHE dist\acms-mk3
           Compress-Archive -Path dist\acms-mk3 -DestinationPath dist\acms-mk3-windows-x86_64.zip
           Move-Item target\installer\acms-mk3-setup-x86_64.exe dist\
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows
           path: |
@@ -72,9 +77,9 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install && rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Linux packages
         run: |
           sudo apt-get update
@@ -83,7 +88,7 @@ jobs:
       - run: cargo test --release -p acms-core -- --ignored time_to_flatten --nocapture
       - name: Debian package
         run: |
-          cargo install cargo-deb --locked
+          cargo install cargo-deb --version 3.8.0 --locked
           cargo deb -p acms-app --no-build --output dist/
           dpkg-deb --info dist/*.deb
           dpkg-deb --contents dist/*.deb
@@ -94,7 +99,7 @@ jobs:
           cp installer/linux/acms-mk3.desktop installer/linux/acms-mk3.xml dist/acms-mk3/
           cp assets/icon/acms-256.png dist/acms-mk3/acms-mk3.png
           tar -C dist -czf dist/acms-mk3-linux-x86_64.tar.gz acms-mk3
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux
           path: |
@@ -112,12 +117,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: The tag matches the version
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "acms-app") | .version')
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, version $version"; exit 1; }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true

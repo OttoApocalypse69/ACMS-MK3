@@ -299,7 +299,10 @@ impl CanvasView {
                     painter.hline(area.x_range(), inner.bottom(), thin);
                 }
                 if let Some(pivot) = slice.pivot {
-                    let at = Point::new(slice.rect.x + pivot.x, slice.rect.y + pivot.y);
+                    let at = Point::new(
+                        slice.rect.x.saturating_add(pivot.x),
+                        slice.rect.y.saturating_add(pivot.y),
+                    );
                     let at = geometry
                         .screen_rect(PixelRect::new(at.x, at.y, 1, 1))
                         .center();

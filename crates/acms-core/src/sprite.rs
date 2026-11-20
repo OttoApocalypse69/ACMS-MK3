@@ -22,6 +22,13 @@ pub const MAX_SPRITE_SIZE: u32 = 4096;
 /// How long a new frame is shown.
 pub const DEFAULT_FRAME_MS: u32 = 100;
 
+/// Most groups a layer can be inside of, one in another.
+pub const MAX_GROUP_DEPTH: usize = 64;
+
+/// Largest layer id a sprite read from a file may use. Ids above it are kept free, so that
+/// new layers always get one.
+pub const MAX_LAYER_ID: u32 = 1 << 30;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SpriteError {
     #[error("a sprite must be between 1 and {MAX_SPRITE_SIZE} pixels on each side, not {0}×{1}")]
@@ -78,6 +85,10 @@ pub enum SpriteError {
     InvalidSlot { index: usize },
     #[error("a group cannot be moved into itself")]
     IntoItself,
+    #[error("groups can be inside one another at most {MAX_GROUP_DEPTH} deep")]
+    TooDeep,
+    #[error("layer id {0} is not allowed")]
+    InvalidLayerId(u32),
     #[error("there is no image layer directly below to merge into")]
     NothingBelow,
     #[error("pixel data is {got_w}×{got_h} but the area to fill is {want_w}×{want_h}")]
@@ -825,7 +836,11 @@ impl Cel {
 
     /// The pixel at a canvas position; transparent outside the cel.
     pub fn pixel(&self, x: i32, y: i32) -> Rgba8 {
-        self.image.get(x - self.origin.x, y - self.origin.y)
+        let local = |at: i32, origin: i32| i32::try_from(i64::from(at) - i64::from(origin));
+        match (local(x, self.origin.x), local(y, self.origin.y)) {
+            (Ok(x), Ok(y)) => self.image.get(x, y),
+            _ => Rgba8::TRANSPARENT,
+        }
     }
 }
 
@@ -841,6 +856,23 @@ pub struct CelSource {
 
 /// A cel together with the layer and frame it belongs to.
 pub(crate) type PlacedCel = (LayerId, usize, Cel);
+
+/// How deep the deepest layer in `layers` is, the layers themselves being at depth 0.
+/// Works without recursion, so that any tree can be measured.
+pub(crate) fn tree_depth(layers: &[Layer]) -> usize {
+    let mut deepest = 0;
+    let mut stack: Vec<(&[Layer], usize)> = vec![(layers, 0)];
+    while let Some((list, depth)) = stack.pop() {
+        for layer in list {
+            deepest = deepest.max(depth);
+            let children = layer.children();
+            if !children.is_empty() {
+                stack.push((children, depth + 1));
+            }
+        }
+    }
+    deepest
+}
 
 fn find(layers: &[Layer], id: LayerId) -> Option<&Layer> {
     layers.iter().find_map(|layer| {
@@ -948,6 +980,16 @@ impl Sprite {
         if frames.is_empty() {
             return Err(SpriteError::NoFrames);
         }
+        // Checked before anything walks the tree, which recurses.
+        if tree_depth(&layers) > MAX_GROUP_DEPTH {
+            return Err(SpriteError::TooDeep);
+        }
+        let frames = frames
+            .into_iter()
+            .map(|frame| Frame {
+                duration_ms: frame.duration_ms.clamp(1, MAX_FRAME_MS),
+            })
+            .collect();
 
         let mut sprite = Self {
             width,
@@ -968,6 +1010,9 @@ impl Sprite {
         ids.sort();
         if let Some(pair) = ids.windows(2).find(|pair| pair[0] == pair[1]) {
             return Err(SpriteError::DuplicateLayer(pair[0].0));
+        }
+        if let Some(id) = ids.iter().find(|id| !(1..=MAX_LAYER_ID).contains(&id.0)) {
+            return Err(SpriteError::InvalidLayerId(id.0));
         }
 
         for cel in cels {
@@ -1392,8 +1437,11 @@ impl Sprite {
         let context = self.tile_context();
         let mut state = self.frame_state();
         for (layer, frame, grid) in grids {
+            // Every cell has to name a tile the set has (or none).
             let fits = self.tileset_of(layer).is_some_and(|set| {
-                self.grid_size(set) == (grid.width(), grid.height()) && frame < self.frames.len()
+                self.grid_size(set) == (grid.width(), grid.height())
+                    && frame < self.frames.len()
+                    && grid.cells().iter().all(|&tile| tile as usize <= set.len())
             });
             if fits && !grid.is_empty() {
                 state.grids.insert((layer, frame), Arc::new(grid));
@@ -1995,5 +2043,72 @@ mod tests {
         }
         assert_eq!(BlendMode::from_id("dissolve"), None);
         assert_eq!(BlendMode::default(), BlendMode::Normal);
+    }
+
+    /// Groups inside one another, `depth` deep, with an image layer at the bottom.
+    fn nested(depth: u32) -> Vec<Layer> {
+        let mut layer = Layer::image(LayerId(depth + 1), "Inside");
+        for id in (1..=depth).rev() {
+            layer = Layer::group(LayerId(id), "Group", vec![layer]);
+        }
+        vec![layer]
+    }
+
+    fn built(layers: Vec<Layer>, frames: Vec<Frame>) -> Result<Sprite, SpriteError> {
+        Sprite::from_parts(4, 4, Palette::default_palette(), layers, frames, Vec::new())
+    }
+
+    fn one_frame() -> Vec<Frame> {
+        vec![Frame { duration_ms: 100 }]
+    }
+
+    #[test]
+    fn groups_too_deep_are_refused_before_the_tree_is_walked() {
+        let deepest = MAX_GROUP_DEPTH as u32;
+        assert!(built(nested(deepest), one_frame()).is_ok());
+        assert_eq!(
+            built(nested(deepest + 1), one_frame()),
+            Err(SpriteError::TooDeep)
+        );
+        // Far deeper than any stack would take, and still only an error.
+        assert_eq!(
+            built(nested(10_000), one_frame()).map(|_| ()),
+            Err(SpriteError::TooDeep)
+        );
+    }
+
+    #[test]
+    fn frame_durations_from_a_file_are_kept_in_range() {
+        let frames = vec![
+            Frame { duration_ms: 0 },
+            Frame {
+                duration_ms: u32::MAX,
+            },
+        ];
+        let sprite = built(vec![Layer::image(LayerId(1), "A")], frames).unwrap();
+        let durations: Vec<u32> = sprite.frames().iter().map(|f| f.duration_ms).collect();
+        assert_eq!(durations, [1, MAX_FRAME_MS]);
+    }
+
+    #[test]
+    fn layer_ids_must_leave_room_for_new_layers() {
+        for id in [0, MAX_LAYER_ID + 1, u32::MAX] {
+            assert_eq!(
+                built(vec![Layer::image(LayerId(id), "A")], one_frame()),
+                Err(SpriteError::InvalidLayerId(id))
+            );
+        }
+        assert!(built(vec![Layer::image(LayerId(MAX_LAYER_ID), "A")], one_frame()).is_ok());
+    }
+
+    #[test]
+    fn a_pixel_far_from_a_cel_is_clear_however_far() {
+        let cel = Cel {
+            origin: Point::new(5, -5),
+            image: Arc::new(Image::from_pixels(1, 1, vec![Rgba8::WHITE]).unwrap()),
+        };
+        assert_eq!(cel.pixel(5, -5), Rgba8::WHITE);
+        assert_eq!(cel.pixel(i32::MIN, i32::MAX), Rgba8::TRANSPARENT);
+        assert_eq!(cel.pixel(i32::MAX, i32::MIN), Rgba8::TRANSPARENT);
     }
 }

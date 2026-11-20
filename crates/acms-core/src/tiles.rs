@@ -153,7 +153,8 @@ impl TileGrid {
 
     /// A grid from its cells, row by row. `None` if there are not `width × height` of them.
     pub fn from_cells(width: u32, height: u32, cells: Vec<u32>) -> Option<Self> {
-        (cells.len() == width as usize * height as usize).then_some(Self {
+        let count = (width as usize).checked_mul(height as usize)?;
+        (cells.len() == count).then_some(Self {
             width,
             height,
             cells,

@@ -615,10 +615,13 @@ fn recover(ui: &mut Ui, state: &AppState) -> Outcome {
         ),
     });
     for leftover in found {
-        let label = ui.label(format!("  •  {}", leftover.title()));
-        if let Some(original) = &leftover.original {
-            label.on_hover_text(original.display().to_string());
-        }
+        // Where a recovered sprite will be saved is said plainly: the note naming it is a
+        // file anyone could have written.
+        let line = match leftover.target() {
+            Some(target) => format!("  •  {}  ({})", leftover.title(), target.display()),
+            None => format!("  •  {}  (not saved before)", leftover.title()),
+        };
+        ui.label(line);
     }
     ui.add_space(8.0);
     let (recover, discard, later) = ui

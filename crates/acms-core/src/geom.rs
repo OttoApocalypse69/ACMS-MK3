@@ -38,7 +38,7 @@ impl Rect {
         if right <= left || bottom <= top {
             return Self::EMPTY;
         }
-        Self::new(left, top, (right - left) as u32, (bottom - top) as u32)
+        Self::new(left, top, right.abs_diff(left), bottom.abs_diff(top))
     }
 
     pub const fn is_empty(self) -> bool {
@@ -47,12 +47,13 @@ impl Rect {
 
     /// One past the last column.
     pub const fn right(self) -> i32 {
-        self.x + self.w as i32
+        // Saturates: a rectangle reaching past the largest coordinate ends there.
+        self.x.saturating_add_unsigned(self.w)
     }
 
     /// One past the last row.
     pub const fn bottom(self) -> i32 {
-        self.y + self.h as i32
+        self.y.saturating_add_unsigned(self.h)
     }
 
     pub const fn origin(self) -> Point {
@@ -98,13 +99,29 @@ impl Rect {
 
     /// The same rectangle moved by `(dx, dy)`.
     pub const fn translated(self, dx: i32, dy: i32) -> Self {
-        Self::new(self.x + dx, self.y + dy, self.w, self.h)
+        Self::new(
+            self.x.saturating_add(dx),
+            self.y.saturating_add(dy),
+            self.w,
+            self.h,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extreme_coordinates_saturate_instead_of_overflowing() {
+        let far = Rect::new(i32::MAX - 1, i32::MIN, u32::MAX, 4);
+        assert_eq!(far.right(), i32::MAX);
+        assert_eq!(far.bottom(), i32::MIN + 4);
+        assert_eq!(far.translated(10, -10).x, i32::MAX);
+        let wide = Rect::from_edges(i32::MIN, 0, i32::MAX, 1);
+        assert_eq!(wide.w, u32::MAX);
+        assert!(Rect::from_size(8, 8).intersect(far).is_empty());
+    }
 
     #[test]
     fn edges_and_containment() {

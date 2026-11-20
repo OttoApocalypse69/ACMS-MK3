@@ -108,18 +108,23 @@ pub fn tiled_map(
 
     // The tilesets in use, each with the global number of its first tile.
     let mut first_gids: Vec<(&Tileset, u32)> = Vec::new();
-    let mut next = 1;
+    let mut next: u32 = 1;
     for set in sprite.tilesets() {
         let used = layers.iter().any(|(_, used)| used.id == set.id);
         if used && !set.is_empty() {
             first_gids.push((set, next));
-            next += set.len() as u32;
+            next = u32::try_from(set.len())
+                .ok()
+                .and_then(|count| next.checked_add(count))
+                .ok_or_else(|| unsupported("the tilesets have more tiles than Tiled can number"))?;
         }
     }
+    // A tile the set does not have is no tile; the others fit below `next`.
     let gid = |set: &Tileset, tile: u32| {
         let first = first_gids.iter().find(|(other, _)| other.id == set.id);
         match (tile, first) {
             (0, _) | (_, None) => 0,
+            (tile, Some((set, _))) if tile as usize > set.len() => 0,
             (tile, Some((_, first))) => first + tile - 1,
         }
     };

@@ -4,8 +4,12 @@
 //! to a small note saying which file it belongs to. The copies are removed when the sprite is
 //! saved or closed, and when the app exits normally. Copies found at start mean the app did
 //! not exit normally last time: the user is asked whether to open them.
+//!
+//! Each running app holds a lock on a file of its own in the recovery folder, so that the
+//! copies of an app that is still running are never taken for those of one that crashed.
 
 use std::collections::HashMap;
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 
@@ -36,6 +40,17 @@ pub struct Leftover {
 }
 
 impl Leftover {
+    /// The file a recovered sprite is saved to. The note saying so is only trusted as far as
+    /// naming a sprite file goes: anything else, and the sprite comes back without a file.
+    pub fn target(&self) -> Option<&Path> {
+        self.original.as_deref().filter(|path| {
+            path.is_absolute()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("acms"))
+        })
+    }
+
     /// What to call the sprite when asking about it.
     pub fn title(&self) -> String {
         self.original
@@ -54,14 +69,57 @@ pub struct RecoveryState {
     saved: HashMap<DocId, u64>,
     /// When sprites were last autosaved, in seconds of the app's clock.
     last: Option<f64>,
-    /// Copies being written right now.
-    writing: Vec<JoinHandle<Option<String>>>,
+    /// Copies being written right now, by one thread per round.
+    writing: Vec<JoinHandle<Vec<String>>>,
     /// What was found at start, until the user has decided about it.
     pub found: Vec<Leftover>,
+    /// The file this app holds a lock on while it runs, and the lock.
+    lock: Option<(PathBuf, File)>,
 }
 
 fn copy_path(folder: &Path, id: DocId) -> PathBuf {
     folder.join(format!("{}-{}.acms", std::process::id(), id.0))
+}
+
+fn lock_path(folder: &Path, pid: u32) -> PathBuf {
+    folder.join(format!("{pid}.lock"))
+}
+
+/// Takes the lock that says this app is running. Without it, nothing is lost: another app
+/// may only take this one's copies for leftovers.
+fn take_lock(folder: &Path) -> Option<(PathBuf, File)> {
+    std::fs::create_dir_all(folder).ok()?;
+    let path = lock_path(folder, std::process::id());
+    let file = File::create(&path).ok()?;
+    file.try_lock().ok()?;
+    Some((path, file))
+}
+
+/// Whether the app that wrote copies under `pid` is still running: it holds its lock.
+fn still_running(folder: &Path, pid: u32) -> bool {
+    if pid == std::process::id() {
+        // This app has not written anything yet: an earlier one with the same number did.
+        return false;
+    }
+    let path = lock_path(folder, pid);
+    let Ok(file) = File::options().write(true).open(&path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Err(TryLockError::WouldBlock) => true,
+        Ok(()) | Err(TryLockError::Error(_)) => {
+            // Nobody holds it: what is left of a run that ended.
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            false
+        }
+    }
+}
+
+/// The number of the app that wrote a copy, from its name `<pid>-<sprite>.acms`.
+fn writer_of(copy: &Path) -> Option<u32> {
+    let stem = copy.file_stem()?.to_str()?;
+    stem.split_once('-')?.0.parse().ok()
 }
 
 fn note_path(copy: &Path) -> PathBuf {
@@ -79,7 +137,7 @@ fn settle(state: &mut AppState, wait: bool) -> bool {
     let mut pending = Vec::new();
     for handle in std::mem::take(&mut state.recovery.writing) {
         if wait || handle.is_finished() {
-            if let Ok(Some(problem)) = handle.join() {
+            for problem in handle.join().unwrap_or_default() {
                 state.log.push(format!("Autosave: {problem}"));
             }
         } else {
@@ -115,6 +173,9 @@ pub fn autosave(state: &mut AppState, wait: bool) {
         remove(&copy_path(&folder, id));
     }
 
+    // One thread writes the whole round, one copy after another, however many sprites
+    // are open.
+    let mut jobs = Vec::new();
     for id in open {
         let Some(document) = state.editor.document_by_id(id) else {
             continue;
@@ -128,19 +189,24 @@ pub fn autosave(state: &mut AppState, wait: bool) {
         let note = Note {
             path: state.path_of(id).cloned(),
         };
-        let copy = copy_path(&folder, id);
-        let folder = folder.clone();
         state.recovery.saved.insert(id, revision);
+        jobs.push((copy_path(&folder, id), sprite, note));
+    }
+    if !jobs.is_empty() {
         state.recovery.writing.push(std::thread::spawn(move || {
-            let write = || -> Result<(), String> {
-                std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
-                save_acms(&sprite, &copy).map_err(|err| err.to_string())?;
-                let note = serde_json::to_string(&note).map_err(|err| err.to_string())?;
-                settings::write_text(&note_path(&copy), &note)
-            };
-            write()
-                .err()
-                .map(|why| format!("could not write {} ({why})", copy.display()))
+            let mut problems = Vec::new();
+            for (copy, sprite, note) in jobs {
+                let write = || -> Result<(), String> {
+                    std::fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
+                    save_acms(&sprite, &copy).map_err(|err| err.to_string())?;
+                    let note = serde_json::to_string(&note).map_err(|err| err.to_string())?;
+                    settings::write_text(&note_path(&copy), &note)
+                };
+                if let Err(why) = write() {
+                    problems.push(format!("could not write {} ({why})", copy.display()));
+                }
+            }
+            problems
         }));
     }
     settle(state, wait);
@@ -179,6 +245,8 @@ fn leftovers(folder: &Path) -> Vec<Leftover> {
             path.extension()
                 .is_some_and(|extension| extension == "acms")
         })
+        // The copies of an app that is running now are its own business.
+        .filter(|copy| !writer_of(copy).is_some_and(|pid| still_running(folder, pid)))
         .map(|copy| {
             let note = std::fs::read_to_string(note_path(&copy))
                 .ok()
@@ -199,6 +267,7 @@ pub fn check_at_start(state: &mut AppState) {
     let Some(folder) = state.paths.recovery.clone() else {
         return;
     };
+    state.recovery.lock = take_lock(&folder);
     state.recovery.found = leftovers(&folder);
     if !state.recovery.found.is_empty() {
         state.dialog = Some(Dialog::Recover);
@@ -214,6 +283,10 @@ pub fn clean_exit(state: &mut AppState) {
     for (id, _) in state.recovery.saved.drain() {
         remove(&copy_path(&folder, id));
     }
+    if let Some((path, file)) = state.recovery.lock.take() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn recover(state: &mut AppState, discard: bool) -> Result<(), CommandError> {
@@ -223,7 +296,8 @@ fn recover(state: &mut AppState, discard: bool) -> Result<(), CommandError> {
         if !discard {
             match load_acms(&leftover.copy) {
                 Ok(sprite) => {
-                    state.open_document(Document::new(sprite), leftover.original.clone());
+                    let target = leftover.target().map(Path::to_path_buf);
+                    state.open_document(Document::new(sprite), target);
                     // It differs from what is on disk, whatever its history says.
                     state.saved_revision = u64::MAX;
                     state.log.push(format!("Recovered {}", leftover.title()));
@@ -285,8 +359,10 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(dir.path().join("recovery")) else {
             return Vec::new();
         };
+        // The lock of the app that is running is not a copy.
         let mut names: Vec<String> = entries
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".lock"))
             .collect();
         names.sort();
         names
@@ -470,6 +546,64 @@ mod tests {
         );
         assert_eq!(copies(&dir), ["1-1.acms"]);
         assert_eq!(f.state.editor.documents().count(), 0);
+    }
+
+    #[test]
+    fn the_copies_of_an_app_that_is_still_running_are_left_alone() {
+        let dir = TempDir::new("recover-running");
+        let folder = dir.path().join("recovery");
+        std::fs::create_dir_all(&folder).unwrap();
+        // Another app, number 1, is running: it holds its lock.
+        let other = File::create(lock_path(&folder, 1)).unwrap();
+        other.try_lock().unwrap();
+        std::fs::write(folder.join("1-1.acms"), "a sprite being worked on").unwrap();
+        // App number 2 crashed: its lock is there, but nobody holds it.
+        File::create(lock_path(&folder, 2)).unwrap();
+        std::fs::write(folder.join("2-1.acms"), "a sprite left behind").unwrap();
+
+        let mut f = fixture_in(&dir);
+        let found: Vec<_> = f
+            .state
+            .recovery
+            .found
+            .iter()
+            .map(|l| l.copy.clone())
+            .collect();
+        assert_eq!(found, [folder.join("2-1.acms")]);
+        // Discarding what was left behind does not touch the running app's copy.
+        f.run_with("file.recover", Params::new().with("discard", true));
+        assert!(folder.join("1-1.acms").exists());
+        assert!(!folder.join("2-1.acms").exists());
+        assert!(!lock_path(&folder, 2).exists());
+        drop(other);
+    }
+
+    #[test]
+    fn a_recovered_sprite_is_only_saved_where_a_sprite_file_was() {
+        let leftover = |original: &str| Leftover {
+            copy: PathBuf::from("1-1.acms"),
+            original: Some(PathBuf::from(original)),
+        };
+        let absolute = std::env::temp_dir().join("hero.acms");
+        let named = absolute.to_string_lossy().into_owned();
+        assert_eq!(leftover(&named).target(), Some(absolute.as_path()));
+        let elsewhere = std::env::temp_dir().join("notes.txt");
+        assert_eq!(leftover(&elsewhere.to_string_lossy()).target(), None);
+        assert_eq!(leftover("relative.acms").target(), None);
+    }
+
+    #[test]
+    fn many_sprites_are_written_by_one_thread() {
+        let dir = TempDir::new("autosave-many");
+        let mut f = fixture_in(&dir);
+        for _ in 0..20 {
+            new_sprite(&mut f);
+            f.draw_line(2);
+        }
+        autosave(&mut f.state, false);
+        assert_eq!(f.state.recovery.writing.len(), 1);
+        settle(&mut f.state, true);
+        assert_eq!(copies(&dir).len(), 40);
     }
 
     #[test]

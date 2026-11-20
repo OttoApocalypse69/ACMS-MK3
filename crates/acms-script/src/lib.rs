@@ -179,24 +179,29 @@ impl Engine {
         lua.set_named_registry_value(api::COLOR_META, internal.get::<Table>("color")?)?;
         lua.globals()
             .set("Color", lua.create_function(api::color_constructor)?)?;
-        let console: Table = internal.get::<Function>("environment")?.call(())?;
 
         // The clock is looked at every so often while Lua code runs; coroutines a script
-        // makes inherit the hook.
+        // makes inherit the hook. Once the time is up it stays up: every later look raises
+        // the error again, and `pcall` and the like pass it on instead of catching it.
         let deadline = Rc::new(Cell::new(Instant::now() + DEFAULT_TIME_LIMIT));
-        let limit = deadline.clone();
+        let expired = Rc::new(Cell::new(false));
+        let (limit, gone) = (deadline.clone(), expired.clone());
         lua.set_global_hook(
             HookTriggers::new().every_nth_instruction(INSTRUCTIONS_PER_CHECK),
             move |_, _| {
-                if Instant::now() > limit.get() {
-                    Err(mlua::Error::runtime(
-                        "the script took too long and was stopped",
-                    ))
+                if gone.get() || Instant::now() > limit.get() {
+                    gone.set(true);
+                    Err(mlua::Error::runtime(api::TOO_LONG))
                 } else {
                     Ok(VmState::Continue)
                 }
             },
         )?;
+        let gone = expired.clone();
+        internal.set("expired", lua.create_function(move |_, ()| Ok(gone.get()))?)?;
+        internal.set("too_long", api::TOO_LONG)?;
+        internal.get::<Function>("seal")?.call::<()>(())?;
+        let console: Table = internal.get::<Function>("environment")?.call(())?;
 
         Ok(Self {
             lua,
@@ -208,6 +213,11 @@ impl Engine {
                 group: None,
                 may_ask: false,
                 deadline,
+                expired,
+                images: Rc::new(Cell::new(0)),
+                folder_asks: 0,
+                output_bytes: 0,
+                output_cut: false,
             },
             pending: None,
             stroke: None,
@@ -228,7 +238,14 @@ impl Engine {
 
     /// The lines scripts printed since the last call.
     pub fn take_output(&mut self) -> Vec<String> {
+        self.session.output_bytes = 0;
+        self.session.output_cut = false;
         std::mem::take(&mut self.session.output)
+    }
+
+    /// How many bytes the pictures scripts hold take now.
+    pub fn image_bytes(&self) -> usize {
+        self.session.images.get()
     }
 
     fn registered(&self, list: &str) -> Vec<Registered> {
@@ -270,6 +287,7 @@ impl Engine {
     ) -> Result<R, ScriptError> {
         self.session.may_ask = may_ask;
         self.session.deadline.set(Instant::now() + self.time_limit);
+        self.session.expired.set(false);
         let set_host: Function = self.internal.get("set_host")?;
         let session = &mut self.session;
         let result = self.lua.scope(|scope| {
@@ -306,11 +324,33 @@ impl Engine {
         host.editor().cancel_interaction();
         self.tool_cancel(host);
         self.pending = None;
+        self.forget_folders();
+    }
+
+    /// The folders a run was allowed to use end with the run.
+    fn forget_folders(&mut self) {
         self.session.granted.clear();
+        self.session.folder_asks = 0;
     }
 
     /// Runs or continues a script that may pause to show a dialog.
     fn drive(
+        &mut self,
+        host: &mut dyn Host,
+        thread: Thread,
+        args: impl mlua::IntoLuaMulti,
+    ) -> Result<Outcome, ScriptError> {
+        let outcome = self.step(host, thread, args);
+        // Only a script waiting for a dialog goes on later: for any other, the folders it
+        // was given are given back now.
+        if !matches!(outcome, Ok(Outcome::Dialog(_))) {
+            self.pending = None;
+            self.forget_folders();
+        }
+        outcome
+    }
+
+    fn step(
         &mut self,
         host: &mut dyn Host,
         thread: Thread,
@@ -421,6 +461,9 @@ impl Engine {
         phase: ToolPhase,
         event: PointerEvent,
     ) -> Result<(), ScriptError> {
+        // A tool is not run by the user the way a command is: it may use no folder, not even
+        // one given to a script that is waiting for a dialog.
+        self.forget_folders();
         if phase == ToolPhase::Down {
             self.tool_cancel(host);
             self.pending = None;

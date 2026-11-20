@@ -4,7 +4,8 @@ See `PLAN.md` for the full plan. This file tracks what is done, what is next and
 
 ## Current state
 
-**Phases 0 to 8 are done**: every phase of `PLAN.md`. What is left is the plan's "Later /
+**Phases 0 to 8 are done**: every phase of `PLAN.md`. The findings of the security audit
+are fixed (see below). What is left is the plan's "Later /
 optional" list, the items under "Deferred from the plan's description" below, and the things
 marked "not checked by me" in each phase.
 
@@ -12,6 +13,84 @@ Resolved versions: Rust 1.97.1, egui / eframe 0.36.2 (wgpu backend, eframe's def
 egui_dock 0.21.1, rfd 0.17, zip 9 (deflate only), png 0.18, gif 0.14, directories 6, serde 1,
 serde_json 1, thiserror 2, anyhow 1, arboard 3.6, mlua 0.12 (vendored Lua 5.4),
 aseprite-loader 0.4.
+
+## Security fixes from the audit report (2026-11-20, asked for)
+
+An outside audit of 0.3.0 listed 19 findings (VULN-01 to VULN-19). All of them are fixed:
+
+- [x] **VULN-01, script paths**: a path must be a file *inside* a picked folder, never the
+  folder itself; the deepest existing part of it is resolved (links followed) and must still
+  be inside the folder, which is remembered resolved too. Exporters that write files next to
+  the one named therefore stay inside it, and every write goes through a new temporary file
+  that is renamed into place, so a link at the target is replaced, not written through.
+- [x] **VULN-02, commands from scripts**: an allowlist (`scripting::script_may_run`).
+  Refused: `file.save`, `file.close`, `file.recover`, `file.clear_recent`, `app.*`,
+  `edit.copy` / `cut` / `paste` (the system clipboard), `keymap.*`, `prefs.set`, `script.*`,
+  layouts, theme, the command palette, the log, and the scripts' own commands through the
+  app. A test lists exactly what is refused, so a new command has to be decided on.
+- [x] **VULN-03, isolation**: every script (and the console) gets its own globals with copies
+  of the libraries; the API's metatables, the string metatable and the per-script
+  environments are locked; `rawset` is gone; `__gc` is refused; `prelude.lua` keeps its own
+  copies of the functions it calls.
+- [x] **VULN-04, stale folders**: the folders a run was given are forgotten when the run ends
+  (kept only while it waits for a dialog), and before every tool event.
+- [x] **VULN-05, the time limit**: once the time is up it stays up: the hook raises again at
+  every check, `pcall` / `xpcall` / `coroutine.resume` pass the error on, and the host refuses
+  every request. Command time is no longer refunded; asking for a folder needs a command the
+  user ran and is allowed 4 times a run; `pump` does at most 16 requests a frame. Pattern
+  functions estimate the work a pattern can take on its text and refuse the hopeless ones.
+- [x] **VULN-06, memory outside Lua**: pictures scripts hold are counted (512 MB, collected
+  first when short); printing is cut off at 1 MB a run; `selection.scale`, `sprite.size` and
+  `sprite.canvas_size` check the size before making anything; every undo step costs its
+  bookkeeping, names, slices and reference pictures; a script's open undo group may not grow
+  past the history limit.
+- [x] **VULN-07, PNG**: the size in the header is checked (16 384 a side, 64 M pixels) before
+  room is made, and the decoder's own buffers are limited.
+- [x] **VULN-08, `.acms`**: entries are read through a limit (manifest 16 MB, pictures 64 MB),
+  all pictures of a file share a 1 GB budget (so one picture named a million times is counted
+  a million times), frames, cels, tilesets and tiles are capped, reference pictures are at
+  most `MAX_SPRITE_SIZE`.
+- [x] **VULN-09, deep groups**: at most 64 groups deep (`MAX_GROUP_DEPTH`), checked without
+  recursion in `Sprite::from_parts`, in the Aseprite reader (which also stops the
+  `child_level` 65535 trick) and when layers are added or moved.
+- [x] **VULN-10, importers**: files are read through `acms_io::read_file` (ordinary files of
+  at most 256 MB); Aseprite files are looked over before parsing (frames × layers at most
+  1 M) and their cels share a 1 GB budget; Netpbm never makes room for more values than the
+  file has bytes, and reads at most 4096 pictures and 1 GB.
+- [x] **VULN-11, tileset count**: at most 65 536 tiles, the size check in 64 bits.
+- [x] **VULN-12, durations**: clamped to 1 ms – `MAX_FRAME_MS` in `Sprite::from_parts`;
+  playback sums in 64 bits.
+- [x] **VULN-13, ids**: layer ids from files must be 1 – 2³⁰ (`MAX_LAYER_ID`); new ids
+  saturate; tile numbers a set does not have are refused on load and in the Tiled export,
+  whose numbering is checked.
+- [x] **VULN-14, coordinates**: `Rect` saturates, `Cel::pixel` works in 64 bits, sheet
+  padding is at most 16 384 and its sums saturate, slice pivots saturate.
+- [x] **VULN-15, export size**: PNG and PNG-sequence exports refuse an output above the PNG
+  limits; `Image` sizes cannot wrap.
+- [x] **VULN-16, temporary files**: `write_atomically` (now used for settings too) makes a new
+  file `.<name>.<pid>-<n>.tmp` with `create_new`.
+- [x] **VULN-17, recovery**: each app holds a lock file in the recovery folder, and copies of an
+  app that holds its lock are not offered (nor discarded) by another; one thread writes a
+  whole autosave round; a recovered sprite is only given back its file if the note names an
+  absolute `.acms` path, and the dialog shows that path.
+- [x] **VULN-18, dialogs**: read with raw access only, at most 64 fields, 256 options and 4096
+  bytes of text each.
+- [x] **VULN-19, CI**: `permissions: contents: read` at the top (write only for publishing),
+  actions pinned to commit SHAs, Inno Setup 6.7.1 and cargo-deb 3.8.0 pinned.
+
+### How it was checked
+
+- New tests for each: paths (the folder itself, links out on Unix, stale folders, tools),
+  the allowlist, timeouts caught by `pcall` / `xpcall` / `coroutine.resume`, patterns,
+  isolation between scripts, dialog limits, print and picture limits; PNG headers claiming
+  huge pictures, oversized exports and sheets, ZIP entries over their limit, manifests with
+  overflowing counts, ids and durations, Aseprite files claiming 65 535 × 20 cels and 5000
+  nested groups (both ways), Netpbm headers without data and files of 5000 pictures, deep
+  group trees, extreme coordinates, recovery with a running and a crashed app, many sprites
+  in one autosave round.
+- `cargo fmt`, `cargo clippy -D warnings` and all tests pass on Windows.
+- **Not checked by me**: the Unix-only test (links out of a folder) and file locking on Linux
+  run in CI only, since WSL here has no Rust; how the limits feel with very large real files.
 
 ## Flappy Pencil, a hidden minigame (2026-11-20, asked for)
 

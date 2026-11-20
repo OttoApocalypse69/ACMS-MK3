@@ -1,6 +1,17 @@
 -- The part of the scripting API that is written in Lua. It runs once in every new Lua state
 -- and returns the functions the Rust side needs. Everything that touches the application goes
 -- through `H`, which calls the host function that is current for this entry into Lua.
+--
+-- Scripts share this state, so they must not be able to change what another one sees: each
+-- gets its own globals (see `internal.environment`), every table of the API has its metatable
+-- locked, and this file keeps its own copies of the library functions it uses.
+
+local error, pcall, xpcall, select, type, tostring = error, pcall, xpcall, select, type, tostring
+local setmetatable, getmetatable, ipairs, pairs = setmetatable, getmetatable, ipairs, pairs
+local rawget = rawget
+local concat = table.concat
+local format, byte, sub = string.format, string.byte, string.sub
+local yield, isyieldable, resume = coroutine.yield, coroutine.isyieldable, coroutine.resume
 
 local current
 
@@ -35,10 +46,11 @@ Color.__eq = function(a, b)
 end
 Color.__tostring = function(c)
   if c.a == 255 then
-    return string.format("#%02x%02x%02x", c.r, c.g, c.b)
+    return format("#%02x%02x%02x", c.r, c.g, c.b)
   end
-  return string.format("#%02x%02x%02x%02x", c.r, c.g, c.b, c.a)
+  return format("#%02x%02x%02x%02x", c.r, c.g, c.b, c.a)
 end
+Color.__metatable = false
 function Color:hex()
   return tostring(self)
 end
@@ -47,6 +59,7 @@ end
 
 local Cel = {}
 Cel.__index = Cel
+Cel.__metatable = false
 Cel.__tostring = function(cel)
   return "Cel(layer " .. cel.layer .. ", frame " .. cel.frame .. ")"
 end
@@ -67,6 +80,7 @@ end
 
 local Layer = {}
 Layer.__index = Layer
+Layer.__metatable = false
 Layer.__tostring = function(layer)
   return "Layer(" .. layer.name .. ")"
 end
@@ -91,6 +105,7 @@ end
 
 local Selection = {}
 Selection.__index = Selection
+Selection.__metatable = false
 function Selection:contains(x, y)
   return H("selected", x, y)
 end
@@ -122,6 +137,7 @@ local sprite = setmetatable({}, {
     local width, height = H("size")
     return "Sprite(" .. width .. " x " .. height .. ")"
   end,
+  __metatable = false,
 })
 
 -- Registered commands, filters and tools ---------------------------------------------------
@@ -228,6 +244,7 @@ local app = setmetatable({}, {
       error("app." .. tostring(key) .. " cannot be set", 2)
     end
   end,
+  __metatable = false,
 })
 
 local function register_command(def)
@@ -287,6 +304,7 @@ local DIALOG = {}
 
 local Dialog = {}
 Dialog.__index = Dialog
+Dialog.__metatable = false
 
 local function field(kind)
   return function(self, def)
@@ -314,11 +332,11 @@ Dialog.check = field("check")
 Dialog.dropdown = field("dropdown")
 
 function Dialog:show()
-  if not coroutine.isyieldable() or not H("can_ask") then
+  if not isyieldable() or not H("can_ask") then
     error("a dialog cannot be shown here", 2)
   end
   H("check_dialog", self)
-  return coroutine.yield(DIALOG, self)
+  return yield(DIALOG, self)
 end
 
 local function new_dialog(title)
@@ -330,30 +348,141 @@ end
 
 -- Globals -----------------------------------------------------------------------------------
 
-function print(...)
+local function print(...)
   local parts = {}
   for i = 1, select("#", ...) do
     parts[i] = tostring((select(i, ...)))
   end
-  H("print", table.concat(parts, "\t"))
+  H("print", concat(parts, "\t"))
 end
-
-_G.app = app
-_G.Dialog = new_dialog
-_G.register_command = register_command
-_G.register_filter = register_filter
-_G.register_tool = register_tool
-
--- No way to load code or files from inside a script.
-_G.dofile = nil
-_G.loadfile = nil
-_G.load = nil
-_G.collectgarbage = nil
-string.dump = nil
 
 -- For the Rust side -------------------------------------------------------------------------
 
 local internal = { color = Color, dialog = DIALOG, commands = commands, tools = tools }
+
+-- Once a script's time is up, catching the error does not help: whatever caught it raises it
+-- again. (`internal.expired` and `internal.too_long` are set by the Rust side.)
+local function passed_on(...)
+  if internal.expired() then
+    error(internal.too_long, 0)
+  end
+  return ...
+end
+
+local function safe_pcall(fn, ...)
+  return passed_on(pcall(fn, ...))
+end
+
+local function safe_xpcall(fn, handler, ...)
+  return passed_on(xpcall(fn, handler, ...))
+end
+
+local function safe_resume(co, ...)
+  return passed_on(resume(co, ...))
+end
+
+-- A finaliser would run whenever memory is collected, outside the script's own time.
+local function safe_setmetatable(t, mt)
+  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
+    error("__gc is not available to scripts", 2)
+  end
+  return setmetatable(t, mt)
+end
+
+-- Matching runs inside Lua's C code, where the time limit cannot stop it. A pattern with many
+-- repeats can take very long on long text, so how much work it can be is estimated first.
+local MATCH_WORK = 1e9
+
+local function check_match(subject, pattern, init, plain, level)
+  if plain or type(pattern) ~= "string" then
+    return
+  end
+  if type(subject) == "number" then
+    subject = tostring(subject)
+  end
+  if type(subject) ~= "string" then
+    return
+  end
+  local repeats, i, n = 0, 1, #pattern
+  while i <= n do
+    local c = byte(pattern, i)
+    if c == 37 then -- `%x`
+      i = i + 2
+    else
+      if c == 42 or c == 43 or c == 45 or c == 63 then -- `*`, `+`, `-`, `?`
+        repeats = repeats + 1
+      end
+      i = i + 1
+    end
+  end
+  if repeats == 0 then
+    return
+  end
+  local length = #subject
+  -- Ways the repeats can share out the text, times the places a match can start.
+  local work = sub(pattern, 1, 1) == "^" and 1 or length
+  for k = 1, repeats do
+    work = work * (length + k) / k
+    if work > MATCH_WORK then
+      error("this pattern has too many repeats for text this long", level)
+    end
+  end
+end
+
+local guarded_string = {}
+for name, fn in pairs(string) do
+  guarded_string[name] = fn
+end
+string.dump = nil
+guarded_string.dump = nil
+for _, name in ipairs({ "find", "match", "gmatch", "gsub" }) do
+  local original = string[name]
+  local plain_at = name == "find" and 4 or nil
+  local guarded = function(subject, pattern, ...)
+    local plain = plain_at and select(2, ...)
+    check_match(subject, pattern, nil, plain, 3)
+    return original(subject, pattern, ...)
+  end
+  string[name] = guarded
+  guarded_string[name] = guarded
+end
+
+-- The metatable of strings is shared by every script: it is locked, so `("x"):upper()` always
+-- means the real `string.upper`.
+getmetatable("").__metatable = false
+
+-- What every script finds among its globals. The libraries are copies, so a script that
+-- changes `string.format` changes its own.
+local base_names = {
+  "assert", "error", "ipairs", "next", "pairs", "rawequal", "rawget", "rawlen", "select",
+  "getmetatable", "tonumber", "tostring", "type", "_VERSION",
+}
+local library_names = { "table", "math", "utf8", "coroutine" }
+
+-- Called once by the Rust side, after `Color` has been added: from then on the globals of
+-- the state itself are no longer what scripts see.
+function internal.seal()
+  local G = _G
+  local api = {
+    app = app,
+    Dialog = new_dialog,
+    Color = G.Color,
+    register_command = register_command,
+    register_filter = register_filter,
+    register_tool = register_tool,
+    print = print,
+    pcall = safe_pcall,
+    xpcall = safe_xpcall,
+    setmetatable = safe_setmetatable,
+  }
+  internal.api = api
+  internal.base = {}
+  for _, name in ipairs(base_names) do
+    internal.base[name] = G[name]
+  end
+  -- No way to load code or files, or to change tables behind their metatables.
+  G.dofile, G.loadfile, G.load, G.collectgarbage, G.rawset = nil, nil, nil, nil, nil
+end
 
 function internal.set_host(fn)
   current = fn
@@ -388,9 +517,30 @@ function internal.forget_after(command_count, tool_count)
   end
 end
 
--- A new environment for one script: it reads the globals and keeps its own to itself.
+-- A new environment for one script: its own globals, which no other script sees.
 function internal.environment()
-  return setmetatable({}, { __index = _G })
+  local env = {}
+  for name, value in pairs(internal.base) do
+    env[name] = value
+  end
+  for name, value in pairs(internal.api) do
+    env[name] = value
+  end
+  for _, name in ipairs(library_names) do
+    local copy = {}
+    for key, value in pairs(_G[name]) do
+      copy[key] = value
+    end
+    env[name] = copy
+  end
+  local strings = {}
+  for key, value in pairs(guarded_string) do
+    strings[key] = value
+  end
+  env.string = strings
+  env.coroutine.resume = safe_resume
+  env._G = env
+  return env
 end
 
 -- Runs a line typed into the console and shows what it evaluated to, if anything.

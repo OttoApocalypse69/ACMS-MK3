@@ -86,6 +86,11 @@ impl<'a> Reader<'a> {
     }
 
     /// Skips white space and comments.
+    /// How many bytes are left to read.
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.at)
+    }
+
     fn skip(&mut self) {
         while let Some(&byte) = self.bytes.get(self.at) {
             if Self::is_space(byte) {
@@ -202,7 +207,8 @@ fn raw_samples(reader: &mut Reader<'_>, count: usize, maxval: u32) -> Result<Vec
 
 /// The samples of a plain raster: numbers written out.
 fn plain_samples(reader: &mut Reader<'_>, count: usize, maxval: u32) -> Result<Vec<u32>, IoError> {
-    let mut samples = Vec::with_capacity(count);
+    // Each value takes at least a byte: room for more than the file holds is never needed.
+    let mut samples = Vec::with_capacity(count.min(reader.remaining()));
     for _ in 0..count {
         let sample = match reader.number("pixel value") {
             Ok(sample) => sample,
@@ -353,7 +359,7 @@ fn read_image(reader: &mut Reader<'_>, notes: &mut Vec<String>) -> Result<Image,
     let pixels = match kind {
         b'1' => {
             // Plain PBM: one digit per pixel, with or without space between them.
-            let mut pixels = Vec::with_capacity(count);
+            let mut pixels = Vec::with_capacity(count.min(reader.remaining()));
             while pixels.len() < count {
                 reader.skip();
                 match reader.bytes.get(reader.at) {
@@ -392,13 +398,27 @@ fn read_image(reader: &mut Reader<'_>, notes: &mut Vec<String>) -> Result<Image,
     Image::from_pixels(width, height, pixels).ok_or_else(|| damaged("the picture has no pixels"))
 }
 
+/// Most pictures of one file that become frames.
+const MAX_IMAGES: usize = 4096;
+
+/// Most bytes the pictures of one file may take together, once read.
+const MAX_DECODED_BYTES: usize = 1 << 30;
+
 /// Reads a Netpbm file. Several images in one file become frames.
 pub fn import_netpbm(bytes: &[u8]) -> Result<Imported, IoError> {
     let mut reader = Reader { bytes, at: 0 };
     let mut notes = Vec::new();
     let mut images: Vec<Image> = Vec::new();
+    let mut decoded = 0;
     let mut skipped = 0;
     loop {
+        if images.len() == MAX_IMAGES || decoded > MAX_DECODED_BYTES {
+            notes.push(format!(
+                "The file holds more pictures than ACMS opens; the first {} were read.",
+                images.len()
+            ));
+            break;
+        }
         let image = match read_image(&mut reader, &mut notes) {
             Ok(image) => image,
             // What follows a good image may be anything; the images before it stand.
@@ -414,7 +434,10 @@ pub fn import_netpbm(bytes: &[u8]) -> Result<Imported, IoError> {
         };
         match images.first() {
             Some(first) if first.bounds() != image.bounds() => skipped += 1,
-            _ => images.push(image),
+            _ => {
+                decoded += image.byte_size();
+                images.push(image);
+            }
         }
         if reader.at_end() {
             break;
@@ -459,7 +482,7 @@ pub fn import_netpbm(bytes: &[u8]) -> Result<Imported, IoError> {
 
 /// [`import_netpbm`] from a file.
 pub fn import_netpbm_from_path(path: &Path) -> Result<Imported, IoError> {
-    import_netpbm(&std::fs::read(path)?)
+    import_netpbm(&crate::read_file(path)?)
 }
 
 /// What became of the picture on its way into a Netpbm file.
@@ -905,5 +928,37 @@ mod tests {
             Err(IoError::Unsupported(_))
         ));
         assert!(export_netpbm(&sprite, 1, NetpbmKind::Ppm).is_err());
+    }
+
+    #[test]
+    fn a_header_claiming_a_large_picture_makes_no_room_for_it() {
+        // 4096 × 4096 plain values would be 200 MB of room before the end of the file is
+        // seen; now the end is simply found.
+        for header in [
+            &b"P3 4096 4096 255\n"[..],
+            b"P2 4096 4096 255\n",
+            b"P1 4096 4096\n",
+        ] {
+            assert!(matches!(
+                import_netpbm(header),
+                Err(IoError::Invalid(message)) if message.contains("ends before")
+            ));
+        }
+    }
+
+    #[test]
+    fn a_file_of_endless_pictures_is_read_only_so_far() {
+        let mut bytes = Vec::new();
+        for _ in 0..5000 {
+            bytes.extend_from_slice(b"P4 1 1\n\x80");
+        }
+        let imported = import_netpbm(&bytes).unwrap();
+        assert_eq!(imported.sprite.frames().len(), MAX_IMAGES);
+        assert!(
+            imported
+                .notes
+                .iter()
+                .any(|note| note.contains("more pictures"))
+        );
     }
 }

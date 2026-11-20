@@ -19,7 +19,8 @@ use acms_core::geom::{Point, Rect};
 use acms_core::image::Image;
 use acms_core::sprite::{
     BlendMode, CelSource, Direction, Frame, GroupLayer, ImageLayer, Layer, LayerId, LayerKind,
-    Palette, PaletteEntry, ReferenceLayer, Sprite, Symmetry, Tag, TilemapLayer,
+    MAX_LAYER_ID, MAX_SPRITE_SIZE, Palette, PaletteEntry, ReferenceLayer, Sprite, Symmetry, Tag,
+    TilemapLayer,
 };
 use acms_core::tiles::{MAX_TILE_SIZE, Slice, TileGrid, Tileset, TilesetId};
 use serde::{Deserialize, Serialize};
@@ -623,20 +624,71 @@ fn upgrade_1_to_2(manifest: &mut serde_json::Value) {
     }
     manifest["format_version"] = 2.into();
 }
-fn read_entry<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Vec<u8>, IoError> {
-    let mut entry = zip
+/// Most bytes the manifest of a file may unpack to.
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Most bytes one picture in a file may unpack to (still compressed as a PNG).
+const MAX_PICTURE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Most bytes all the pictures of a file may take together once read.
+const MAX_DECODED_BYTES: usize = 1 << 30;
+
+/// Most frames, cels, tilesets or tiles of a set a file may have.
+const MAX_FRAMES: usize = 10_000;
+const MAX_CELS: usize = 1 << 20;
+const MAX_TILESETS: usize = 1024;
+const MAX_TILES: usize = 65_536;
+
+/// Reads one entry of the archive, refusing one that unpacks to more than `limit` bytes:
+/// a small archive can claim to hold a huge file.
+fn read_entry_limited<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    name: &str,
+    limit: u64,
+) -> Result<Vec<u8>, IoError> {
+    let entry = zip
         .by_name(name)
         .map_err(|_| IoError::Invalid(format!("`{name}` is missing")))?;
     let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes)?;
+    entry.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(IoError::Unsupported(format!(
+            "`{name}` is larger than ACMS opens"
+        )));
+    }
     Ok(bytes)
+}
+
+fn read_entry<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Vec<u8>, IoError> {
+    read_entry_limited(zip, name, MAX_PICTURE_BYTES)
+}
+
+/// Keeps count of the memory the pictures of one file take, so that a file naming the same
+/// small picture a million times cannot fill the memory.
+struct Budget(usize);
+
+impl Budget {
+    fn take(&mut self, image: Image) -> Result<Image, IoError> {
+        self.0 = self.0.saturating_add(image.byte_size());
+        if self.0 > MAX_DECODED_BYTES {
+            return Err(IoError::Unsupported(
+                "the pictures in the file take more memory than ACMS can give them".to_owned(),
+            ));
+        }
+        Ok(image)
+    }
+}
+
+fn too_many(what: &str) -> IoError {
+    IoError::Unsupported(format!("the file has more {what} than ACMS opens"))
 }
 
 /// Reads a sprite from an `.acms` archive.
 pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
     let mut zip = ZipArchive::new(reader)?;
 
-    let manifest: serde_json::Value = serde_json::from_slice(&read_entry(&mut zip, MANIFEST)?)?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&read_entry_limited(&mut zip, MANIFEST, MAX_MANIFEST_BYTES)?)?;
     let version = manifest
         .get("format_version")
         .and_then(serde_json::Value::as_u64)
@@ -667,7 +719,25 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
     )
     .ok_or_else(|| IoError::Invalid(format!("`{}` is not a symmetry", manifest.symmetry.mode)))?;
 
-    let mut picture = |id: u32| decode_png(&read_entry(&mut zip, &reference_path(id))?);
+    if manifest.frames.len() > MAX_FRAMES {
+        return Err(too_many("frames"));
+    }
+    if manifest.cels.len() > MAX_CELS || manifest.grids.len() > MAX_CELS {
+        return Err(too_many("cels"));
+    }
+    if manifest.tilesets.len() > MAX_TILESETS {
+        return Err(too_many("tilesets"));
+    }
+    let mut budget = Budget(0);
+    let mut picture = |id: u32| {
+        let image = decode_png(&read_entry(&mut zip, &reference_path(id))?)?;
+        if image.width() > MAX_SPRITE_SIZE || image.height() > MAX_SPRITE_SIZE {
+            return Err(IoError::Unsupported(format!(
+                "a reference picture is larger than {MAX_SPRITE_SIZE} pixels on a side"
+            )));
+        }
+        budget.take(image)
+    };
     let layers = manifest
         .layers
         .into_iter()
@@ -687,11 +757,18 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
         .into_iter()
         .map(|cel| {
             let bytes = read_entry(&mut zip, &cel_path(cel.image))?;
+            let image = decode_png(&bytes)?;
+            // A cel may reach past the canvas, but not by much in any real file.
+            if image.width() > 2 * MAX_SPRITE_SIZE || image.height() > 2 * MAX_SPRITE_SIZE {
+                return Err(IoError::Invalid(
+                    "a cel is far larger than the sprite".to_owned(),
+                ));
+            }
             Ok(CelSource {
                 layer: LayerId(cel.layer),
                 frame: cel.frame,
                 origin: Point::new(cel.x, cel.y),
-                image: decode_png(&bytes)?,
+                image: budget.take(image)?,
             })
         })
         .collect::<Result<Vec<_>, IoError>>()?;
@@ -742,12 +819,23 @@ pub fn read_acms<R: Read + Seek>(reader: R) -> Result<Sprite, IoError> {
                     set.name
                 )));
             }
-            let atlas = decode_png(&read_entry(&mut zip, &tileset_path(set.id))?)?;
-            // The picture has to be large enough for the tiles it is said to hold.
+            if set.count > MAX_TILES {
+                return Err(too_many("tiles in a tileset"));
+            }
+            if set.id > MAX_LAYER_ID {
+                return Err(IoError::Invalid(format!(
+                    "tileset id {} is not allowed",
+                    set.id
+                )));
+            }
+            let atlas = budget.take(decode_png(&read_entry(&mut zip, &tileset_path(set.id))?)?)?;
+            // The picture has to be large enough for the tiles it is said to hold. With at
+            // most `MAX_TILES` tiles of at most `MAX_TILE_SIZE`, nothing here overflows.
+            let count = set.count as u64;
             let columns = set.columns.max(1);
-            let rows = (set.count as u64).div_ceil(u64::from(columns));
+            let rows = count.div_ceil(u64::from(columns));
             let fits = u64::from(atlas.width())
-                >= u64::from(columns.min(set.count as u32)) * u64::from(set.tile_width)
+                >= u64::from(columns).min(count) * u64::from(set.tile_width)
                 && u64::from(atlas.height()) >= rows * u64::from(set.tile_height);
             if !fits {
                 return Err(IoError::Invalid(format!(
@@ -1508,5 +1596,72 @@ mod tests {
         let loaded = broken(&|m| m["grids"][0]["layer"] = 1.into()).unwrap();
         assert!(loaded.grid(LayerId(2), 0).is_none());
         assert!(loaded.cel(LayerId(1), 0).is_some());
+    }
+
+    #[test]
+    fn an_entry_that_unpacks_to_more_than_it_may_is_refused() {
+        let big = vec![b' '; 4096];
+        let bytes = archive_with(&[("big.txt", &big[..])]);
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            read_entry_limited(&mut zip, "big.txt", 4096).unwrap().len(),
+            4096
+        );
+        assert!(matches!(
+            read_entry_limited(&mut zip, "big.txt", 4095),
+            Err(IoError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn numbers_from_a_manifest_cannot_overflow_or_hang_the_app() {
+        let sprite = tiled_sprite();
+        let good = manifest_json(&sprite);
+        let mut zip = ZipArchive::new(Cursor::new(archive(&sprite))).unwrap();
+        let parts: Vec<(String, Vec<u8>)> = ["cels/1.png", "tiles/1.png", "tiles/2.png"]
+            .iter()
+            .map(|name| ((*name).to_owned(), read_entry(&mut zip, name).unwrap()))
+            .collect();
+        let read = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut manifest = good.clone();
+            edit(&mut manifest);
+            let manifest = manifest.to_string();
+            let mut files: Vec<(&str, &[u8])> = vec![(MANIFEST, manifest.as_bytes())];
+            files.extend(
+                parts
+                    .iter()
+                    .map(|(name, bytes)| (name.as_str(), &bytes[..])),
+            );
+            read_acms(Cursor::new(archive_with(&files)))
+        };
+        // A count that would overflow the size check, or truncate.
+        for count in [u64::MAX / 4, u64::from(u32::MAX) + 2, 1 << 40] {
+            let result = read(&|m| m["tilesets"][0]["count"] = count.into());
+            assert!(result.is_err(), "{count}: {result:?}");
+        }
+        // Layer ids that leave no room for new layers.
+        let result = read(&|m| m["layers"][0]["id"] = u32::MAX.into());
+        assert!(matches!(result, Err(IoError::Sprite(_))), "{result:?}");
+        // Durations that would overflow the playback clock become ones that do not.
+        let loaded = read(&|m| m["frames"][0]["duration_ms"] = u32::MAX.into()).unwrap();
+        assert_eq!(
+            loaded.frames()[0].duration_ms,
+            acms_core::sprite::MAX_FRAME_MS
+        );
+        let loaded = read(&|m| m["frames"][0]["duration_ms"] = 0.into()).unwrap();
+        assert_eq!(loaded.frames()[0].duration_ms, 1);
+        // Tiles the set does not have are not drawn from.
+        let loaded = read(&|m| m["grids"][0]["cells"][0] = u32::MAX.into()).unwrap();
+        assert!(loaded.grid(LayerId(2), 0).is_none());
+    }
+
+    #[test]
+    fn the_same_picture_named_again_and_again_is_counted_each_time() {
+        let mut budget = Budget(MAX_DECODED_BYTES - 16);
+        assert!(budget.take(Image::new(2, 2)).is_ok());
+        assert!(matches!(
+            budget.take(Image::new(1, 1)),
+            Err(IoError::Unsupported(_))
+        ));
     }
 }

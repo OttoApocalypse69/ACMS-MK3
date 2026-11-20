@@ -312,7 +312,7 @@ fn add_reference(state: &mut AppState, params: &Params) -> CommandResult {
     let could_not = |err: &dyn std::fmt::Display| {
         CommandError::failed(format!("Could not read {}: {err}", path.display()))
     };
-    let bytes = std::fs::read(&path).map_err(|err| could_not(&err))?;
+    let bytes = acms_io::read_file(&path).map_err(|err| could_not(&err))?;
     let image = decode_png(&bytes).map_err(|err| could_not(&err))?;
     // It is shown as a single texture, like the canvas.
     if image.width() > MAX_SPRITE_SIZE || image.height() > MAX_SPRITE_SIZE {

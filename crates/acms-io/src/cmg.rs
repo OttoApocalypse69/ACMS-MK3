@@ -236,7 +236,7 @@ pub fn import_cmg(bytes: &[u8]) -> Result<Imported, IoError> {
 
 /// [`import_cmg`] from a file.
 pub fn import_cmg_from_path(path: &Path) -> Result<Imported, IoError> {
-    import_cmg(&std::fs::read(path)?)
+    import_cmg(&crate::read_file(path)?)
 }
 
 /// What became of the picture on its way into a CMG file.

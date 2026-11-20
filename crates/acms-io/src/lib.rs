@@ -9,9 +9,10 @@ pub mod palette;
 pub mod png;
 pub mod tiled;
 
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use acms_core::sprite::SpriteError;
 use thiserror::Error;
@@ -43,19 +44,72 @@ pub enum IoError {
     Sprite(#[from] SpriteError),
 }
 
+/// Most bytes a file that is opened may have. Larger files are refused before anything is
+/// read, so that a huge (or endless, like a device) file cannot use up the memory.
+pub const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Reads a whole file of at most [`MAX_FILE_BYTES`].
+pub fn read_file(path: &Path) -> Result<Vec<u8>, IoError> {
+    read_file_limited(path, MAX_FILE_BYTES)
+}
+
+/// Reads a whole file of at most `limit` bytes; only ordinary files are read.
+pub fn read_file_limited(path: &Path, limit: u64) -> Result<Vec<u8>, IoError> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(IoError::Unsupported("this is not a file".to_owned()));
+    }
+    if metadata.len() > limit {
+        return Err(too_large(limit));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    // The file may grow while it is read: never more than the limit is taken.
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(too_large(limit));
+    }
+    Ok(bytes)
+}
+
+fn too_large(limit: u64) -> IoError {
+    IoError::Unsupported(format!(
+        "the file is larger than {} MB, the most ACMS opens",
+        limit / (1024 * 1024)
+    ))
+}
+
+/// A temporary file next to `path`, made new: an existing file (or a link) of that name is
+/// never written through, and two writers never share one.
+fn create_temp(path: &Path) -> io::Result<(PathBuf, File)> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map_or_else(|| "file".into(), |name| name.to_string_lossy().into_owned());
+    let mut last = None;
+    for _ in 0..16 {
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = path.with_file_name(format!(".{name}.{}-{count}.tmp", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("no temporary file could be made")))
+}
+
 /// Writes a file so that it is either complete or not there at all: the data goes to a
-/// temporary file next to `path`, which replaces `path` only once everything is written.
-/// A crash halfway never leaves a half-written file under the real name.
-pub(crate) fn write_atomically(
+/// new temporary file next to `path`, which replaces `path` only once everything is written.
+/// A crash halfway never leaves a half-written file under the real name, and a link at `path`
+/// is replaced rather than written through.
+pub fn write_atomically(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), IoError>,
 ) -> Result<(), IoError> {
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-
+    let (temp, file) = create_temp(path)?;
     let result = (|| {
-        let mut writer = BufWriter::new(File::create(&temp)?);
+        let mut writer = BufWriter::new(file);
         write(&mut writer)?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
@@ -67,6 +121,71 @@ pub(crate) fn write_atomically(
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::TempPath;
+
+    #[test]
+    fn writing_leaves_no_temporary_file_and_replaces_the_old_one() {
+        let target = TempPath::new("atomic-write.txt");
+        std::fs::write(target.path(), "old").unwrap();
+        write_atomically(target.path(), |file| Ok(file.write_all(b"new")?)).unwrap();
+        assert_eq!(std::fs::read(target.path()).unwrap(), b"new");
+        let folder = target.path().parent().unwrap();
+        let name = target
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let left = std::fs::read_dir(folder)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let other = entry.file_name().to_string_lossy().into_owned();
+                other.starts_with(&format!(".{name}.")) && other.ends_with(".tmp")
+            });
+        assert!(!left);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_old_file_alone() {
+        let target = TempPath::new("atomic-fail.txt");
+        std::fs::write(target.path(), "old").unwrap();
+        let result = write_atomically(target.path(), |_| {
+            Err(IoError::Invalid("stopped halfway".to_owned()))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(target.path()).unwrap(), b"old");
+    }
+
+    #[test]
+    fn the_temporary_file_never_takes_the_place_of_an_existing_one() {
+        let target = TempPath::new("atomic-taken.txt");
+        // A file where the old temporary name was is not touched.
+        let old_temp = TempPath::new("atomic-taken.txt.tmp");
+        std::fs::write(old_temp.path(), "keep").unwrap();
+        write_atomically(target.path(), |file| Ok(file.write_all(b"data")?)).unwrap();
+        assert_eq!(std::fs::read(old_temp.path()).unwrap(), b"keep");
+        assert_eq!(std::fs::read(target.path()).unwrap(), b"data");
+    }
+
+    #[test]
+    fn files_larger_than_the_limit_are_refused() {
+        let file = TempPath::new("read-limit.bin");
+        std::fs::write(file.path(), [7_u8; 100]).unwrap();
+        assert_eq!(read_file_limited(file.path(), 100).unwrap().len(), 100);
+        assert!(matches!(
+            read_file_limited(file.path(), 99),
+            Err(IoError::Unsupported(_))
+        ));
+        // A folder is not a file.
+        let folder = std::env::temp_dir();
+        assert!(read_file(&folder).is_err());
+    }
 }
 
 #[cfg(test)]
